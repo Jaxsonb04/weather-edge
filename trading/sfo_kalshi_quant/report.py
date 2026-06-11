@@ -1,0 +1,396 @@
+from __future__ import annotations
+
+import json
+from dataclasses import asdict, is_dataclass
+from datetime import date
+from pathlib import Path
+from typing import Any
+from urllib.error import URLError
+
+from .backtest import run_walk_forward_calibration_backtest
+from .config import SERIES_TICKER, StrategyConfig
+from .ensemble import OpenMeteoEnsembleError, SfoEnsembleClient
+from .forecast import (
+    ForecastDataError,
+    SfoForecasterAdapter,
+    has_forecaster_observed_high_adjustment,
+    parse_target_date,
+)
+from .kalshi import KalshiPublicClient, load_event_snapshots
+from .models import EnsembleSnapshot, EventSnapshot, ForecastSnapshot, IntradaySnapshot, TradeDecision
+from .probability import ResidualCalibrator
+from .risk import TradeEvaluator
+from .standard_bins import standard_sfo_bins
+
+
+def build_daily_report(
+    *,
+    forecaster_root: Path,
+    targets: list[date],
+    config: StrategyConfig,
+    side: str,
+    offline_events: Path | None = None,
+    observed_high: float | None = None,
+    no_ensemble: bool = False,
+    ensemble_timeout: float = 12.0,
+    allow_live_market: bool = True,
+    calibration_min_train: int = 180,
+    calibration_source: str = "auto",
+) -> dict[str, Any]:
+    """Build a public, paper-only daily report without recording local state."""
+
+    adapter = SfoForecasterAdapter(forecaster_root)
+    outcomes = adapter.load_calibration_outcomes(calibration_source)
+    calibrator = ResidualCalibrator(outcomes, config)
+    calibration = calibration_diagnostics(outcomes, config=config, min_train=calibration_min_train)
+    target_reports = [
+        build_target_report(
+            target=target,
+            adapter=adapter,
+            calibrator=calibrator,
+            config=config,
+            side=side,
+            offline_events=offline_events,
+            observed_high=observed_high,
+            no_ensemble=no_ensemble,
+            ensemble_timeout=ensemble_timeout,
+            allow_live_market=allow_live_market,
+        )
+        for target in targets
+    ]
+    best = _best_signal(target_reports)
+    return {
+        "schema_version": 1,
+        "mode": "paper_research_only",
+        "live_orders_enabled": False,
+        "summary": {
+            "best_signal": best,
+            "target_count": len(target_reports),
+            "approved_signal_count": sum(
+                1
+                for report in target_reports
+                for decision in report["decisions"]
+                if decision["approved"]
+            ),
+        },
+        "calibration": calibration,
+        "targets": target_reports,
+        "disclaimer": "Paper-trading research only. This report does not place live orders.",
+    }
+
+
+def build_target_report(
+    *,
+    target: date,
+    adapter: SfoForecasterAdapter,
+    calibrator: ResidualCalibrator,
+    config: StrategyConfig,
+    side: str,
+    offline_events: Path | None,
+    observed_high: float | None,
+    no_ensemble: bool,
+    ensemble_timeout: float,
+    allow_live_market: bool,
+) -> dict[str, Any]:
+    forecast = adapter.latest_blend(target)
+    _enforce_live_forecast_freshness(forecast, config)
+    intraday = _intraday_for_report(target, adapter, observed_high)
+    observed_high_f = intraday.observed_high_f if intraday else None
+    if intraday is not None and not has_forecaster_observed_high_adjustment(forecast):
+        forecast = adapter.apply_intraday_update(forecast, intraday)
+
+    ensemble, ensemble_warning = _ensemble_for_report(
+        target,
+        forecast.predicted_high_f,
+        no_ensemble=no_ensemble,
+        timeout=ensemble_timeout,
+    )
+    event, market_warning = _event_for_report(
+        target,
+        offline_events=offline_events,
+        allow_live_market=allow_live_market,
+    )
+    if event:
+        markets = event.active_markets or event.markets
+        event_title = event.title
+        market_available = True
+    else:
+        markets = standard_sfo_bins(f"{SERIES_TICKER}-{target.strftime('%y%b%d').upper()}-PAPER")
+        event_title = "No live Kalshi event found; probability-only fallback ladder"
+        market_available = False
+
+    probabilities = calibrator.bucket_probabilities(
+        markets,
+        forecast.predicted_high_f,
+        source_spread_f=forecast.source_spread_f,
+        observed_high_f=observed_high_f,
+        ensemble=ensemble,
+        intraday=intraday,
+    )
+    decisions = TradeEvaluator(config).rank(
+        markets,
+        probabilities,
+        bankroll=config.paper_bankroll,
+        sides=_analysis_sides(side),
+        source_spread_f=forecast.source_spread_f,
+    )
+    warnings = [warning for warning in (ensemble_warning, market_warning) if warning]
+    return {
+        "target_date": target.isoformat(),
+        "event_title": event_title,
+        "market_available": market_available,
+        "forecast": forecast_to_dict(forecast),
+        "intraday": intraday_to_dict(intraday),
+        "ensemble": ensemble_to_dict(ensemble),
+        "warnings": warnings,
+        "best_decision": decision_to_dict(decisions[0]) if decisions else None,
+        "decisions": [decision_to_dict(decision) for decision in decisions],
+    }
+
+
+def calibration_diagnostics(
+    outcomes,
+    *,
+    config: StrategyConfig,
+    min_train: int = 180,
+) -> dict[str, Any]:
+    result = run_walk_forward_calibration_backtest(outcomes, config=config, min_train=min_train)
+    buckets = [
+        {
+            "range": f"{bucket.lower:.1f}-{bucket.upper:.1f}",
+            "lower": bucket.lower,
+            "upper": bucket.upper,
+            "count": bucket.count,
+            "avg_probability": round(bucket.avg_probability, 4),
+            "observed_frequency": round(bucket.observed_frequency, 4),
+            "calibration_gap": round(bucket.observed_frequency - bucket.avg_probability, 4),
+            "brier_score": round(bucket.brier_score, 4),
+        }
+        for bucket in result.calibration_buckets
+    ]
+    cohorts = [
+        {
+            "name": cohort.name,
+            "count": cohort.count,
+            "brier_score": round(cohort.brier_score, 4),
+            "log_loss": round(cohort.log_loss, 4),
+            "top_bin_accuracy": round(cohort.top_bin_accuracy, 4),
+            "avg_winning_probability": round(cohort.avg_winning_probability, 4),
+        }
+        for cohort in result.cohorts
+    ]
+    warnings = []
+    for bucket in buckets:
+        if bucket["count"] < 15:
+            continue
+        if 0.5 <= bucket["lower"] < 0.7 and bucket["calibration_gap"] <= -0.10:
+            warnings.append(
+                "Mid-probability buckets are overconfident: "
+                f"{bucket['range']} averages {bucket['avg_probability']:.3f} "
+                f"but resolves {bucket['observed_frequency']:.3f}."
+            )
+    return {
+        "source": outcomes[0].model_name if outcomes else "unknown",
+        "n": result.n,
+        "brier_score": round(result.brier_score, 4),
+        "log_loss": round(result.log_loss, 4),
+        "top_bin_accuracy": round(result.top_bin_accuracy, 4),
+        "avg_winning_probability": round(result.avg_winning_probability, 4),
+        "avg_entropy": round(result.avg_entropy, 4),
+        "buckets": buckets,
+        "cohorts": cohorts,
+        "warnings": warnings,
+    }
+
+
+def write_report(path: Path, payload: dict[str, Any]) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+
+def forecast_to_dict(forecast: ForecastSnapshot) -> dict[str, Any]:
+    return {
+        "target_date": forecast.target_date.isoformat(),
+        "predicted_high_f": round(forecast.predicted_high_f, 2),
+        "source_spread_f": round(forecast.source_spread_f, 2),
+        "fetched_at": forecast.fetched_at,
+        "lead_hours": forecast.lead_hours,
+        "method": forecast.method,
+        "source_count": forecast.source_count,
+        "fresh_station_count": forecast.fresh_station_count,
+        "calls_used_today": forecast.calls_used_today,
+        "max_calls_per_day": forecast.max_calls_per_day,
+        "sources": {
+            "google_high_f": forecast.google_high_f,
+            "nws_high_f": forecast.nws_high_f,
+            "open_meteo_high_f": forecast.open_meteo_high_f,
+            "history_high_f": forecast.history_high_f,
+        },
+    }
+
+
+def intraday_to_dict(intraday: IntradaySnapshot | None) -> dict[str, Any] | None:
+    if intraday is None:
+        return None
+    return {
+        "target_date": intraday.target_date.isoformat(),
+        "observed_high_f": intraday.observed_high_f,
+        "latest_temp_f": intraday.latest_temp_f,
+        "latest_observed_at": intraday.latest_observed_at,
+        "remaining_forecast_high_f": intraday.remaining_forecast_high_f,
+        "forecast_fetched_at": intraday.forecast_fetched_at,
+        "observation_count": intraday.observation_count,
+        "observed_high_source": intraday.observed_high_source,
+        "is_complete": intraday.is_complete,
+    }
+
+
+def ensemble_to_dict(ensemble: EnsembleSnapshot | None) -> dict[str, Any] | None:
+    if ensemble is None:
+        return None
+    return {
+        "source": ensemble.source,
+        "member_count": ensemble.member_count,
+        "station_mean_high_f": round(ensemble.station_mean_high_f, 2),
+        "station_std_high_f": round(ensemble.station_std_high_f, 2),
+        "station_bias_f": round(ensemble.station_bias_f, 2),
+        "cell_selection": ensemble.cell_selection,
+        "warning": ensemble.warning,
+    }
+
+
+def decision_to_dict(decision: TradeDecision) -> dict[str, Any]:
+    spend = decision.recommended_contracts * decision.cost_per_contract
+    return {
+        "ticker": decision.ticker,
+        "label": decision.label,
+        "side": decision.side,
+        "action": decision.action,
+        "approved": decision.approved,
+        "decision": "TRADE" if decision.approved else "NO_TRADE",
+        "probability": round(decision.probability, 4),
+        "probability_lcb": round(decision.probability_lcb, 4),
+        "model_probability": _round_optional(decision.model_probability),
+        "market_probability": _round_optional(decision.market_probability),
+        "residual_probability": _round_optional(decision.residual_probability),
+        "ensemble_probability": _round_optional(decision.ensemble_probability),
+        "intraday_probability": _round_optional(decision.intraday_probability),
+        "remaining_heat_risk": _round_optional(decision.remaining_heat_risk),
+        "bid": round(decision.bid, 4),
+        "ask": round(decision.ask, 4),
+        "spread": round(decision.spread, 4),
+        "edge": round(decision.edge, 4),
+        "edge_lcb": round(decision.edge_lcb, 4),
+        "trade_quality_score": round(decision.trade_quality_score, 1),
+        "recommended_contracts": round(decision.recommended_contracts, 4),
+        "recommended_spend": round(spend, 2),
+        "expected_profit": round(decision.expected_profit, 4),
+        "reasons": list(decision.reasons),
+    }
+
+
+def _event_for_report(
+    target: date,
+    *,
+    offline_events: Path | None,
+    allow_live_market: bool,
+) -> tuple[EventSnapshot | None, str | None]:
+    if offline_events:
+        events = load_event_snapshots(offline_events, target)
+        return (events[0] if events else None), None
+    if not allow_live_market:
+        return None, "Live Kalshi lookup disabled; using probability-only fallback ladder."
+    try:
+        return KalshiPublicClient().find_event_by_date(target, series_ticker=SERIES_TICKER), None
+    except URLError as exc:
+        return None, f"Live Kalshi lookup failed: {exc}"
+
+
+def _ensemble_for_report(
+    target: date,
+    station_center_high_f: float,
+    *,
+    no_ensemble: bool,
+    timeout: float,
+) -> tuple[EnsembleSnapshot | None, str | None]:
+    if no_ensemble:
+        return None, "Open-Meteo ensemble disabled for this report."
+    try:
+        return SfoEnsembleClient(timeout=timeout).station_aligned_snapshot(target, station_center_high_f), None
+    except (OpenMeteoEnsembleError, OSError, TimeoutError, URLError) as exc:
+        return None, f"Station-aligned ensemble lookup failed: {exc}"
+
+
+def _intraday_for_report(
+    target: date,
+    adapter: SfoForecasterAdapter,
+    observed_high: float | None,
+) -> IntradaySnapshot | None:
+    if target != parse_target_date("today"):
+        return None
+    intraday = adapter.intraday_snapshot(target)
+    if observed_high is None:
+        return intraday
+    if intraday is None:
+        return IntradaySnapshot(
+            target_date=target,
+            observed_high_f=observed_high,
+            latest_temp_f=None,
+            latest_observed_at=None,
+            remaining_forecast_high_f=None,
+            forecast_fetched_at=None,
+            observation_count=0,
+        )
+    if is_dataclass(intraday):
+        values = asdict(intraday)
+        values["observed_high_f"] = observed_high
+        return IntradaySnapshot(**values)
+    return intraday
+
+
+def _analysis_sides(side_arg: str) -> tuple[str, ...]:
+    if side_arg == "both":
+        return ("YES", "NO")
+    return (side_arg.upper(),)
+
+
+def _best_signal(target_reports: list[dict[str, Any]]) -> dict[str, Any] | None:
+    decisions = [
+        {**decision, "target_date": report["target_date"], "market_available": report["market_available"]}
+        for report in target_reports
+        for decision in report["decisions"]
+    ]
+    if not decisions:
+        return None
+    decisions.sort(
+        key=lambda row: (
+            row["market_available"],
+            row["approved"],
+            row["trade_quality_score"],
+            row["edge_lcb"],
+            row["edge"],
+        ),
+        reverse=True,
+    )
+    return decisions[0]
+
+
+def _round_optional(value: float | None) -> float | None:
+    if value is None:
+        return None
+    return round(float(value), 4)
+
+
+def _enforce_live_forecast_freshness(forecast: ForecastSnapshot, config: StrategyConfig) -> None:
+    today = parse_target_date("today")
+    if forecast.target_date < today:
+        return
+    age_hours = forecast.age_hours()
+    if age_hours is None:
+        raise ForecastDataError("forecast snapshot has no readable fetched_at timestamp")
+    if age_hours > config.max_forecast_age_hours:
+        raise ForecastDataError(
+            f"forecast snapshot for {forecast.target_date.isoformat()} is stale "
+            f"({age_hours:.1f}h old; max {config.max_forecast_age_hours:.1f}h)"
+        )

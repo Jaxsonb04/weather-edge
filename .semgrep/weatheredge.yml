@@ -1,0 +1,28 @@
+rules:
+  - id: weatheredge-no-private-local-metadata
+    languages: [generic]
+    severity: ERROR
+    message: "Private local path, identity, or migration metadata must not be committed."
+    paths:
+      exclude:
+        - /.semgrep/**
+        - /.git/**
+    pattern-regex: '(/Users/[A-Za-z0-9._-]+/|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.edu\b|LightsailDefaultKey)'
+
+  - id: weatheredge-no-high-confidence-secrets
+    languages: [generic]
+    severity: ERROR
+    message: "High-confidence secret-like token found. Move secrets to local env/secret storage."
+    paths:
+      exclude:
+        - /.semgrep/**
+        - /.git/**
+    pattern-regex: '(AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9_]{36}|sk-[A-Za-z0-9]{20,}|AIza[0-9A-Za-z_-]{35}|BEGIN (RSA |OPENSSH |EC |DSA )?PRIVATE KEY)'
+
+  - id: weatheredge-python-shell-execution
+    languages: [python]
+    severity: ERROR
+    message: "Avoid shell=True or os.system in committed Python; use argv lists and explicit validation."
+    pattern-either:
+      - pattern: subprocess.$FUNC(..., shell=True, ...)
+      - pattern: os.system(...)

@@ -1,0 +1,203 @@
+from dataclasses import replace
+from datetime import date, timedelta
+
+from sfo_kalshi_quant.config import StrategyConfig
+from sfo_kalshi_quant.models import ForecastOutcome, IntradaySnapshot
+from sfo_kalshi_quant.probability import (
+    ResidualCalibrator,
+    _market_implied_probabilities,
+    _market_prior_reliability,
+    _model_weight,
+)
+from sfo_kalshi_quant.standard_bins import standard_sfo_bins
+
+
+def _outcomes():
+    start = date(2025, 1, 1)
+    rows = []
+    for idx in range(220):
+        pred = 66.0 + (idx % 10) * 0.7
+        residual = [-3, -2, -1, 0, 1, 2, 3, 4, -1, 1][idx % 10]
+        rows.append(
+            ForecastOutcome(
+                local_date=start + timedelta(days=idx),
+                predicted_high_f=pred,
+                actual_high_f=pred + residual,
+            )
+        )
+    return rows
+
+
+def test_bucket_probabilities_sum_to_one():
+    config = StrategyConfig(min_conditional_samples=20)
+    calibrator = ResidualCalibrator(_outcomes(), config)
+    probabilities = calibrator.bucket_probabilities(standard_sfo_bins(), 69.0)
+    total = sum(row.probability for row in probabilities.values())
+    assert abs(total - 1.0) < 1e-9
+    assert all(0.0 <= row.lower_confidence <= row.probability <= 1.0 for row in probabilities.values())
+
+
+def test_observed_high_so_far_rules_out_lower_today_bins():
+    config = StrategyConfig(min_conditional_samples=20)
+    calibrator = ResidualCalibrator(_outcomes(), config)
+    markets = [
+        replace(
+            market,
+            status="active",
+            yes_bid=0.01,
+            yes_ask=0.02,
+            yes_bid_size=10.0,
+            yes_ask_size=10.0,
+        )
+        for market in standard_sfo_bins()
+    ]
+    probabilities = calibrator.bucket_probabilities(
+        markets,
+        68.0,
+        observed_high_f=67.0,
+    )
+    low = next(row for row in probabilities.values() if row.label == "65° or below")
+    assert low.probability == 0.0
+    assert low.model_probability == 0.0
+    assert abs(sum(row.probability for row in probabilities.values()) - 1.0) < 1e-9
+
+
+def test_observed_high_above_half_degree_boundary_rules_out_current_integer_bin():
+    config = StrategyConfig(min_conditional_samples=20)
+    calibrator = ResidualCalibrator(_outcomes(), config)
+    probabilities = calibrator.bucket_probabilities(
+        standard_sfo_bins(),
+        69.9,
+        observed_high_f=69.9,
+    )
+    current = next(row for row in probabilities.values() if row.label == "68° to 69°")
+    next_bin = next(row for row in probabilities.values() if row.label == "70° to 71°")
+    assert current.probability == 0.0
+    assert current.model_probability == 0.0
+    assert next_bin.probability > 0.0
+
+
+def test_intraday_near_boundary_before_peak_shifts_probability_to_next_bin():
+    config = StrategyConfig(min_conditional_samples=20)
+    calibrator = ResidualCalibrator(_outcomes(), config)
+    intraday = IntradaySnapshot(
+        target_date=date(2026, 6, 5),
+        observed_high_f=69.3,
+        latest_temp_f=69.3,
+        latest_observed_at="2026-06-05T20:00:00+00:00",
+        remaining_forecast_high_f=70.0,
+        forecast_fetched_at="2026-06-05T19:45:00+00:00",
+    )
+    probabilities = calibrator.bucket_probabilities(
+        standard_sfo_bins(),
+        69.3,
+        observed_high_f=69.3,
+        intraday=intraday,
+    )
+    current = next(row for row in probabilities.values() if row.label == "68° to 69°")
+    next_bin = next(row for row in probabilities.values() if row.label == "70° to 71°")
+    assert current.intraday_probability is not None
+    assert current.remaining_heat_risk is not None
+    assert current.remaining_heat_risk > 0.50
+    assert next_bin.probability > current.probability
+
+
+def test_market_prior_uses_yes_and_no_book_bounds():
+    base = standard_sfo_bins()
+    markets = [
+        replace(
+            base[0],
+            status="active",
+            yes_bid=0.04,
+            yes_ask=0.06,
+            no_bid=0.94,
+            no_ask=0.96,
+        ),
+        replace(
+            base[1],
+            status="active",
+            yes_bid=0.14,
+            yes_ask=0.16,
+            no_bid=0.84,
+            no_ask=0.86,
+        ),
+    ]
+
+    probabilities = _market_implied_probabilities(markets)
+
+    assert round(probabilities[markets[0].ticker], 2) == 0.25
+    assert round(probabilities[markets[1].ticker], 2) == 0.75
+
+
+def test_market_prior_weight_is_reliability_aware():
+    base = standard_sfo_bins()[0]
+    config = StrategyConfig()
+    tight_deep = replace(
+        base,
+        status="active",
+        yes_bid=0.49,
+        yes_ask=0.51,
+        no_bid=0.49,
+        no_ask=0.51,
+        yes_bid_size=100.0,
+        yes_ask_size=100.0,
+    )
+    wide_thin = replace(
+        base,
+        status="active",
+        yes_bid=0.20,
+        yes_ask=0.35,
+        no_bid=0.65,
+        no_ask=0.80,
+        yes_bid_size=1.0,
+        yes_ask_size=1.0,
+    )
+
+    assert _market_prior_reliability(tight_deep, config) > _market_prior_reliability(wide_thin, config)
+    assert _model_weight(0.0, market=tight_deep, config=config) < _model_weight(
+        0.0,
+        market=wide_thin,
+        config=config,
+    )
+
+
+def test_predawn_intraday_does_not_crush_high_bracket_tails():
+    """At 2:36am the overnight observed high says ~nothing about the afternoon
+    peak; the 2026-06-10 book bet against >=79F at p=0.008 and the day settled
+    at 79F. Pre-dawn the intraday gaussian must stay wide and lightly weighted."""
+
+    config = StrategyConfig(min_conditional_samples=20)
+    calibrator = ResidualCalibrator(_outcomes(), config)
+    markets = [
+        replace(
+            market,
+            status="active",
+            yes_bid=0.10,
+            yes_ask=0.12,
+            yes_bid_size=20.0,
+            yes_ask_size=20.0,
+        )
+        for market in standard_sfo_bins()
+    ]
+    intraday = IntradaySnapshot(
+        target_date=date(2026, 6, 10),
+        observed_high_f=55.0,
+        latest_temp_f=54.6,
+        latest_observed_at="2026-06-10T09:36:00+00:00",  # 2:36am PDT
+        remaining_forecast_high_f=68.0,
+        forecast_fetched_at="2026-06-10T09:30:00+00:00",
+        observation_count=20,
+        observed_high_source="nws_station_observations",
+        is_complete=False,
+    )
+    probabilities = calibrator.bucket_probabilities(
+        markets,
+        70.2,
+        source_spread_f=9.6,
+        intraday=intraday,
+    )
+    top = next(row for row in probabilities.values() if row.label == "74° or above")
+    assert top.intraday_probability is not None
+    assert top.intraday_probability > 0.05
+    # The blended weather probability must not collapse to near-zero either.
+    assert top.probability > 0.05

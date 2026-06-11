@@ -1,0 +1,194 @@
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SFO_TZ = ZoneInfo("America/Los_Angeles")
+SERIES_TICKER = "KXHIGHTSFO"
+
+
+def _default_forecaster_root() -> Path:
+    return PROJECT_ROOT.parent / "forecaster"
+
+
+DEFAULT_FORECASTER_ROOT = Path(os.getenv("SFO_FORECASTER_ROOT", str(_default_forecaster_root())))
+DEFAULT_DB_PATH = Path(os.getenv("SFO_KALSHI_DB", PROJECT_ROOT / "data" / "paper_trading.db"))
+
+
+@dataclass(frozen=True)
+class StrategyConfig:
+    """Conservative gate values for paper trading.
+
+    `StrategyConfig()` stays strict so tests and explicit conservative runs are
+    stable. The CLI uses `strategy_config_for_profile()` so the paper-research
+    default can collect more examples without changing these baseline gates.
+    """
+
+    paper_bankroll: float = float(os.getenv("PAPER_BANKROLL", "1000"))
+    min_edge: float = 0.03
+    min_edge_lcb: float = 0.00
+    max_spread: float = 0.06
+    max_spread_fraction_of_cost: float = 0.35
+    min_yes_bid: float = 0.01
+    min_yes_bid_size: float = 1.0
+    max_model_market_gap: float = 0.12
+    min_posterior_probability: float = 0.06
+    fractional_kelly: float = 0.15
+    kelly_lcb_weight: float = 1.0
+    max_position_risk_pct: float = 0.01
+    max_event_risk_pct: float = 0.03
+    max_target_exposure_pct: float = 0.05
+    max_entries_per_market_side: int = 1
+    max_contracts_per_market: float = 25.0
+    max_forecast_age_hours: float = 30.0
+    allow_fractional_contracts: bool = False
+    taker_fee_rate: float = 0.07
+    maker_fee_rate: float = 0.0175
+    fee_multiplier: float = 1.0
+    min_conditional_samples: int = 35
+    shrinkage_samples: int = 70
+    empirical_weight: float = 0.75
+    confidence_z: float = 1.96
+    market_prior_weight: float = 0.45
+    min_model_weight: float = 0.35
+    source_spread_market_weight_per_f: float = 0.04
+    market_prior_min_reliability: float = 0.20
+    market_prior_full_depth: float = 25.0
+    market_prior_tight_spread: float = 0.02
+    market_prior_wide_spread: float = 0.12
+    market_disagreement_lcb_penalty: float = 0.35
+    ensemble_weight: float = 0.30
+    ensemble_min_members: int = 10
+    ensemble_disagreement_lcb_penalty: float = 0.20
+    intraday_probability_weight: float = 0.65
+    intraday_boundary_watch_f: float = 0.35
+    intraday_boundary_weight_boost: float = 0.15
+    intraday_min_sigma_f: float = 0.25
+    # Cap must stay above the pre-dawn sigma floor (~3F) or the intraday
+    # gaussian goes back to crushing high-bracket tails overnight.
+    intraday_max_sigma_f: float = 3.25
+    # When the forecast sources disagree by more than this many degrees F,
+    # the point blend has no business making confident bracket bets: the
+    # 2026-06-10 losses all entered with source spread 9.6-11.0F while the
+    # blend missed the settled high by ~4F.
+    max_source_spread_f: float = 6.0
+    cheap_tail_max_ask: float = 0.05
+    cheap_tail_min_yes_bid: float = 0.01
+    cheap_tail_min_yes_bid_size: float = 25.0
+    cheap_tail_min_probability_lcb: float = 0.12
+    cheap_tail_min_edge_lcb: float = 0.07
+    cheap_tail_max_model_market_gap: float = 0.08
+    cheap_tail_min_ensemble_probability: float = 0.08
+
+
+BALANCED_PROFILE_OVERRIDES = {
+    # Paper-trading default. The first live month (Jun 2026) proved that
+    # negative lower-bound edge collects only noise: 190 approved trades with
+    # edge_lcb < 0 produced a 3/190 win rate, while sub-5c tails won 1.9%
+    # against a modeled 8.7%. Balanced now keeps the conservative statistical
+    # floor (edge_lcb >= 0) and differs from conservative only in a slightly
+    # lower headline-edge bar and a longer forecast-age allowance.
+    "min_edge": 0.02,
+    "min_edge_lcb": 0.00,
+    "max_spread": 0.07,
+    "max_model_market_gap": 0.15,
+    "min_posterior_probability": 0.10,
+    "fractional_kelly": 0.12,
+    "kelly_lcb_weight": 1.0,
+    "max_position_risk_pct": 0.01,
+    "max_event_risk_pct": 0.03,
+    "max_forecast_age_hours": 36.0,
+    "max_contracts_per_market": 25.0,
+    "max_source_spread_f": 7.0,
+}
+
+
+EXPLORATORY_PROFILE_OVERRIDES = {
+    # Paper-data collection mode for sparse markets. This should never be used
+    # as a live-money profile; it trades a slightly looser statistical bar for
+    # much smaller size. Structural gates (relative spread, re-entry cap,
+    # target exposure) stay identical to balanced.
+    **BALANCED_PROFILE_OVERRIDES,
+    "min_edge": 0.01,
+    "min_edge_lcb": -0.01,
+    "max_spread": 0.08,
+    "max_model_market_gap": 0.20,
+    "min_posterior_probability": 0.08,
+    "fractional_kelly": 0.05,
+    "max_position_risk_pct": 0.005,
+    "max_event_risk_pct": 0.015,
+    "max_target_exposure_pct": 0.025,
+    "max_contracts_per_market": 10.0,
+    "max_source_spread_f": 8.0,
+    "cheap_tail_min_probability_lcb": 0.10,
+    "cheap_tail_min_edge_lcb": 0.04,
+}
+
+
+FAST_FEEDBACK_PROFILE_OVERRIDES = {
+    # Paper-only acceleration mode. This is intentionally easier to trigger
+    # than exploratory so the project can collect enough entries to learn from,
+    # while position size is capped hard enough that bad research ideas stay
+    # small in the paper journal.
+    **BALANCED_PROFILE_OVERRIDES,
+    "min_edge": 0.00,
+    "min_edge_lcb": -0.08,
+    "max_spread": 0.12,
+    "max_spread_fraction_of_cost": 0.75,
+    "min_yes_bid": 0.01,
+    "min_yes_bid_size": 1.0,
+    "max_model_market_gap": 0.35,
+    "min_posterior_probability": 0.03,
+    "fractional_kelly": 0.03,
+    "kelly_lcb_weight": 0.0,
+    "max_position_risk_pct": 0.003,
+    "max_event_risk_pct": 0.010,
+    "max_target_exposure_pct": 0.015,
+    "max_contracts_per_market": 5.0,
+    # Research profile stays looser so disagreement days still produce
+    # decision snapshots, but it no longer trades straight through extreme
+    # source conflict either.
+    "max_source_spread_f": 12.0,
+    "cheap_tail_min_yes_bid": 0.01,
+    "cheap_tail_min_yes_bid_size": 1.0,
+    "cheap_tail_min_probability_lcb": 0.02,
+    "cheap_tail_min_edge_lcb": -0.03,
+    "cheap_tail_max_model_market_gap": 0.25,
+    "cheap_tail_min_ensemble_probability": 0.03,
+}
+
+
+def normalize_risk_profile_name(profile: str | None = None) -> str:
+    normalized = (profile or os.getenv("PAPER_RISK_PROFILE", "balanced")).strip().lower()
+    normalized = normalized.replace("_", "-")
+    if normalized in ("", "conservative"):
+        return "conservative"
+    if normalized == "balanced":
+        return "balanced"
+    if normalized == "exploratory":
+        return "exploratory"
+    if normalized in ("fast", "fast-feedback"):
+        return "fast-feedback"
+    raise ValueError("risk profile must be conservative, balanced, exploratory, or fast-feedback")
+
+
+def strategy_config_for_profile(profile: str | None = None) -> StrategyConfig:
+    normalized = normalize_risk_profile_name(profile)
+    base = StrategyConfig()
+    if normalized == "conservative":
+        return base
+    if normalized == "balanced":
+        return StrategyConfig(**{**base.__dict__, **BALANCED_PROFILE_OVERRIDES})
+    if normalized == "exploratory":
+        return StrategyConfig(**{**base.__dict__, **EXPLORATORY_PROFILE_OVERRIDES})
+    if normalized == "fast-feedback":
+        return StrategyConfig(**{**base.__dict__, **FAST_FEEDBACK_PROFILE_OVERRIDES})
+    raise ValueError("risk profile must be conservative, balanced, exploratory, or fast-feedback")
+
+
+def project_path(*parts: str) -> Path:
+    return PROJECT_ROOT.joinpath(*parts)

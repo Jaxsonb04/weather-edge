@@ -1,0 +1,31 @@
+[project]
+name = "weatheredge"
+version = "0.1.0"
+description = "Unified SFO weather forecasting and Kalshi paper-trading research project."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+forecaster = [
+  "pandas",
+  "numpy",
+  "matplotlib",
+  "seaborn",
+  "scikit-learn",
+  "scipy",
+  "xgboost",
+  "torch",
+]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+sfo-kalshi = "sfo_kalshi_quant.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["trading"]
+include = ["sfo_kalshi_quant*"]
+
+[tool.pytest.ini_options]
+testpaths = ["trading/tests"]
+pythonpath = ["trading"]

@@ -1,0 +1,113 @@
+from __future__ import annotations
+
+import importlib.util
+import sys
+import tempfile
+from pathlib import Path
+
+
+def _load_health_module():
+    script_path = Path(__file__).resolve().parents[2] / "scripts" / "weatheredge_health_check.py"
+    spec = importlib.util.spec_from_file_location("weatheredge_health_check", script_path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+health = _load_health_module()
+
+
+def _write(root: Path, relative_path: str, content: str = "") -> None:
+    path = root / relative_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+
+def _make_minimal_project(root: Path) -> Path:
+    _write(root, "README.md", "# WeatherEdge\n")
+    _write(root, "CONTEXT.md", "# WeatherEdge Context\n")
+    _write(root, ".gitignore", ".env\n")
+    _write(root, "docs/architecture.md", "# Architecture\n")
+    _write(root, "forecaster/build_dashboard.py", "print('build dashboard')\n")
+    _write(root, "forecaster/forecast_data.json", "{}\n")
+    _write(root, "forecaster/weather_story_data.json", "{}\n")
+    _write(root, "scripts/run_tests.sh", "#!/usr/bin/env bash\n")
+    _write(root, "trading/tests/run_tests.py", "def main(): return 0\n")
+    _write(
+        root,
+        "trading/sfo_kalshi_quant/config.py",
+        "DEFAULT_FORECASTER_ROOT = 'WeatherEdge/forecaster'\n",
+    )
+    return root
+
+
+def test_minimal_project_has_no_failures():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = _make_minimal_project(Path(tmp))
+        results = health.run_checks(root)
+        failures = [result for result in results if result.status == "FAIL"]
+        assert failures == []
+
+
+def test_env_file_is_a_failure():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = _make_minimal_project(Path(tmp))
+        google_key = "AIza" + ("A" * 35)
+        _write(
+            root,
+            ".env",
+            f"GOOGLE_WEATHER_API_KEY={google_key}\n",
+        )
+        results = health.run_checks(root)
+        assert any(
+            result.name == "local secret files" and result.status == "FAIL"
+            for result in results
+        )
+
+
+def test_high_confidence_secret_pattern_is_a_failure():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = _make_minimal_project(Path(tmp))
+        token = "ghp_" + "1234567890abcdefghijklmnopqrstuvwxyz"
+        _write(root, "README.md", f"token {token}\n")
+        results = health.run_checks(root)
+        assert any(
+            result.name == "secret pattern scan" and result.status == "FAIL"
+            for result in results
+        )
+
+
+def test_local_runtime_artifact_is_a_warning():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = _make_minimal_project(Path(tmp))
+        _write(root, "forecaster/google_weather_cache.json", '{"available": true}\n')
+
+        results = health.run_checks(root)
+        runtime = next(result for result in results if result.name == "local runtime data")
+
+        assert runtime.status == "WARN"
+        assert "AWS-side after sync" in runtime.details
+
+
+def test_local_runtime_placeholder_is_not_stale():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = _make_minimal_project(Path(tmp))
+        _write(
+            root,
+            "forecaster/google_weather_cache.json",
+            '{"available": false, "local_runtime_placeholder": true}\n',
+        )
+        _write(
+            root,
+            "forecaster/strategy_research.json",
+            '{"available": false, "local_runtime_placeholder": true}\n',
+        )
+
+        results = health.run_checks(root)
+        runtime = next(result for result in results if result.name == "local runtime data")
+
+        assert runtime.status == "PASS"
+        assert "strategy_research.json" in runtime.details

@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+FORECASTER_DIR="${SFO_FORECASTER_ROOT:-/opt/weatheredge/forecaster}"
+REMOTE_URL="${SFO_FORECASTER_GIT_REMOTE:-git@github.com:Jaxsonb04/weather-edge.git}"
+BRANCH="${SFO_FORECASTER_GIT_BRANCH:-main}"
+DEPLOY_KEY="${SFO_PAGES_DEPLOY_KEY:-$HOME/.ssh/sfo_weather_pages_deploy}"
+SOURCE_CACHE_DIR="${SFO_FORECASTER_SOURCE_CACHE:-/opt/weatheredge/.cache/main}"
+SOURCE_SUBDIR="${SFO_FORECASTER_SOURCE_SUBDIR:-forecaster}"
+
+if [[ "$REMOTE_URL" == git@* && ! -f "$DEPLOY_KEY" ]]; then
+  echo "missing deploy key for private SSH remote: $DEPLOY_KEY" >&2
+  exit 1
+fi
+
+if [[ "$REMOTE_URL" == git@* ]]; then
+  export GIT_SSH_COMMAND="ssh -i $DEPLOY_KEY -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+fi
+
+mkdir -p "$(dirname "$SOURCE_CACHE_DIR")" "$FORECASTER_DIR"
+
+if [[ ! -d "$SOURCE_CACHE_DIR/.git" ]]; then
+  rm -rf "$SOURCE_CACHE_DIR"
+  git clone --depth 1 --branch "$BRANCH" "$REMOTE_URL" "$SOURCE_CACHE_DIR"
+else
+  cd "$SOURCE_CACHE_DIR"
+  git remote set-url origin "$REMOTE_URL"
+  git fetch --depth 1 origin "$BRANCH"
+  git checkout -B "$BRANCH" "origin/$BRANCH"
+fi
+
+RSYNC_SOURCE="$SOURCE_CACHE_DIR/"
+if [[ -n "$SOURCE_SUBDIR" ]]; then
+  RSYNC_SOURCE="$SOURCE_CACHE_DIR/$SOURCE_SUBDIR/"
+fi
+
+if [[ ! -f "$RSYNC_SOURCE/google_weather_cache.py" ]]; then
+  echo "missing forecaster source at $RSYNC_SOURCE" >&2
+  exit 1
+fi
+
+rsync -a --delete \
+  --exclude ".git/" \
+  --exclude ".venv/" \
+  --exclude "venv/" \
+  --exclude ".env" \
+  --exclude "__pycache__/" \
+  --exclude "*.pyc" \
+  --exclude "logs/" \
+  --exclude "models/" \
+  --exclude "weather.db" \
+  --exclude "*.db-journal" \
+  --exclude "*.sqlite" \
+  --exclude "*.sqlite3" \
+  --exclude ".google_weather_usage.json" \
+  --exclude "google_weather_cache.json" \
+  --exclude "trading_signal.json" \
+  --exclude "strategy_research.json" \
+  --exclude "strategy_research.protected.json" \
+  --exclude "dataset_research.json" \
+  --exclude "forecast_data.json" \
+  --exclude "weather_story_data.json" \
+  --exclude "/index.html" \
+  --exclude "/details.html" \
+  --exclude "/strategy-lab.html" \
+  "$RSYNC_SOURCE" "$FORECASTER_DIR"/
+
+echo "synced $REMOTE_URL#$BRANCH:$SOURCE_SUBDIR into $FORECASTER_DIR"

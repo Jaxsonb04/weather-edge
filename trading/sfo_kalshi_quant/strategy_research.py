@@ -1,0 +1,1712 @@
+from __future__ import annotations
+
+import json
+import math
+import os
+import sqlite3
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+from .backtest import run_walk_forward_calibration_backtest
+from .config import DEFAULT_DB_PATH, DEFAULT_FORECASTER_ROOT, SFO_TZ, StrategyConfig, strategy_config_for_profile
+from .db import PaperStore
+from .fees import quadratic_fee_average_per_contract
+from .forecast import ForecastDataError, SfoForecasterAdapter
+from .settlement_day import settlement_today
+from .summary import build_paper_summary
+
+
+ACTIVE_CALIBRATION_SOURCE = "lstm"
+CHALLENGER_CALIBRATION_SOURCE = "clean-blend/combined"
+MIN_CLEAN_WINNER_SAMPLE = 60
+DEFAULT_TAKE_PROFIT_PCT = 35.0
+DEFAULT_STOP_LOSS_PCT = 35.0
+
+
+def build_strategy_research(
+    *,
+    forecaster_root: Path = DEFAULT_FORECASTER_ROOT,
+    db_path: Path = DEFAULT_DB_PATH,
+    config: StrategyConfig | None = None,
+    calibration_min_train: int = 180,
+) -> dict[str, Any]:
+    """Build the public Strategy Lab artifact from existing runtime state.
+
+    This is diagnostic-only. It reads the AWS-side forecast archive, public
+    trading signal, and paper-trading database when present; it does not place,
+    close, or settle paper orders.
+    """
+
+    forecaster_root = Path(forecaster_root)
+    db_path = Path(db_path)
+    cfg = config or strategy_config_for_profile(None)
+    adapter = SfoForecasterAdapter(forecaster_root)
+    trading_signal = _load_json_optional(forecaster_root / "trading_signal.json")
+    dataset_research = _load_json_optional(forecaster_root / "dataset_research.json")
+
+    active_calibration = _calibration_payload(
+        adapter,
+        source="lstm",
+        label="lstm",
+        role="Active execution calibration",
+        min_train=calibration_min_train,
+    )
+    challenger_calibration = _calibration_payload(
+        adapter,
+        source="clean-blend",
+        label=CHALLENGER_CALIBRATION_SOURCE,
+        role="Challenger research calibration",
+        min_train=calibration_min_train,
+    )
+    comparison = _comparison_summary(active_calibration, challenger_calibration)
+    backtest = _signal_backtest_payload(adapter, db_path)
+    signal_quality = _signal_quality_payload(db_path, trading_signal)
+    paper = _paper_payload(db_path)
+    daily_summary = _daily_summary_payload(
+        db_path=db_path,
+        forecaster_root=forecaster_root,
+        config=cfg,
+    )
+    status = _status_payload(
+        config=cfg,
+        db_path=db_path,
+        trading_signal=trading_signal,
+        backtest=backtest,
+        signal_quality=signal_quality,
+        paper=paper,
+    )
+
+    return {
+        "schema_version": 1,
+        "available": True,
+        "mode": "paper_research_only",
+        "live_orders_enabled": False,
+        "generated_at": datetime.now(UTC).isoformat(),
+        "source_of_truth": "AWS Lightsail runtime artifacts after sync and refresh",
+        "status": status,
+        "daily_summary": daily_summary,
+        "calibration_comparison": {
+            "active": active_calibration,
+            "challenger": challenger_calibration,
+            "comparison": comparison,
+        },
+        "signal_quality": signal_quality,
+        "backtest_summary": backtest,
+        "paper_trading": paper,
+        "dataset_research": _dataset_research_summary(dataset_research),
+        "research_notes": _research_notes(),
+        "disclaimer": (
+            "Paper-trading research only. The active AWS execution calibration "
+            "remains pinned to lstm; this artifact does not place live orders."
+        ),
+    }
+
+
+def _daily_summary_payload(
+    *,
+    db_path: Path,
+    forecaster_root: Path,
+    config: StrategyConfig,
+) -> dict[str, Any]:
+    try:
+        payload = build_paper_summary(
+            db_path=db_path,
+            forecaster_root=forecaster_root,
+            config=config,
+            days=7,
+        )
+    except Exception as exc:  # diagnostics artifact must not fail the refresh
+        return {"available": False, "reason": f"{type(exc).__name__}: {exc}"}
+    return {"available": True, **payload}
+
+
+def write_strategy_research(path: Path, payload: dict[str, Any]) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _calibration_payload(
+    adapter: SfoForecasterAdapter,
+    *,
+    source: str,
+    label: str,
+    role: str,
+    min_train: int,
+) -> dict[str, Any]:
+    try:
+        outcomes = (
+            adapter.load_clean_blend_outcomes()
+            if source == "clean-blend"
+            else adapter.load_lstm_outcomes()
+        )
+    except (ForecastDataError, FileNotFoundError, KeyError, ValueError) as exc:
+        return {
+            "available": False,
+            "source": label,
+            "role": role,
+            "outcome_count": 0,
+            "sample_size": 0,
+            "minimum_train_rows": min_train,
+            "reason": str(exc),
+            "buckets": [],
+            "cohorts": _empty_cohorts(),
+        }
+
+    if len(outcomes) <= min_train:
+        return {
+            "available": False,
+            "source": label,
+            "role": role,
+            "outcome_count": len(outcomes),
+            "sample_size": 0,
+            "minimum_train_rows": min_train,
+            "reason": (
+                f"{label} has {len(outcomes)} outcome rows; needs more than "
+                f"{min_train} rows for this walk-forward comparison."
+            ),
+            "buckets": [],
+            "cohorts": _empty_cohorts(),
+        }
+
+    try:
+        result = run_walk_forward_calibration_backtest(outcomes, min_train=min_train)
+    except ValueError as exc:
+        return {
+            "available": False,
+            "source": label,
+            "role": role,
+            "outcome_count": len(outcomes),
+            "sample_size": 0,
+            "minimum_train_rows": min_train,
+            "reason": str(exc),
+            "buckets": [],
+            "cohorts": _empty_cohorts(),
+        }
+
+    return {
+        "available": True,
+        "source": label,
+        "role": role,
+        "outcome_count": len(outcomes),
+        "sample_size": result.n,
+        "minimum_train_rows": min_train,
+        "brier_score": _round(result.brier_score, 4),
+        "log_loss": _round(result.log_loss, 4),
+        "top_bin_accuracy": _round(result.top_bin_accuracy, 4),
+        "avg_winning_probability": _round(result.avg_winning_probability, 4),
+        "avg_entropy": _round(result.avg_entropy, 4),
+        "buckets": [
+            {
+                "range": f"{bucket.lower:.1f}-{bucket.upper:.1f}",
+                "lower": bucket.lower,
+                "upper": bucket.upper,
+                "count": bucket.count,
+                "avg_probability": _round(bucket.avg_probability, 4),
+                "observed_frequency": _round(bucket.observed_frequency, 4),
+                "calibration_gap": _round(bucket.observed_frequency - bucket.avg_probability, 4),
+                "brier_score": _round(bucket.brier_score, 4),
+            }
+            for bucket in result.calibration_buckets
+        ],
+        "cohorts": _cohort_rows(result.cohorts),
+    }
+
+
+def _comparison_summary(active: dict[str, Any], challenger: dict[str, Any]) -> dict[str, Any]:
+    recommendation = "Keep AWS execution pinned to lstm."
+    if not active.get("available"):
+        return {
+            "winner": "not_available",
+            "label": "Active calibration data unavailable",
+            "recommendation": recommendation,
+        }
+    if not challenger.get("available"):
+        return {
+            "winner": "not_enough_clean_data",
+            "label": "Not enough clean challenger data yet",
+            "recommendation": recommendation,
+        }
+    if float(challenger.get("sample_size") or 0) < MIN_CLEAN_WINNER_SAMPLE:
+        return {
+            "winner": "not_enough_clean_data",
+            "label": "Challenger sample is still too small",
+            "recommendation": recommendation,
+        }
+
+    challenger_brier = float(challenger["brier_score"])
+    active_brier = float(active["brier_score"])
+    challenger_log = float(challenger["log_loss"])
+    active_log = float(active["log_loss"])
+    if challenger_brier < active_brier and challenger_log <= active_log:
+        return {
+            "winner": "challenger",
+            "label": "Challenger leads on clean metrics",
+            "recommendation": (
+                "Do not switch automatically. Review point-in-time signal "
+                "quality, paper PnL, and tail calibration before changing AWS."
+            ),
+        }
+    if active_brier <= challenger_brier and active_log <= challenger_log:
+        return {
+            "winner": "active",
+            "label": "Active lstm still leads",
+            "recommendation": recommendation,
+        }
+    return {
+        "winner": "mixed",
+        "label": "Metrics are mixed",
+        "recommendation": recommendation,
+    }
+
+
+def _signal_backtest_payload(adapter: SfoForecasterAdapter, db_path: Path) -> dict[str, Any]:
+    empty = {
+        "available": False,
+        "sample_mode": "latest-per-market-side",
+        "pre_resolution_only": True,
+        "counts": {
+            "raw_signals": 0,
+            "pre_resolution_signals": 0,
+            "deduped_signals": 0,
+            "excluded_post_resolution_signals": 0,
+            "settled_signals": 0,
+            "approved_signals": 0,
+            "approved_raw_signals": 0,
+            "approved_pre_resolution_signals": 0,
+        },
+        "metrics_available": False,
+        "metrics": {},
+        "quality_buckets": [],
+    }
+    if not db_path.exists():
+        return {**empty, "reason": f"Paper-trading DB not found: {db_path}"}
+    if not _db_table_exists(db_path, "decision_snapshots"):
+        return {**empty, "reason": "decision_snapshots table is not available yet."}
+
+    store = PaperStore(db_path, init=False)
+    settlements = adapter.load_ksfo_daily_highs()
+    summary = store.signal_backtest_summary(
+        settlements,
+        pre_resolution_only=True,
+        sample_mode="latest-per-market-side",
+    )
+    counts = {
+        "raw_signals": int(summary["raw_signals"]),
+        "pre_resolution_signals": int(summary["pre_resolution_signals"]),
+        "deduped_signals": int(summary["signals"]),
+        "excluded_post_resolution_signals": int(summary["excluded_post_resolution_signals"]),
+        "settled_signals": int(summary["settled_signals"]),
+        "approved_signals": int(summary["approved_signals"]),
+        "approved_raw_signals": int(summary.get("approved_raw_signals", summary["approved_signals"])),
+        "approved_pre_resolution_signals": int(
+            summary.get("approved_pre_resolution_signals", summary["approved_signals"])
+        ),
+    }
+    metrics_available = counts["settled_signals"] > 0
+    metric = _round if metrics_available else _null_metric
+    return {
+        "available": counts["raw_signals"] > 0,
+        "metrics_available": metrics_available,
+        "sample_mode": summary["sample_mode"],
+        "pre_resolution_only": bool(summary["pre_resolution_only"]),
+        "dedupe_explanation": (
+            "Repeated 15-minute AWS scans are counted once per target, market, "
+            "and side by default, using the latest pre-resolution row."
+        ),
+        "counts": counts,
+        "metrics": {
+            "approval_rate": _round(summary["approval_rate"], 4),
+            "brier_score": metric(summary["brier_score"], 4),
+            "log_loss": metric(summary["log_loss"], 4),
+            "hit_rate": metric(summary["win_rate"], 4),
+            "avg_probability": metric(summary["avg_probability"], 4),
+            "avg_edge": metric(summary["avg_edge"], 4),
+            "avg_edge_lcb": metric(summary["avg_edge_lcb"], 4),
+            "avg_quality": metric(summary["avg_quality"], 1),
+            "approved_paper_pnl": metric(summary["approved_paper_pnl"], 2),
+            "approved_capital_at_risk": metric(summary["approved_capital_at_risk"], 2),
+            "approved_roi": metric(summary["approved_roi"], 4),
+            "approved_hit_rate": metric(summary["approved_hit_rate"], 4),
+        },
+        "quality_buckets": [_round_dict(bucket) for bucket in summary["quality_buckets"]],
+    }
+
+
+def _signal_quality_payload(db_path: Path, trading_signal: dict[str, Any] | None) -> dict[str, Any]:
+    decisions = _latest_decision_rows(db_path)
+    source = "decision_snapshots"
+    if not decisions:
+        decisions = _decisions_from_trading_signal(trading_signal)
+        source = "trading_signal.json"
+
+    decisions.sort(
+        key=lambda row: (
+            bool(row.get("approved")),
+            _to_float(row.get("quality_score")),
+            _to_float(row.get("edge_lcb")),
+            _to_float(row.get("edge")),
+        ),
+        reverse=True,
+    )
+    decisions = decisions[:24]
+    return {
+        "available": bool(decisions),
+        "source": source,
+        "latest_candidates": decisions,
+        "charts": {
+            "probability_vs_market": _probability_market_points(decisions),
+            "edge_by_market_bucket": _edge_by_market_bucket(decisions),
+            "quality_distribution": _quality_distribution(decisions),
+        },
+    }
+
+
+def _paper_payload(db_path: Path) -> dict[str, Any]:
+    monitor = _paper_monitor_config()
+    empty = {
+        "available": False,
+        "monitor": monitor,
+        "summary": {
+            "open_positions": 0,
+            "published_open_positions": 0,
+            "hidden_open_positions": 0,
+            "duplicate_open_groups": 0,
+            "largest_duplicate_open_group": 0,
+            "unresolved_past_targets": [],
+            "latest_monitor_action_at": None,
+            "closed_positions": 0,
+            "realized_pnl": 0.0,
+            "unrealized_pnl": None,
+            "marked_open_positions": 0,
+            "open_risk": 0.0,
+            "open_value": None,
+            "win_count": 0,
+            "loss_count": 0,
+        },
+        "open_positions": [],
+        "closed_positions": [],
+        "recent_monitor_actions": [],
+        "profiles": [],
+    }
+    if not db_path.exists():
+        return {**empty, "reason": f"Paper-trading DB not found: {db_path}"}
+    if not _db_table_exists(db_path, "paper_orders"):
+        return {**empty, "reason": "paper_orders table is not available yet."}
+
+    store = PaperStore(db_path, init=False)
+    summary = store.market_backtest_summary()
+    monitor_marks = _latest_monitor_marks(db_path)
+    decision_marks = _latest_position_marks(db_path)
+    has_monitor_snapshots = _db_table_exists(db_path, "paper_monitor_snapshots")
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        open_rows = conn.execute(
+            """
+            SELECT *
+            FROM paper_orders
+            WHERE status = 'PAPER_FILLED'
+              AND settled_at IS NULL
+              AND closed_at IS NULL
+            ORDER BY created_at DESC
+            LIMIT 30
+            """
+        ).fetchall()
+        closed_rows = conn.execute(
+            """
+            SELECT *
+            FROM paper_orders
+            WHERE realized_pnl IS NOT NULL
+            ORDER BY COALESCE(closed_at, settled_at, created_at) DESC
+            LIMIT 30
+            """
+        ).fetchall()
+        closed_action_rows = conn.execute(
+            """
+            SELECT *
+            FROM paper_orders
+            WHERE closed_at IS NOT NULL OR settled_at IS NOT NULL
+            ORDER BY COALESCE(closed_at, settled_at, created_at) DESC
+            LIMIT 12
+            """
+        ).fetchall()
+        monitor_rows = []
+        if has_monitor_snapshots:
+            monitor_rows = conn.execute(
+                """
+                SELECT m.*, p.label
+                FROM paper_monitor_snapshots m
+                LEFT JOIN paper_orders p ON p.id = m.order_id
+                ORDER BY m.created_at DESC, m.id DESC
+                LIMIT 12
+                """
+            ).fetchall()
+        duplicate_rows = conn.execute(
+            """
+            SELECT target_date,
+                   market_ticker,
+                   UPPER(COALESCE(side, 'YES')) AS side,
+                   COUNT(*) AS open_orders
+            FROM paper_orders
+            WHERE status = 'PAPER_FILLED'
+              AND settled_at IS NULL
+              AND closed_at IS NULL
+            GROUP BY target_date, market_ticker, UPPER(COALESCE(side, 'YES'))
+            HAVING COUNT(*) > 1
+            ORDER BY open_orders DESC, target_date, market_ticker
+            LIMIT 5
+            """
+        ).fetchall()
+        target_rows = conn.execute(
+            """
+            SELECT target_date, COUNT(*) AS open_orders
+            FROM paper_orders
+            WHERE status = 'PAPER_FILLED'
+              AND settled_at IS NULL
+              AND closed_at IS NULL
+            GROUP BY target_date
+            ORDER BY target_date
+            """
+        ).fetchall()
+        scanning_profiles = []
+        if _db_table_exists(db_path, "decision_snapshots"):
+            scanning_profiles = [
+                str(row[0])
+                for row in conn.execute(
+                    """
+                    SELECT DISTINCT COALESCE(risk_profile, 'unknown')
+                    FROM decision_snapshots
+                    WHERE created_at >= datetime('now', '-7 days')
+                    ORDER BY 1
+                    """
+                ).fetchall()
+            ]
+        profile_rows = conn.execute(
+            """
+            SELECT COALESCE(risk_profile, 'unknown') AS risk_profile,
+                   COUNT(*) AS orders,
+                   SUM(CASE WHEN realized_pnl IS NOT NULL THEN 1 ELSE 0 END) AS resolved,
+                   SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) AS wins,
+                   SUM(CASE WHEN realized_pnl < 0 THEN 1 ELSE 0 END) AS losses,
+                   SUM(COALESCE(realized_pnl, 0.0)) AS realized_pnl,
+                   SUM(CASE WHEN status = 'PAPER_FILLED'
+                             AND settled_at IS NULL
+                             AND closed_at IS NULL
+                            THEN 1 ELSE 0 END) AS open_positions,
+                   SUM(CASE WHEN status = 'PAPER_FILLED'
+                             AND settled_at IS NULL
+                             AND closed_at IS NULL
+                            THEN contracts * cost_per_contract ELSE 0.0 END) AS open_risk,
+                   SUM(CASE WHEN realized_pnl IS NOT NULL
+                            THEN contracts * cost_per_contract ELSE 0.0 END) AS capital_resolved
+            FROM paper_orders
+            WHERE status != 'REJECTED'
+            GROUP BY COALESCE(risk_profile, 'unknown')
+            ORDER BY risk_profile
+            """
+        ).fetchall()
+
+    open_positions = [
+        _paper_row(
+            row,
+            monitor_marks.get(int(row["id"]))
+            or decision_marks.get((row["market_ticker"], _side_from_row(row))),
+            monitor,
+        )
+        for row in open_rows
+    ]
+    closed_positions = [_paper_row(row, None, monitor) for row in closed_rows]
+    action_rows = [_paper_monitor_snapshot_row(row) for row in monitor_rows] + [
+        _paper_action_row(row) for row in closed_action_rows
+    ]
+    action_rows = sorted(action_rows, key=lambda row: str(row.get("time") or ""), reverse=True)[:12]
+    duplicate_groups = [_duplicate_group_row(row) for row in duplicate_rows]
+    today = settlement_today()
+    unresolved_past_targets = [
+        {
+            "target_date": str(row["target_date"]),
+            "open_orders": int(row["open_orders"]),
+        }
+        for row in target_rows
+        if _date_from_string(row["target_date"]) is not None
+        and _date_from_string(row["target_date"]) < today
+    ]
+    marked_open_positions = [
+        row for row in open_positions if row.get("unrealized_pnl") is not None
+    ]
+    unrealized_pnl = (
+        _round(sum(_to_float(row.get("unrealized_pnl")) for row in marked_open_positions), 2)
+        if marked_open_positions
+        else None
+    )
+    open_value = (
+        _round(sum(_to_float(row.get("current_value")) for row in marked_open_positions), 2)
+        if marked_open_positions
+        else None
+    )
+    win_count = sum(1 for row in closed_rows if _to_float(row["realized_pnl"]) > 0)
+    loss_count = sum(1 for row in closed_rows if _to_float(row["realized_pnl"]) < 0)
+    return {
+        "available": True,
+        "monitor": monitor,
+        "summary": {
+            "open_positions": int(summary["open_orders"]),
+            "published_open_positions": len(open_positions),
+            "hidden_open_positions": max(0, int(summary["open_orders"]) - len(open_positions)),
+            "duplicate_open_groups": len(duplicate_groups),
+            "largest_duplicate_open_group": max(
+                [row["open_orders"] for row in duplicate_groups],
+                default=0,
+            ),
+            "unresolved_past_targets": unresolved_past_targets,
+            "latest_opened_at": open_rows[0]["created_at"] if open_rows else None,
+            "latest_monitor_action_at": action_rows[0].get("time") if action_rows else None,
+            "closed_positions": int(summary["orders"]),
+            "realized_pnl": _round(summary["realized_pnl"], 2),
+            "unrealized_pnl": unrealized_pnl,
+            "marked_open_positions": len(marked_open_positions),
+            "open_risk": _round(summary["open_capital_at_risk"], 2),
+            "open_value": open_value,
+            "capital_at_risk": _round(summary["capital_at_risk"], 2),
+            "roi": _round(summary["roi"], 4),
+            "hit_rate": _round(summary["hit_rate"], 4),
+            "win_count": win_count,
+            "loss_count": loss_count,
+        },
+        "open_positions": open_positions,
+        "closed_positions": closed_positions,
+        "recent_monitor_actions": action_rows,
+        "duplicate_open_groups": duplicate_groups,
+        "profiles": _profiles_with_scanners(
+            [_profile_summary_row(row) for row in profile_rows],
+            scanning_profiles,
+        ),
+    }
+
+
+def _profiles_with_scanners(
+    profiles: list[dict[str, Any]],
+    scanning_profiles: list[str],
+) -> list[dict[str, Any]]:
+    """A profile that scans but never trades must still appear in the lab —
+    'balanced placed nothing while fast-feedback lost' is the key diagnostic."""
+
+    present = {row["risk_profile"] for row in profiles}
+    for name in scanning_profiles:
+        if name in present:
+            continue
+        profiles.append(
+            {
+                "risk_profile": name,
+                "orders": 0,
+                "resolved": 0,
+                "wins": 0,
+                "losses": 0,
+                "hit_rate": None,
+                "realized_pnl": 0.0,
+                "roi": None,
+                "open_positions": 0,
+                "open_risk": 0.0,
+            }
+        )
+    profiles.sort(key=lambda row: row["risk_profile"])
+    return profiles
+
+
+def _profile_summary_row(row: sqlite3.Row) -> dict[str, Any]:
+    resolved = int(row["resolved"] or 0)
+    wins = int(row["wins"] or 0)
+    losses = int(row["losses"] or 0)
+    pnl = _to_float(row["realized_pnl"])
+    capital = _to_float(row["capital_resolved"])
+    return {
+        "risk_profile": str(row["risk_profile"]),
+        "orders": int(row["orders"] or 0),
+        "resolved": resolved,
+        "wins": wins,
+        "losses": losses,
+        "hit_rate": _round(wins / (wins + losses), 4) if (wins + losses) else None,
+        "realized_pnl": _round(pnl, 2),
+        "roi": _round(pnl / capital, 4) if capital > 0 else None,
+        "open_positions": int(row["open_positions"] or 0),
+        "open_risk": _round(_to_float(row["open_risk"]), 2),
+    }
+
+
+def _dataset_research_summary(payload: dict[str, Any] | None) -> dict[str, Any]:
+    """Compact Strategy Lab view of the daily dataset-research verdict.
+
+    The backfill timer collects IEM/Open-Meteo/Kalshi history every night; this
+    block is what proves the collection is feeding the promotion decision
+    rather than sitting unused in the DB.
+    """
+
+    if not payload:
+        return {
+            "available": False,
+            "reason": "dataset_research.json not published yet; the nightly backfill writes it after collection.",
+        }
+    # dataset_research.py publishes candidates under accuracy_gate with MAE
+    # metrics nested in each row's holdout block (the decision basis); legacy
+    # top-level payloads are kept readable as a fallback.
+    accuracy_gate = payload.get("accuracy_gate")
+    if not isinstance(accuracy_gate, dict):
+        accuracy_gate = {}
+    candidates = accuracy_gate.get("candidates", payload.get("candidates"))
+    candidate_rows = candidates if isinstance(candidates, list) else []
+    top = [
+        _dataset_candidate_row(row)
+        for row in candidate_rows[:6]
+        if isinstance(row, dict)
+    ]
+    return {
+        "available": True,
+        "generated_at": payload.get("generated_at"),
+        "status": payload.get("status"),
+        "promotion_rule": payload.get("promotion_rule"),
+        "candidate_count": accuracy_gate.get(
+            "candidate_count", payload.get("candidate_count", len(candidate_rows))
+        ),
+        "accuracy_candidate_count": accuracy_gate.get(
+            "accuracy_candidate_count", payload.get("accuracy_candidate_count")
+        ),
+        "candidates": top,
+    }
+
+
+def _dataset_candidate_row(row: dict[str, Any]) -> dict[str, Any]:
+    holdout = row.get("holdout")
+    metrics = holdout if isinstance(holdout, dict) else row
+    return {
+        "dataset_key": row.get("dataset_key"),
+        "decision": row.get("decision"),
+        "matched_rows": row.get("matched_rows"),
+        "dataset_mae_f": metrics.get("dataset_mae_f"),
+        "baseline_mae_f": metrics.get("baseline_mae_f"),
+        "mae_delta_vs_baseline_f": metrics.get("mae_delta_vs_baseline_f"),
+    }
+
+
+def _row_risk_profile(row: sqlite3.Row) -> str | None:
+    try:
+        value = row["risk_profile"]
+    except (IndexError, KeyError):
+        return None
+    return str(value) if value else None
+
+
+def _status_payload(
+    *,
+    config: StrategyConfig,
+    db_path: Path,
+    trading_signal: dict[str, Any] | None,
+    backtest: dict[str, Any],
+    signal_quality: dict[str, Any],
+    paper: dict[str, Any],
+) -> dict[str, Any]:
+    latest_targets = [
+        str(row.get("target_date"))
+        for row in signal_quality.get("latest_candidates", [])
+        if row.get("target_date") and row.get("market_available") is not False
+    ]
+    entry_block_reason = _entry_block_reason(signal_quality.get("latest_candidates", []))
+    for row in paper.get("open_positions", []):
+        if row.get("target_date") and not _is_probability_only_ticker(row.get("ticker")):
+            latest_targets.append(str(row["target_date"]))
+    latest_target = _status_target_date(
+        latest_targets,
+        entry_block_reason=entry_block_reason,
+    ) or _target_from_signal(trading_signal)
+    raw_count = backtest["counts"]["raw_signals"]
+    settled_count = backtest["counts"]["settled_signals"]
+    small_sample = settled_count < 30
+    alerts = _strategy_alerts(
+        paper=paper,
+        entry_block_reason=entry_block_reason,
+    )
+    return {
+        "active_calibration_source": ACTIVE_CALIBRATION_SOURCE,
+        "active_calibration_label": "lstm = Active execution calibration",
+        "challenger_calibration_source": CHALLENGER_CALIBRATION_SOURCE,
+        "challenger_calibration_label": (
+            "clean-blend/combined = Challenger research calibration"
+        ),
+        "aws_execution_calibration_locked": True,
+        "paper_only": True,
+        "automation_status": (
+            "AWS timers generate forecast, public signal, Strategy Lab JSON, "
+            "paper scans, and paper monitor state when enabled."
+        ),
+        "paper_trading_status": _paper_status(paper),
+        "entry_scanner_status": (
+            "Same-day entries blocked; rolling scanner is evaluating later target dates."
+            if entry_block_reason
+            else "Entry scanner active for eligible target dates."
+        ),
+        "entry_scanner_reason": entry_block_reason,
+        "last_updated": datetime.now(UTC).isoformat(),
+        "latest_target_date": latest_target,
+        "latest_signal_targets": sorted(set(latest_targets)),
+        "raw_signal_count": raw_count,
+        "pre_resolution_signal_count": backtest["counts"]["pre_resolution_signals"],
+        "deduped_signal_count": backtest["counts"]["deduped_signals"],
+        "post_resolution_excluded_count": backtest["counts"]["excluded_post_resolution_signals"],
+        "alerts": alerts,
+        "alert_level": _alert_level(alerts),
+        "sample_warning": (
+            "Sample size is still small; treat calibration and ROI as research diagnostics."
+            if small_sample
+            else ""
+        ),
+        "bankroll": _round(config.paper_bankroll, 2),
+        "target_exposure_cap": _round(config.paper_bankroll * config.max_target_exposure_pct, 2),
+        "max_entries_per_market_side": int(config.max_entries_per_market_side),
+        "open_risk": paper["summary"]["open_risk"],
+        "db_path_hint": str(db_path),
+    }
+
+
+def _latest_decision_rows(db_path: Path) -> list[dict[str, Any]]:
+    if not db_path.exists() or not _db_table_exists(db_path, "decision_snapshots"):
+        return []
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            WITH recent_targets AS (
+                SELECT target_date
+                FROM decision_snapshots
+                WHERE market_ticker NOT LIKE '%-PAPER%'
+                GROUP BY target_date
+                ORDER BY target_date DESC
+                LIMIT 3
+            ),
+            latest_by_target AS (
+                SELECT d.target_date, MAX(d.created_at) AS created_at
+                FROM decision_snapshots d
+                JOIN recent_targets rt ON rt.target_date = d.target_date
+                WHERE d.market_ticker NOT LIKE '%-PAPER%'
+                GROUP BY d.target_date
+            )
+            SELECT d.*
+            FROM decision_snapshots d
+            JOIN latest_by_target latest
+              ON latest.target_date = d.target_date
+             AND latest.created_at = d.created_at
+            WHERE d.market_ticker NOT LIKE '%-PAPER%'
+            ORDER BY d.target_date DESC, d.approved DESC,
+                     d.trade_quality_score DESC, d.edge_lcb DESC, d.edge DESC
+            """
+        ).fetchall()
+    return [_decision_row(row) for row in rows]
+
+
+def _decision_row(row: sqlite3.Row) -> dict[str, Any]:
+    reasons = _json_list(row["reasons_json"])
+    approved = bool(row["approved"])
+    return {
+        "created_at": row["created_at"],
+        "target_date": row["target_date"],
+        "ticker": row["market_ticker"],
+        "market_available": not _is_probability_only_ticker(row["market_ticker"]),
+        "label": row["label"],
+        "side": row["side"],
+        "approved": approved,
+        "decision": "TRADE" if approved else "NO_TRADE",
+        "probability": _round(row["probability"], 4),
+        "probability_lcb": _round(row["probability_lcb"], 4),
+        "model_probability": _round(row["model_probability"], 4),
+        "market_probability": _round(row["market_probability"], 4),
+        "residual_probability": _round(row["residual_probability"], 4),
+        "ensemble_probability": _round(row["ensemble_probability"], 4),
+        "intraday_probability": _round(row["intraday_probability"], 4),
+        "remaining_heat_risk": _round(row["remaining_heat_risk"], 4),
+        "bid": _round(row["entry_bid"], 4),
+        "ask": _round(row["entry_ask"], 4),
+        "spread": _round(row["spread"], 4),
+        "edge": _round(row["edge"], 4),
+        "edge_lcb": _round(row["edge_lcb"], 4),
+        "quality_score": _round(row["trade_quality_score"], 1),
+        "recommended_contracts": _round(row["recommended_contracts"], 4),
+        "recommended_spend": _round(row["recommended_spend"], 2),
+        "expected_profit": _round(row["expected_profit"], 2),
+        "reasons": reasons,
+        "decision_reason": _decision_reason(approved, reasons, row["edge"], row["edge_lcb"]),
+    }
+
+
+def _decisions_from_trading_signal(payload: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(payload, dict) or payload.get("local_runtime_placeholder"):
+        return []
+    decisions = []
+    for target in payload.get("targets") or []:
+        if target.get("market_available") is False:
+            continue
+        for row in target.get("decisions") or []:
+            if _is_probability_only_ticker(row.get("ticker")):
+                continue
+            reasons = list(row.get("reasons") or [])
+            approved = bool(row.get("approved"))
+            decisions.append(
+                {
+                    "created_at": payload.get("generated_at"),
+                    "target_date": target.get("target_date"),
+                    "ticker": row.get("ticker"),
+                    "market_available": bool(target.get("market_available", True)),
+                    "label": row.get("label"),
+                    "side": row.get("side"),
+                    "approved": approved,
+                    "decision": row.get("decision") or ("TRADE" if approved else "NO_TRADE"),
+                    "probability": row.get("probability"),
+                    "probability_lcb": row.get("probability_lcb"),
+                    "model_probability": row.get("model_probability"),
+                    "market_probability": row.get("market_probability"),
+                    "residual_probability": row.get("residual_probability"),
+                    "ensemble_probability": row.get("ensemble_probability"),
+                    "intraday_probability": row.get("intraday_probability"),
+                    "remaining_heat_risk": row.get("remaining_heat_risk"),
+                    "bid": row.get("bid"),
+                    "ask": row.get("ask"),
+                    "spread": row.get("spread"),
+                    "edge": row.get("edge"),
+                    "edge_lcb": row.get("edge_lcb"),
+                    "quality_score": row.get("trade_quality_score"),
+                    "recommended_contracts": row.get("recommended_contracts"),
+                    "recommended_spend": row.get("recommended_spend"),
+                    "expected_profit": row.get("expected_profit"),
+                    "reasons": reasons,
+                    "decision_reason": _decision_reason(
+                        approved,
+                        reasons,
+                        row.get("edge"),
+                        row.get("edge_lcb"),
+                    ),
+                }
+            )
+    return decisions
+
+
+def _latest_monitor_marks(db_path: Path) -> dict[int, dict[str, Any]]:
+    if not db_path.exists() or not _db_table_exists(db_path, "paper_monitor_snapshots"):
+        return {}
+    marks: dict[int, dict[str, Any]] = {}
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM paper_monitor_snapshots
+            WHERE live_bid IS NOT NULL
+            ORDER BY created_at DESC, id DESC
+            LIMIT 5000
+            """
+        ).fetchall()
+    for row in rows:
+        order_id = int(row["order_id"])
+        if order_id in marks:
+            continue
+        marks[order_id] = {
+            "source": "paper_monitor_snapshot",
+            "snapshot_id": row["id"],
+            "created_at": row["created_at"],
+            "bid": _round(row["live_bid"], 4),
+            "ask": None,
+            "bid_size": None,
+            "ask_size": None,
+            "spread": None,
+            "market_probability": None,
+            "quality_score": None,
+            "monitor_action": row["action"],
+            "monitor_reason": row["reason"],
+        }
+    return marks
+
+
+def _latest_position_marks(db_path: Path) -> dict[tuple[str, str], dict[str, Any]]:
+    if not db_path.exists() or not _db_table_exists(db_path, "decision_snapshots"):
+        return {}
+    marks: dict[tuple[str, str], dict[str, Any]] = {}
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT id, created_at, market_ticker, side, yes_bid, yes_ask,
+                   entry_bid, entry_ask, entry_bid_size, entry_ask_size,
+                   spread, market_probability, trade_quality_score
+            FROM decision_snapshots
+            ORDER BY created_at DESC, id DESC
+            LIMIT 5000
+            """
+        ).fetchall()
+
+    for row in rows:
+        side = _side_from_row(row)
+        key = (row["market_ticker"], side)
+        if key in marks:
+            continue
+        bid = row["entry_bid"]
+        ask = row["entry_ask"]
+        if side == "YES":
+            bid = row["yes_bid"] if bid is None else bid
+            ask = row["yes_ask"] if ask is None else ask
+        marks[key] = {
+            "source": "latest_decision_snapshot",
+            "snapshot_id": row["id"],
+            "created_at": row["created_at"],
+            "bid": _round(bid, 4),
+            "ask": _round(ask, 4),
+            "bid_size": _round(row["entry_bid_size"], 4),
+            "ask_size": _round(row["entry_ask_size"], 4),
+            "spread": _round(row["spread"], 4),
+            "market_probability": _round(row["market_probability"], 4),
+            "quality_score": _round(row["trade_quality_score"], 1),
+        }
+    return marks
+
+
+def _side_from_row(row: sqlite3.Row) -> str:
+    try:
+        side = row["side"]
+    except (IndexError, KeyError):
+        side = None
+    if side:
+        normalized = str(side).upper()
+        if normalized in {"YES", "NO"}:
+            return normalized
+    try:
+        action = str(row["action"]).upper()
+    except (IndexError, KeyError):
+        return "YES"
+    return "NO" if "NO" in action else "YES"
+
+
+def _paper_monitor_config() -> dict[str, Any]:
+    take_profit = _env_float("PAPER_TAKE_PROFIT_PCT")
+    stop_loss = _env_float("PAPER_STOP_LOSS_PCT")
+    return {
+        "take_profit_pct": take_profit if take_profit is not None else DEFAULT_TAKE_PROFIT_PCT,
+        "stop_loss_pct": stop_loss if stop_loss is not None else DEFAULT_STOP_LOSS_PCT,
+    }
+
+
+def _net_exit_per_contract(bid: float, contracts: float) -> float:
+    if bid <= 0 or bid >= 1 or contracts <= 0:
+        return 0.0
+    return bid - quadratic_fee_average_per_contract(bid, contracts)
+
+
+def _exit_bid_for_net(target_net: float, contracts: float) -> float | None:
+    if contracts <= 0:
+        return None
+    if target_net <= _net_exit_per_contract(0.01, contracts):
+        return _round(0.01, 4)
+    if target_net > _net_exit_per_contract(0.99, contracts):
+        return None
+    lo = 0.01
+    hi = 0.99
+    for _ in range(48):
+        mid = (lo + hi) / 2.0
+        if _net_exit_per_contract(mid, contracts) >= target_net:
+            hi = mid
+        else:
+            lo = mid
+    return _round(hi, 4)
+
+
+def _position_mark_status(
+    unrealized_pnl: float | None,
+    unrealized_roi: float | None,
+    monitor: dict[str, Any],
+) -> dict[str, str]:
+    if unrealized_pnl is None or unrealized_roi is None:
+        return {
+            "status": "MARK_PENDING",
+            "label": "Mark pending",
+            "tone": "warn",
+            "monitor_action": "WAITING_FOR_MARK",
+        }
+
+    take_profit = _to_float(monitor.get("take_profit_pct")) / 100.0
+    stop_loss = _to_float(monitor.get("stop_loss_pct")) / 100.0
+    if unrealized_roi >= take_profit:
+        monitor_action = "TAKE_PROFIT_READY"
+    elif unrealized_roi <= -stop_loss:
+        monitor_action = "STOP_LOSS_READY"
+    else:
+        monitor_action = "HOLD"
+
+    if unrealized_pnl > 0.005:
+        return {
+            "status": "WINNING",
+            "label": "Winning",
+            "tone": "good",
+            "monitor_action": monitor_action,
+        }
+    if unrealized_pnl < -0.005:
+        return {
+            "status": "LOSING",
+            "label": "Losing",
+            "tone": "bad",
+            "monitor_action": monitor_action,
+        }
+    return {
+        "status": "FLAT",
+        "label": "Flat",
+        "tone": "warn",
+        "monitor_action": monitor_action,
+    }
+
+
+def _paper_row(
+    row: sqlite3.Row,
+    mark: dict[str, Any] | None = None,
+    monitor: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    reasons = _json_list(row["reasons_json"])
+    monitor = monitor or _paper_monitor_config()
+    contracts = _to_float(row["contracts"])
+    entry_price = row["entry_price"] if row["entry_price"] is not None else row["yes_ask"]
+    cost_per_contract = _to_float(row["cost_per_contract"])
+    fee_per_contract = _to_float(row["fee_per_contract"])
+    risk = contracts * cost_per_contract
+    current_bid = _to_float(mark.get("bid"), None) if mark else None
+    current_ask = _to_float(mark.get("ask"), None) if mark else None
+    current_exit_fee = (
+        quadratic_fee_average_per_contract(current_bid, contracts)
+        if current_bid is not None and current_bid > 0
+        else None
+    )
+    current_net_exit = (
+        current_bid - current_exit_fee
+        if current_bid is not None and current_exit_fee is not None
+        else None
+    )
+    current_value = (
+        contracts * current_net_exit
+        if current_net_exit is not None
+        else None
+    )
+    unrealized_pnl = (
+        current_value - risk
+        if current_value is not None
+        else None
+    )
+    unrealized_roi = (
+        unrealized_pnl / risk
+        if unrealized_pnl is not None and risk > 0
+        else None
+    )
+    take_profit = _to_float(monitor.get("take_profit_pct")) / 100.0
+    stop_loss = _to_float(monitor.get("stop_loss_pct")) / 100.0
+    take_profit_net = cost_per_contract * (1.0 + take_profit)
+    stop_loss_net = max(0.0, cost_per_contract * (1.0 - stop_loss))
+    mark_status = _position_mark_status(unrealized_pnl, unrealized_roi, monitor)
+    return {
+        "id": row["id"],
+        "created_at": row["created_at"],
+        "target_date": row["target_date"],
+        "ticker": row["market_ticker"],
+        "label": row["label"],
+        "side": row["side"],
+        "status": row["status"],
+        "risk_profile": _row_risk_profile(row),
+        "contracts": _round(contracts, 4),
+        "entry_price": _round(entry_price, 4),
+        "entry_fee_per_contract": _round(fee_per_contract, 4),
+        "cost_per_contract": _round(cost_per_contract, 4),
+        "initial_cost": _round(risk, 2),
+        "risk": _round(risk, 2),
+        "max_profit": _round(contracts * max(0.0, 1.0 - cost_per_contract), 2),
+        "max_loss": _round(risk, 2),
+        "probability": _round(row["probability"], 4),
+        "probability_lcb": _round(row["probability_lcb"], 4),
+        "edge": _round(row["edge"], 4),
+        "edge_lcb": _round(row["edge_lcb"], 4),
+        "quality_score": _round(row["trade_quality_score"], 1),
+        "expected_profit": _round(row["expected_profit"], 2),
+        "current_bid": _round(current_bid, 4),
+        "current_ask": _round(current_ask, 4),
+        "current_spread": _round(mark.get("spread"), 4) if mark else None,
+        "current_market_probability": _round(mark.get("market_probability"), 4) if mark else None,
+        "current_snapshot_at": mark.get("created_at") if mark else None,
+        "current_source": mark.get("source") if mark else None,
+        "current_exit_fee_per_contract": _round(current_exit_fee, 4),
+        "current_net_exit": _round(current_net_exit, 4),
+        "current_value": _round(current_value, 2),
+        "unrealized_pnl": _round(unrealized_pnl, 2),
+        "unrealized_roi": _round(unrealized_roi, 4),
+        "position_status": mark_status["status"],
+        "position_status_label": mark_status["label"],
+        "position_status_tone": mark_status["tone"],
+        "monitor_action": mark_status["monitor_action"],
+        "take_profit_pct": _round(monitor.get("take_profit_pct"), 2),
+        "stop_loss_pct": _round(monitor.get("stop_loss_pct"), 2),
+        "take_profit_pnl": _round(risk * take_profit, 2),
+        "stop_loss_pnl": _round(-(risk * stop_loss), 2),
+        "take_profit_net_exit": _round(take_profit_net, 4),
+        "stop_loss_net_exit": _round(stop_loss_net, 4),
+        "take_profit_bid": _exit_bid_for_net(take_profit_net, contracts),
+        "stop_loss_bid": _exit_bid_for_net(stop_loss_net, contracts),
+        "settlement_high_f": _round(row["settlement_high_f"], 1),
+        "resolved_yes": row["resolved_yes"],
+        "exit_price": _round(row["exit_price"], 4),
+        "exit_fee_per_contract": _round(row["exit_fee_per_contract"], 4),
+        "realized_pnl": _round(row["realized_pnl"], 2),
+        "realized_roi": (
+            _round(_to_float(row["realized_pnl"]) / risk, 4)
+            if row["realized_pnl"] is not None and risk > 0
+            else None
+        ),
+        "closed_at": row["closed_at"],
+        "settled_at": row["settled_at"],
+        "reasons": reasons,
+        "why_good": _why_trade_good(row, reasons),
+    }
+
+
+def _paper_action_row(row: sqlite3.Row) -> dict[str, Any]:
+    action_time = row["closed_at"] or row["settled_at"] or row["created_at"]
+    contracts = _to_float(row["contracts"])
+    risk = contracts * _to_float(row["cost_per_contract"])
+    return {
+        "id": row["id"],
+        "time": action_time,
+        "ticker": row["market_ticker"],
+        "label": row["label"],
+        "target_date": row["target_date"],
+        "side": row["side"],
+        "contracts": _round(contracts, 4),
+        "status": row["status"],
+        "entry_price": _round(row["entry_price"] if row["entry_price"] is not None else row["yes_ask"], 4),
+        "cost_per_contract": _round(row["cost_per_contract"], 4),
+        "initial_cost": _round(risk, 2),
+        "exit_price": _round(row["exit_price"], 4),
+        "exit_fee_per_contract": _round(row["exit_fee_per_contract"], 4),
+        "settlement_high_f": _round(row["settlement_high_f"], 1),
+        "realized_pnl": _round(row["realized_pnl"], 2),
+        "realized_roi": (
+            _round(_to_float(row["realized_pnl"]) / risk, 4)
+            if row["realized_pnl"] is not None and risk > 0
+            else None
+        ),
+        "note": "closed by monitor" if row["closed_at"] else "settled against official high",
+    }
+
+
+def _paper_monitor_snapshot_row(row: sqlite3.Row) -> dict[str, Any]:
+    try:
+        label = row["label"] or row["market_ticker"]
+    except (IndexError, KeyError):
+        label = row["market_ticker"]
+    return {
+        "id": row["order_id"],
+        "time": row["created_at"],
+        "ticker": row["market_ticker"],
+        "label": label,
+        "target_date": row["target_date"],
+        "side": row["side"],
+        "contracts": None,
+        "status": row["action"],
+        "entry_price": None,
+        "cost_per_contract": None,
+        "initial_cost": None,
+        "exit_price": _round(row["live_bid"], 4),
+        "exit_fee_per_contract": _round(row["exit_fee_per_contract"], 4),
+        "settlement_high_f": None,
+        "realized_pnl": _round(row["unrealized_pnl"], 2),
+        "realized_roi": _round(row["unrealized_roi"], 4),
+        "note": row["reason"] or "monitor inspection",
+    }
+
+
+def _duplicate_group_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "target_date": str(row["target_date"]),
+        "ticker": row["market_ticker"],
+        "side": row["side"],
+        "open_orders": int(row["open_orders"]),
+    }
+
+
+def _cohort_rows(cohorts) -> list[dict[str, Any]]:
+    by_name = {
+        cohort.name: {
+            "name": cohort.name,
+            "label": _cohort_label(cohort.name),
+            "count": cohort.count,
+            "brier_score": _round(cohort.brier_score, 4),
+            "log_loss": _round(cohort.log_loss, 4),
+            "top_bin_accuracy": _round(cohort.top_bin_accuracy, 4),
+            "avg_winning_probability": _round(cohort.avg_winning_probability, 4),
+        }
+        for cohort in cohorts
+    }
+    rows = []
+    for name in ("cold_below_60f", "normal_60_69f", "warm_70_79f", "hot_80f_plus"):
+        rows.append(by_name.get(name) or _empty_cohort(name))
+    return rows
+
+
+def _empty_cohorts() -> list[dict[str, Any]]:
+    return [
+        _empty_cohort(name)
+        for name in ("cold_below_60f", "normal_60_69f", "warm_70_79f", "hot_80f_plus")
+    ]
+
+
+def _empty_cohort(name: str) -> dict[str, Any]:
+    return {
+        "name": name,
+        "label": _cohort_label(name),
+        "count": 0,
+        "brier_score": None,
+        "log_loss": None,
+        "top_bin_accuracy": None,
+        "avg_winning_probability": None,
+    }
+
+
+def _cohort_label(name: str) -> str:
+    return {
+        "cold_below_60f": "Cold",
+        "normal_60_69f": "Normal",
+        "warm_70_79f": "Warm",
+        "hot_80f_plus": "Hot",
+    }.get(name, name)
+
+
+def _probability_market_points(decisions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    points = []
+    for row in decisions:
+        market = row.get("market_probability")
+        model = row.get("model_probability")
+        probability = row.get("probability")
+        if market is None or (model is None and probability is None):
+            continue
+        points.append(
+            {
+                "x": _round(market, 4),
+                "y": _round(model if model is not None else probability, 4),
+                "r": max(4, min(12, _to_float(row.get("quality_score")) / 10)),
+                "label": row.get("label"),
+                "side": row.get("side"),
+                "approved": bool(row.get("approved")),
+            }
+        )
+    return points
+
+
+def _edge_by_market_bucket(decisions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    buckets = [(0, 20), (20, 40), (40, 60), (60, 80), (80, 100)]
+    output = []
+    for lower, upper in buckets:
+        rows = [
+            row
+            for row in decisions
+            if row.get("market_probability") is not None
+            and lower / 100 <= _to_float(row["market_probability"]) < upper / 100
+        ]
+        output.append(
+            {
+                "range": f"{lower}-{upper}",
+                "count": len(rows),
+                "avg_edge": _round(
+                    sum(_to_float(row.get("edge")) for row in rows) / len(rows),
+                    4,
+                )
+                if rows
+                else 0.0,
+            }
+        )
+    return output
+
+
+def _quality_distribution(decisions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    buckets = [(0, 20), (20, 40), (40, 60), (60, 80), (80, 100.0001)]
+    output = []
+    for lower, upper in buckets:
+        rows = [
+            row
+            for row in decisions
+            if lower <= _to_float(row.get("quality_score")) < upper
+        ]
+        output.append({"range": f"{int(lower)}-{int(min(upper, 100))}", "count": len(rows)})
+    return output
+
+
+def _research_notes() -> list[dict[str, str]]:
+    return [
+        {"term": "Backtest", "note": "Replay historical rows to see how probabilities scored after outcomes were known."},
+        {"term": "Look-ahead bias", "note": "Using information that was not available at trade time; Strategy Lab separates pre-resolution rows."},
+        {"term": "Pre-resolution", "note": "A signal recorded before market close or an observed-high lock."},
+        {"term": "Dedupe", "note": "Repeated 15-minute scans are reduced to one sampled row per target, market, and side."},
+        {"term": "Calibration", "note": "How closely stated probabilities match observed win frequencies."},
+        {"term": "Brier score", "note": "Squared probability error; lower is better."},
+        {"term": "Log loss", "note": "Penalty for assigning low probability to what happened; lower is better."},
+        {"term": "Paper trading", "note": "Simulated positions recorded for research. No live money is placed."},
+        {"term": "Challenger model", "note": "A research calibration compared against the active execution calibration."},
+    ]
+
+
+def _decision_reason(approved: bool, reasons: list[str], edge: object, edge_lcb: object) -> str:
+    if approved:
+        return (
+            f"Passed risk gates with edge {_to_float(edge):.3f} and "
+            f"lower-bound edge {_to_float(edge_lcb):.3f}."
+        )
+    if reasons:
+        return reasons[0]
+    return "No trade gate reason was recorded."
+
+
+def _why_trade_good(row: sqlite3.Row, reasons: list[str]) -> str:
+    if reasons:
+        return "; ".join(reasons[:2])
+    return (
+        f"Paper position passed gates with p={_to_float(row['probability']):.3f}, "
+        f"edge={_to_float(row['edge']):.3f}, "
+        f"edge_lcb={_to_float(row['edge_lcb']):.3f}."
+    )
+
+
+def _paper_status(paper: dict[str, Any]) -> str:
+    if not paper.get("available"):
+        return "paper database unavailable"
+    open_count = int(paper["summary"]["open_positions"])
+    if open_count:
+        return f"{open_count} open paper position(s)"
+    return "no open paper positions"
+
+
+def _strategy_alerts(
+    *,
+    paper: dict[str, Any],
+    entry_block_reason: str | None,
+    daily_budget: float | None = None,
+    now: datetime | None = None,
+) -> list[dict[str, str]]:
+    alerts: list[dict[str, str]] = []
+    current_utc = now or datetime.now(UTC)
+    if current_utc.tzinfo is None:
+        current_utc = current_utc.replace(tzinfo=UTC)
+    else:
+        current_utc = current_utc.astimezone(UTC)
+    summary = paper.get("summary") or {}
+    if not paper.get("available"):
+        alerts.append(
+            _alert(
+                "warning",
+                "paper-db-unavailable",
+                "Paper DB unavailable",
+                str(paper.get("reason") or "Strategy Lab cannot read paper-trading state."),
+                "Check the AWS paper DB path and strategy-research service logs.",
+            )
+        )
+        return alerts
+
+    open_count = int(_to_float(summary.get("open_positions"), default=0.0))
+    unresolved_targets = summary.get("unresolved_past_targets") or []
+    if unresolved_targets:
+        target_text = ", ".join(
+            f"{row.get('target_date')} ({int(row.get('open_orders') or 0)})"
+            for row in unresolved_targets[:4]
+        )
+        alerts.append(
+            _alert(
+                "critical",
+                "settlement-backlog",
+                "Settlement backlog",
+                f"Open paper positions remain for completed target dates: {target_text}.",
+                "Run paper-auto-settle or inspect CLISFO settlement lookup.",
+            )
+        )
+
+    duplicate_groups = paper.get("duplicate_open_groups") or []
+    if duplicate_groups:
+        largest = duplicate_groups[0]
+        alerts.append(
+            _alert(
+                "critical",
+                "duplicate-open-markets",
+                "Duplicate open markets",
+                (
+                    f"{len(duplicate_groups)} market/side group(s) have repeated open positions. "
+                    f"Largest: {largest.get('open_orders')}x {largest.get('ticker')} {largest.get('side')}."
+                ),
+                "Clear legacy duplicates, then confirm the duplicate guard is deployed.",
+            )
+        )
+
+    latest_monitor_at = summary.get("latest_monitor_action_at")
+    latest_monitor_dt = _parse_timestamp(latest_monitor_at)
+    if open_count and latest_monitor_dt is None:
+        latest_opened_dt = _parse_timestamp(summary.get("latest_opened_at"))
+        if latest_opened_dt is not None and current_utc - latest_opened_dt <= timedelta(minutes=10):
+            alerts.append(
+                _alert(
+                    "info",
+                    "monitor-pending",
+                    "Monitor mark pending",
+                    "A paper position was opened recently; the next monitor pass should mark it shortly.",
+                    "Keep the paper monitor timer active and refresh Strategy Lab after the next monitor tick.",
+                )
+            )
+        else:
+            alerts.append(
+                _alert(
+                    "critical",
+                    "monitor-not-recording",
+                    "Monitor not recording",
+                    "Open paper positions exist, but Strategy Lab has no monitor inspection rows.",
+                    "Start the paper monitor service and refresh Strategy Lab.",
+                )
+            )
+    elif open_count and latest_monitor_dt is not None:
+        monitor_age = current_utc - latest_monitor_dt
+        if monitor_age > timedelta(minutes=45):
+            alerts.append(
+                _alert(
+                    "critical",
+                    "monitor-stale",
+                    "Monitor stale",
+                    f"Latest paper monitor action is {_age_label(monitor_age)} old.",
+                    "Check sfo-kalshi-paper-monitor.timer and service logs.",
+                )
+            )
+
+    marked_count = int(_to_float(summary.get("marked_open_positions"), default=0.0))
+    if open_count and marked_count == 0:
+        alerts.append(
+            _alert(
+                "warning",
+                "open-positions-unmarked",
+                "Open positions unmarked",
+                "Open paper positions have no current sell-bid marks yet.",
+                "Confirm monitor snapshots include live bid data.",
+            )
+        )
+
+    hidden_count = int(_to_float(summary.get("hidden_open_positions"), default=0.0))
+    if hidden_count:
+        alerts.append(
+            _alert(
+                "warning",
+                "open-positions-hidden",
+                "Open list truncated",
+                f"{hidden_count} open paper position(s) are summarized but hidden from the card list.",
+                "Use paper-report for the full ledger, or reduce stale open inventory.",
+            )
+        )
+
+    open_risk = _to_float(summary.get("open_risk"), default=0.0)
+    if daily_budget is not None and daily_budget > 0 and open_risk > daily_budget:
+        alerts.append(
+            _alert(
+                "warning",
+                "open-risk-over-budget",
+                "Open risk over budget",
+                f"Open paper risk ${open_risk:.2f} is above the daily budget ${daily_budget:.2f}.",
+                "Review duplicate exposure and daily budget settings.",
+            )
+        )
+
+    if entry_block_reason:
+        alerts.append(
+            _alert(
+                "info",
+                "same-day-entry-blocked",
+                "Same-day entries blocked",
+                entry_block_reason,
+                "Monitor and settlement can still run; scanner shifts to later targets.",
+            )
+        )
+
+    if not alerts:
+        alerts.append(
+            _alert(
+                "ok",
+                "strategy-lab-healthy",
+                "Strategy Lab healthy",
+                "No settlement, monitor, duplicate-position, or risk alerts are active.",
+                "Keep monitoring after each AWS refresh.",
+            )
+        )
+    return alerts
+
+
+def _alert(level: str, code: str, title: str, detail: str, action: str) -> dict[str, str]:
+    return {
+        "level": level,
+        "code": code,
+        "title": title,
+        "detail": detail,
+        "action": action,
+    }
+
+
+def _alert_level(alerts: list[dict[str, str]]) -> str:
+    order = {"critical": 4, "warning": 3, "info": 2, "ok": 1}
+    return max((alert.get("level", "ok") for alert in alerts), key=lambda level: order.get(level, 0), default="ok")
+
+
+def _entry_block_reason(
+    rows: list[dict[str, Any]],
+    *,
+    now: datetime | None = None,
+) -> str | None:
+    today = settlement_today(now)
+    for row in rows:
+        target = _date_from_string(row.get("target_date"))
+        if target is not None and target != today:
+            continue
+        for reason in row.get("reasons") or []:
+            text = str(reason)
+            if text.startswith("same-day entry disabled:"):
+                return text
+    return None
+
+
+def _status_target_date(
+    targets: list[str],
+    *,
+    entry_block_reason: str | None,
+    now: datetime | None = None,
+) -> str | None:
+    parsed = sorted({
+        parsed
+        for target in targets
+        if (parsed := _date_from_string(target)) is not None
+    })
+    if not parsed:
+        return None
+
+    today = settlement_today(now)
+
+    if entry_block_reason:
+        future = [target for target in parsed if target > today]
+        if future:
+            return future[0].isoformat()
+    elif today in parsed:
+        return today.isoformat()
+
+    current_or_future = [target for target in parsed if target >= today]
+    if current_or_future:
+        return current_or_future[0].isoformat()
+    return parsed[-1].isoformat()
+
+
+def _target_from_signal(payload: dict[str, Any] | None) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    targets = [
+        target.get("target_date")
+        for target in payload.get("targets") or []
+        if target.get("target_date") and target.get("market_available") is not False
+    ]
+    return max(targets) if targets else None
+
+
+def _is_probability_only_ticker(ticker: object) -> bool:
+    return "-PAPER" in str(ticker or "")
+
+
+def _date_from_string(value: object):
+    if value is None:
+        return None
+    try:
+        return datetime.fromisoformat(str(value)).date()
+    except ValueError:
+        return None
+
+
+def _parse_timestamp(value: object) -> datetime | None:
+    if value is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _age_label(delta: timedelta) -> str:
+    total_minutes = max(0, int(delta.total_seconds() // 60))
+    if total_minutes < 60:
+        return f"{total_minutes} minute(s)"
+    hours, minutes = divmod(total_minutes, 60)
+    if hours < 24:
+        return f"{hours} hour(s) {minutes} minute(s)"
+    days, hours = divmod(hours, 24)
+    return f"{days} day(s) {hours} hour(s)"
+
+
+def _load_json_optional(path: Path) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _db_table_exists(db_path: Path, table_name: str) -> bool:
+    try:
+        with sqlite3.connect(db_path) as conn:
+            row = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (table_name,),
+            ).fetchone()
+    except sqlite3.Error:
+        return False
+    return row is not None
+
+
+def _json_list(value: object) -> list[str]:
+    if not value:
+        return []
+    try:
+        payload = json.loads(str(value))
+    except json.JSONDecodeError:
+        return []
+    if isinstance(payload, list):
+        return [str(item) for item in payload]
+    return []
+
+
+def _round_dict(row: dict[str, Any]) -> dict[str, Any]:
+    return {key: _round(value, 4) if isinstance(value, float) else value for key, value in row.items()}
+
+
+def _round(value: object, digits: int = 4):
+    if value is None:
+        return None
+    number = _to_float(value, default=math.nan)
+    if not math.isfinite(number):
+        return None
+    return round(number, digits)
+
+
+def _null_metric(value: object, digits: int = 4):
+    return None
+
+
+def _to_float(value: object, default: float = 0.0) -> float:
+    if value in (None, ""):
+        return default
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if math.isfinite(number) else default
+
+
+def _env_float(name: str) -> float | None:
+    value = os.getenv(name)
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None

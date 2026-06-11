@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# macOS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Local assistant state
+.agents/
+.clau?e/
+.codex/
+skills-lock.json
+
+# Secrets and local credentials
+.env
+*.pem
+*.key
+.google_weather_usage.json
+
+# Runtime state
+logs/
+*.log
+*.db-journal
+*.sqlite
+*.sqlite3
+trading/data/
+forecaster/logs/
+
+# Generated training artifacts that can be rebuilt
+forecaster/combined_weather.csv
+forecaster/weather_features.csv
+forecaster/output.csv
+
+# Keep the copied local archive usable, but do not commit live runtime DBs by default.
+forecaster/weather.db
+
+# Large local source data is intentionally kept in WeatherEdge for learning/rebuilds.
+# Remove this ignore only if you explicitly want to version raw NOAA station files.
+forecaster/2016-2026 weather data/
+
+# Dashboard runtime cache is safe to publish when intentionally updating pages,
+# but should not drift into commits by accident.
+forecaster/google_weather_cache.json
+forecaster/trading_signal.json
+forecaster/strategy_research.json
+forecaster/strategy_research.protected.json
+forecaster/index.html
+forecaster/details.html
+forecaster/strategy-lab.html
+forecaster/dataset_research.json

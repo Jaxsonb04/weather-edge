@@ -1,0 +1,11 @@
+[Unit]
+Description=Run SFO forecaster refresh frequently with overnight budget control
+
+[Timer]
+OnCalendar=*-*-* 05..18:10,40:00
+OnCalendar=*-*-* 00..04,19..23:40:00
+Persistent=true
+Unit=sfo-forecaster-refresh.service
+
+[Install]
+WantedBy=timers.target

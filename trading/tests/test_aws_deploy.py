@@ -1,0 +1,159 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[2]
+AWS_DIR = ROOT / "trading" / "deploy" / "aws"
+
+
+def _read(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
+
+
+def test_systemd_units_use_rendered_weatheredge_env_file():
+    installer = _read(AWS_DIR / "install_systemd.sh")
+    assert "ENV_FILE=\"${ENV_FILE:-/etc/weatheredge.env}\"" in installer
+    assert "s#__ENV_FILE__#$ENV_FILE#g" in installer
+
+    for unit in (AWS_DIR / "systemd").glob("*.service.in"):
+        text = _read(unit)
+        assert "EnvironmentFile=__ENV_FILE__" in text
+        assert "/etc/sfo-weather.env" not in text
+
+
+def test_forecaster_refresh_generates_signal_before_dashboard_publish():
+    text = _read(AWS_DIR / "systemd" / "sfo-forecaster-refresh.service.in")
+    signal_idx = text.index("build_public_trading_signal.sh")
+    dashboard_idx = text.index("build_dashboard.py")
+    publish_idx = text.index("publish_forecaster_pages.sh")
+    assert signal_idx < dashboard_idx < publish_idx
+
+
+def test_public_signal_builder_is_read_only_and_paper_only():
+    text = _read(AWS_DIR / "build_public_trading_signal.sh")
+    assert "daily-report" in text
+    assert "strategy-research" in text
+    assert "command -v" in text
+    assert "--no-live-market" not in text
+    assert "SFO_TRADING_SIGNAL_CALIBRATION_SOURCE:-lstm" in text
+    assert "--calibration-source" in text
+    assert "--output" in text
+    assert "--place-paper" not in text
+    assert "paper-buy" not in text
+
+
+def test_paper_scan_pins_calibration_source():
+    service = _read(AWS_DIR / "systemd" / "sfo-kalshi-paper-scan.service.in")
+    runner = _read(AWS_DIR / "run_paper_scan_profiles.sh")
+    example_env = _read(AWS_DIR / "sfo-weather.env.example")
+
+    assert "run_paper_scan_profiles.sh" in service
+    assert 'CALIBRATION_SOURCE="${SFO_TRADING_SIGNAL_CALIBRATION_SOURCE:-lstm}"' in runner
+    assert '--calibration-source "$CALIBRATION_SOURCE"' in runner
+    assert 'TARGET_DATE="${SFO_PAPER_SCAN_TARGET_DATE:-rolling}"' in runner
+    assert 'TAIL_BASKET_ENABLED="${SFO_PAPER_SCAN_TAIL_BASKET_ENABLED:-1}"' in runner
+    assert "tail-basket" in runner
+    assert "--max-worst-case-loss" in runner
+    assert "PAPER_RISK_PROFILES=balanced,fast-feedback" in example_env
+    assert "SFO_PAPER_SCAN_TAIL_BASKET_ENABLED=1" in example_env
+    assert "SFO_TAIL_BASKET_TAIL_STAKE=5" in example_env
+    assert "SFO_TAIL_BASKET_CENTER_STAKE=1" in example_env
+
+
+def test_paper_trading_timers_run_around_the_clock_and_auto_settle():
+    scan = _read(AWS_DIR / "systemd" / "sfo-kalshi-paper-scan.timer")
+    monitor = _read(AWS_DIR / "systemd" / "sfo-kalshi-paper-monitor.timer")
+    settle = _read(AWS_DIR / "systemd" / "sfo-kalshi-paper-settle.timer")
+    installer = _read(AWS_DIR / "install_systemd.sh")
+
+    assert "OnCalendar=*-*-* *:00,15,30,45" in scan
+    assert "OnCalendar=*-*-* *:02,07,12,17,22,27,32,37,42,47,52,57" in monitor
+    assert "OnCalendar=*-*-* *:10,40" in settle
+    assert "sfo-kalshi-paper-settle.service.in" in installer
+    assert "sfo-kalshi-paper-settle.timer" in installer
+
+
+def test_dataset_backfill_timer_is_lightsail_safe_and_installed():
+    installer = _read(AWS_DIR / "install_systemd.sh")
+    service = _read(AWS_DIR / "systemd" / "sfo-dataset-backfill.service.in")
+    timer = _read(AWS_DIR / "systemd" / "sfo-dataset-backfill.timer")
+    runner = _read(AWS_DIR / "run_dataset_backfill.sh")
+    example_env = _read(AWS_DIR / "sfo-weather.env.example")
+
+    assert "sfo-dataset-backfill.service.in" in installer
+    assert "sfo-dataset-backfill.timer" in installer
+    assert "sfo-dataset-backfill.timer" in installer
+    assert "run_dataset_backfill.sh" in service
+    assert "EnvironmentFile=__ENV_FILE__" in service
+    assert "OnCalendar=*-*-* 02:25:00" in timer
+    assert "Unit=sfo-dataset-backfill.service" in timer
+
+    assert 'SFO_DATASET_SOURCES="${SFO_DATASET_SOURCES:-iem-asos,open-meteo-previous-runs,open-meteo-historical-forecast,kalshi-history}"' in runner
+    default_sources = "SFO_DATASET_SOURCES=iem-asos,open-meteo-previous-runs,open-meteo-historical-forecast,kalshi-history"
+    assert default_sources in example_env
+    assert "dataset-backfill" in runner
+    assert "--source noaa-isd" not in runner
+    assert 'SFO_DATASET_DB:-${SFO_KALSHI_DB:-$TRADING_DIR/data/paper_trading.db}' in runner
+    assert 'KALSHI_LOOKBACK_DAYS="${SFO_DATASET_KALSHI_LOOKBACK_DAYS:-90}"' in runner
+    assert "SFO_DATASET_KALSHI_LOOKBACK_DAYS=90" in example_env
+    assert 'SFO_DATASET_KALSHI_CANDLES:-0' in runner
+    assert 'SFO_DATASET_KALSHI_TRADES:-0' in runner
+    assert "SFO_DATASET_KALSHI_CANDLES=0" in example_env
+    assert "SFO_DATASET_KALSHI_TRADES=0" in example_env
+    assert '${1,,}' not in runner
+    assert "tr '[:upper:]' '[:lower:]'" in runner
+
+
+def test_pages_publish_includes_generated_detail_page():
+    publisher = _read(AWS_DIR / "publish_forecaster_pages.sh")
+    syncer = _read(AWS_DIR / "sync_forecaster_source.sh")
+
+    assert "index.html" in publisher
+    assert "details.html" in publisher
+    assert "strategy-lab.html" in publisher
+    assert "strategy_research.json" in publisher
+    assert "strategy_research.protected.json" in publisher
+    assert "SFO_STRATEGY_LAB_PASSWORD" in publisher
+    assert '--exclude "/index.html"' in syncer
+    assert '--exclude "/details.html"' in syncer
+    assert '--exclude "/strategy-lab.html"' in syncer
+    assert '--exclude "strategy_research.json"' in syncer
+    assert '--exclude "strategy_research.protected.json"' in syncer
+
+
+def test_pages_deploy_key_path_matches_lightsail_setup_docs():
+    example_env = _read(AWS_DIR / "sfo-weather.env.example")
+    publisher = _read(AWS_DIR / "publish_forecaster_pages.sh")
+    syncer = _read(AWS_DIR / "sync_forecaster_source.sh")
+    readme = _read(AWS_DIR / "README.md")
+
+    expected = "sfo_weather_pages_deploy"
+    assert expected in example_env
+    assert expected in publisher
+    assert expected in syncer
+    assert expected in readme
+    assert "weatheredge_pages_deploy" not in example_env + publisher + syncer + readme
+
+
+def test_initial_lightsail_sync_does_not_copy_local_runtime_state():
+    syncer = _read(AWS_DIR / "sync_to_lightsail.sh")
+
+    for artifact in (
+        "weather.db",
+        "*.db-journal",
+        "*.sqlite",
+        "*.sqlite3",
+        "google_weather_cache.json",
+        "trading_signal.json",
+        "strategy_research.json",
+        "strategy_research.protected.json",
+    ):
+        assert f"--exclude '{artifact}'" in syncer
+
+    for artifact in (
+        "/index.html",
+        "/details.html",
+        "/strategy-lab.html",
+    ):
+        assert f"--exclude '{artifact}'" in syncer

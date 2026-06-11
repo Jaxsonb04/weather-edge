@@ -1,0 +1,177 @@
+# WeatherEdge
+
+WeatherEdge is a unified SFO weather forecasting and Kalshi paper-trading
+research project. It combines a station-aligned SFO forecaster, Google/NWS/
+Open-Meteo blend, Kalshi market probability engine, paper-trading journal,
+optional deployment scripts, and a static dashboard workflow.
+
+**Safety rule:** this project is paper trading only. It uses real Kalshi market
+prices for research, but it does not place live real-money orders.
+
+## What Is Here
+
+```text
+WeatherEdge/
+  forecaster/   KSFO weather pipeline, forecast blend, archive, dashboard generator
+  trading/      Kalshi probability, risk gates, CLI, paper journal, AWS scripts
+  docs/         unified guides, glossary, sync/deploy notes, dashboard direction
+  pyproject.toml
+  CONTEXT.md
+```
+
+## Quick Start
+
+```bash
+cd /path/to/WeatherEdge
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
+python trading/tests/run_tests.py
+```
+
+Without installing first, use the helper:
+
+```bash
+bash scripts/run_tests.sh
+```
+
+Before syncing, pushing, or deploying, run the full local verification gate:
+
+```bash
+bash scripts/verify_project.sh
+```
+
+It runs the WeatherEdge health check, trading tests, and Python compile check.
+Warnings about Git not being initialized or Semgrep not being installed are
+informational until you decide to turn those on.
+
+Analyze today and tomorrow with paper-trading gates:
+
+```bash
+python -m sfo_kalshi_quant.cli --no-color analyze --target-date both --side both
+```
+
+Without installing first:
+
+```bash
+bash scripts/paper_analyze.sh
+```
+
+Paper analysis defaults to the balanced paper-research profile. Use
+`--risk-profile conservative` when you want the stricter baseline, or
+`--risk-profile exploratory` when you want smaller-size paper data collection.
+Use `--risk-profile fast-feedback` when you want the loosest paper-only gates
+with very small entries so the journal fills faster:
+
+```bash
+python -m sfo_kalshi_quant.cli --no-color --risk-profile conservative analyze --target-date both
+python -m sfo_kalshi_quant.cli --no-color --risk-profile fast-feedback analyze --target-date rolling --side both --place-paper --paper-stake 5
+```
+
+To run balanced and fast-feedback side by side in one paper DB, set:
+
+```bash
+PAPER_RISK_PROFILES=balanced,fast-feedback bash scripts/paper_analyze.sh --target-date rolling --place-paper
+```
+
+Record paper trades only when the CLI says `TRADE`:
+
+```bash
+python -m sfo_kalshi_quant.cli --no-color analyze --target-date both --side both --paper-stake 10 --place-paper
+```
+
+## Forecast Workflow
+
+Run forecaster commands from `forecaster/` because the legacy scripts use
+project-relative paths:
+
+```bash
+cd /path/to/WeatherEdge/forecaster
+python combine_psv.py --dir "2016-2026 weather data" --out combined_weather.csv
+python load_to_db.py
+python features.py
+python forecast_tomorrow.py
+python nws_ground_truth.py --days 14
+python google_weather_cache.py
+python build_dashboard.py
+```
+
+Refreshing Google Weather requires `GOOGLE_WEATHER_API_KEY`. The project keeps
+Google usage disciplined with an 8,000/month and 260/day default event budget,
+below the 10,000 free monthly cap.
+
+## Kalshi Workflow
+
+Run trading commands from the repository root after installing with
+`pip install -e .`, or from `trading/` with its local package layout.
+
+Important commands:
+
+```bash
+python -m sfo_kalshi_quant.cli backtest-calibration
+python -m sfo_kalshi_quant.cli backtest-calibration --source clean-blend
+python -m sfo_kalshi_quant.cli daily-report --target-date both --side both --format json --no-live-market --output forecaster/trading_signal.json
+python -m sfo_kalshi_quant.cli strategy-research --output forecaster/strategy_research.json
+python -m sfo_kalshi_quant.cli analyze --target-date both --side both
+python -m sfo_kalshi_quant.cli backtest-signals
+python -m sfo_kalshi_quant.cli paper-report
+python -m sfo_kalshi_quant.cli paper-monitor
+python -m sfo_kalshi_quant.cli paper-settle --target-date YYYY-MM-DD --settlement-high 67
+```
+
+`daily-report` is read-only dashboard input; it does not record DB snapshots or
+place paper orders.
+
+`backtest-calibration --source clean-blend` validates the archived live blend on
+clean next-day forecasts only. It excludes same-day observed-high lock/floor
+rows.
+
+`--settlement-high 67` means the official resolved SFO high was 67°F for that
+date.
+
+## Repository Sync
+
+Configure a Git remote and review ignored files before publishing changes:
+
+```bash
+git status
+git status --ignored
+```
+
+Optional deployment scripts can sync the app into a server layout such as:
+
+```text
+/opt/weatheredge/forecaster
+/opt/weatheredge/trading
+```
+
+See [docs/aws_lightsail.md](docs/aws_lightsail.md).
+
+## Data And Artifacts
+
+Local WeatherEdge may include copied raw KSFO NOAA station files and ignored
+runtime artifacts from previous runs. After AWS sync and refresh, live
+DB/cache/dashboard state is authoritative on AWS, not on this MacBook. Clear
+stale local runtime state before dashboard design smoke tests:
+
+```bash
+python3 scripts/clear_local_runtime_state.py --confirm
+```
+
+The root `.gitignore` prevents large raw data and live runtime DB/cache files
+from being committed accidentally.
+
+See [docs/data_and_artifacts.md](docs/data_and_artifacts.md).
+
+## Learning Path
+
+Start with:
+
+1. [docs/glossary.md](docs/glossary.md)
+2. [trading/docs/user_guide.md](trading/docs/user_guide.md)
+3. [docs/architecture.md](docs/architecture.md)
+4. [docs/operational_runbook.md](docs/operational_runbook.md)
+5. [docs/research_improvement_review.md](docs/research_improvement_review.md)
+
+The math should stay auditable: probability, calibration, risk gates, observed
+high locks, and paper PnL should be explainable from code and docs.

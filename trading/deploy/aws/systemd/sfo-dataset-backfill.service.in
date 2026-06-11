@@ -1,0 +1,12 @@
+[Unit]
+Description=SFO compact dataset backfill
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=__APP_USER__
+WorkingDirectory=__TRADING_DIR__
+EnvironmentFile=__ENV_FILE__
+ExecStart=/usr/bin/env bash __TRADING_DIR__/deploy/aws/run_dataset_backfill.sh
+Nice=10

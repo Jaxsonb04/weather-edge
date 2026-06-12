@@ -163,13 +163,26 @@ def write_strategy_research_placeholder(path):
             existing = json.loads(path.read_text())
         except (OSError, json.JSONDecodeError):
             existing = {}
-        is_generic_local_placeholder = (
+        is_local_strategy_placeholder = (
             isinstance(existing, dict)
             and existing.get("local_runtime_placeholder") is True
-            and existing.get("artifact") == "forecaster/strategy_research.json"
+            and existing.get("source") == "AWS runtime only"
+            and existing.get("artifact") in (None, "forecaster/strategy_research.json")
+        )
+        monitor = (
+            existing.get("paper_trading", {}).get("monitor", {})
+            if isinstance(existing, dict)
+            else {}
+        )
+        is_outdated_local_placeholder = (
+            is_local_strategy_placeholder
+            and "model_veto_max_loss_pct" not in monitor
+        )
+        is_generic_local_placeholder = (
+            is_local_strategy_placeholder
             and "schema_version" not in existing
         )
-        if not is_generic_local_placeholder:
+        if not is_generic_local_placeholder and not is_outdated_local_placeholder:
             return
     now = datetime.now(timezone.utc).isoformat()
     payload = {
@@ -267,6 +280,7 @@ def write_strategy_research_placeholder(path):
             "monitor": {
                 "take_profit_pct": 35.0,
                 "stop_loss_pct": 35.0,
+                "model_veto_max_loss_pct": 60.0,
             },
             "summary": {
                 "open_positions": 0,

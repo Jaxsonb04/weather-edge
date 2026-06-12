@@ -61,6 +61,7 @@ from .tail_basket import TailBasket, build_tail_basket
 # settlement-day unification (and one hour earlier in winter, which only
 # tightens the gate).
 DEFAULT_SAME_DAY_ENTRY_CUTOFF_HOUR = 14
+DEFAULT_MODEL_VETO_MAX_LOSS_PCT = 60.0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -84,6 +85,16 @@ def _default_calibration_source() -> str:
     """
 
     return os.getenv("SFO_TRADING_SIGNAL_CALIBRATION_SOURCE", "lstm")
+
+
+def _env_float_default(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw in (None, ""):
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -552,6 +563,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=35.0,
         help="Close when unrealized paper ROI is at or below negative this percent. Default: 35.",
+    )
+    monitor.add_argument(
+        "--model-veto-max-loss-pct",
+        type=float,
+        default=_env_float_default("PAPER_MODEL_VETO_MAX_LOSS_PCT", DEFAULT_MODEL_VETO_MAX_LOSS_PCT),
+        help=(
+            "Allow a fresh model snapshot to veto stop-loss exits only while the "
+            "position is above negative this ROI percent. Default: 60."
+        ),
     )
     monitor.add_argument("--dry-run", action="store_true", help="Print actions without closing paper positions")
     monitor.set_defaults(func=cmd_paper_monitor)
@@ -1583,8 +1603,9 @@ def cmd_paper_monitor(args: argparse.Namespace) -> int:
 
     take_profit = args.take_profit_pct / 100.0
     stop_loss = args.stop_loss_pct / 100.0
-    if take_profit <= 0 or stop_loss <= 0:
-        raise ValueError("take-profit and stop-loss percentages must be greater than zero")
+    model_veto_max_loss = args.model_veto_max_loss_pct / 100.0
+    if take_profit <= 0 or stop_loss <= 0 or model_veto_max_loss <= 0:
+        raise ValueError("take-profit, stop-loss, and model-veto loss percentages must be greater than zero")
 
     client = KalshiPublicClient()
     closed = 0
@@ -1636,15 +1657,22 @@ def cmd_paper_monitor(args: argparse.Namespace) -> int:
             reason = f"take-profit {pnl_pct * 100:.1f}% >= {args.take_profit_pct:.1f}%"
         elif pnl_pct <= -stop_loss:
             reason = f"stop-loss {pnl_pct * 100:.1f}% <= -{args.stop_loss_pct:.1f}%"
+            allow_model_veto = side == "NO" and pnl_pct > -model_veto_max_loss
             # Daily-settlement binaries reprice violently intraday; a pure
             # price stop converts that noise into realized losses (June 2026
             # failure mode, and again on 2026-06-10 when a stopped NO position
             # was on track to win at settlement). If a fresh model snapshot
-            # says holding to settlement is worth more than the stop exit,
-            # hold instead of selling the bottom.
-            model_yes_p = store.latest_model_probability(
-                str(row["target_date"]),
-                str(row["market_ticker"]),
+            # says holding a NO to settlement is worth more than the stop exit,
+            # hold instead of selling noise. Cheap YES buckets have been the
+            # live failure mode, so YES stop-losses close instead of using this
+            # veto. Once any loss crosses the hard floor, discipline wins too.
+            model_yes_p = (
+                store.latest_model_probability(
+                    str(row["target_date"]),
+                    str(row["market_ticker"]),
+                )
+                if allow_model_veto
+                else None
             )
             if model_yes_p is not None:
                 side_p = model_yes_p if side == "YES" else 1.0 - model_yes_p

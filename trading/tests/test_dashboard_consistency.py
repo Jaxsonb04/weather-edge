@@ -69,6 +69,17 @@ def test_strategy_lab_fetches_artifact_with_cache_buster_on_each_load():
     assert "fetch(`${artifact}?ts=${Date.now()}`)" in html
 
 
+def test_strategy_lab_trade_cards_show_entry_price_without_sell_bid_lab():
+    html = STRATEGY_TEMPLATE.read_text()
+
+    assert "Bought price" in html
+    assert "Current price" in html
+    assert "Entry all-in" not in html
+    assert "Try sell bid" not in html
+    assert "Why it can turn red immediately" not in html
+    assert "trade-diagnostic" not in html
+
+
 def test_strategy_lab_supports_password_unlock_flow():
     html = STRATEGY_TEMPLATE.read_text()
 

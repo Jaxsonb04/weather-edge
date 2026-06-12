@@ -971,7 +971,8 @@
       font: 600 0.64rem var(--font-mono);
       text-transform: uppercase;
     }
-    .trade-stat p {
+    .trade-stat p,
+    .exit-stat p {
       margin-top: 0.25rem;
       font-size: 0.78rem;
       line-height: 1.35;
@@ -993,19 +994,6 @@
       color: var(--ink-2);
       font-size: 0.9rem;
     }
-    .trade-diagnostic {
-      margin-top: 0.85rem;
-      border-radius: 10px;
-      border: 1px solid var(--line-2);
-      color: var(--ink-2);
-      font-size: 0.9rem;
-      padding: 0.72rem 0.78rem;
-      background: var(--surface-2);
-    }
-    .trade-diagnostic b { color: var(--ink); }
-    .trade-diagnostic.good { border-left: 3px solid var(--mint); }
-    .trade-diagnostic.bad { border-left: 3px solid var(--danger); }
-    .trade-diagnostic.warn { border-left: 3px solid var(--warm); }
     footer {
       display: flex;
       justify-content: space-between;
@@ -2168,7 +2156,7 @@
         </article>
         <article class="paper-exit-rules">
           <h3>Exit monitor</h3>
-          <p>The monitor sells paper positions when scanned bid-based ROI reaches the configured profit or loss rule. Stop-loss exits are vetoed when a fresh model snapshot expects more value at settlement than the exit would return.</p>
+          <p>The monitor sells paper positions when scanned bid-based ROI reaches the configured profit or loss rule. YES stop-losses close; NO stop-losses can be model-vetoed before the hard loss floor, and losses past -${fmt(monitor.model_veto_max_loss_pct ?? 60, 1)}% close.</p>
           <div class="rule-grid">
             <div class="rule-tile"><b>+${fmt(monitor.take_profit_pct ?? 35, 1)}%</b><span>${term('Take profit', 'take-profit')}</span></div>
             <div class="rule-tile"><b>-${fmt(monitor.stop_loss_pct ?? 35, 1)}%</b><span>${term('Stop loss', 'stop-loss')}</span></div>
@@ -2187,11 +2175,12 @@
         </div>`;
     }
 
-    function exitStat(label, value, key, tone) {
+    function exitStat(label, value, key, tone, detail) {
       return `
         <div class="exit-stat">
           <b class="${toneText(tone)}">${htmlEscape(value)}</b>
           <span>${labelHtml(label, key)}</span>
+          ${detail ? `<p class="muted">${htmlEscape(detail)}</p>` : ''}
         </div>`;
     }
 
@@ -2209,28 +2198,16 @@
       const currentDetail = row.current_bid == null
         ? 'P&L waits for the next monitor mark.'
         : `Exit net ${price(row.current_net_exit)} after ${price(row.current_exit_fee_per_contract)} fee.`;
-      const entryDetail = `${price(row.entry_price)} entry + ${price(row.entry_fee_per_contract)} fee = ${price(row.cost_per_contract)} all-in.`;
+      const entryDetail = `${price(row.entry_fee_per_contract)} entry fee; ${price(row.cost_per_contract)} all-in per contract, ${money(row.initial_cost ?? row.risk)} total.`;
       const currentValueDetail = row.current_value == null
         ? 'No marked value yet.'
         : `Marked value ${money(row.current_value)} vs cost ${money(row.initial_cost ?? row.risk)}.`;
-      const costDrag = number(row.cost_per_contract) !== null && number(row.current_net_exit) !== null
-        ? number(row.cost_per_contract) - number(row.current_net_exit)
-        : null;
-      const dragTotal = costDrag === null
-        ? null
-        : costDrag * (number(row.contracts) || 0);
-      const markDiagnosticTitle = costDrag !== null && costDrag > 0.005
-        ? 'Why it can turn red immediately:'
-        : 'Current mark explanation:';
-      const instantMarkDetail = costDrag === null
-        ? 'Immediate mark waits for a current bid. Once marked, open P&L uses the sellable bid after exit fee, not the entry ask.'
-        : costDrag > 0.005
-          ? `Immediate mark crosses from ${price(row.cost_per_contract)} all-in to ${price(row.current_net_exit)} sellable net, a ${price(costDrag)} per-contract drag (${money(dragTotal)} total) before any forecast change.`
-          : `Current sellable net is ${price(Math.abs(costDrag))} above the ${price(row.cost_per_contract)} all-in entry cost, so the mark is ahead by ${money(Math.abs(dragTotal))}.`;
       const profitTarget = row.take_profit_bid == null
         ? 'Not reachable before 99c'
         : `${price(row.take_profit_bid)} or higher`;
       const stopTarget = row.stop_loss_bid == null ? '-' : `${price(row.stop_loss_bid)} or lower`;
+      const takeProfitDetail = row.take_profit_pct == null ? '' : `+${fmt(row.take_profit_pct, 1)}% ROI after exit fee.`;
+      const stopLossDetail = row.stop_loss_pct == null ? '' : `-${fmt(row.stop_loss_pct, 1)}% ROI after exit fee.`;
       return `
         <article class="trade-card ${tone}" data-order-id="${htmlEscape(row.id)}">
           <div class="trade-card-head">
@@ -2240,15 +2217,14 @@
           <div class="trade-grid">
             ${tradeStat('Current price', currentMarket, 'current-bid', tone, currentDetail)}
             ${tradeStat('Current P&L', pnlText, 'unrealized-pnl', tone, currentValueDetail)}
-            ${tradeStat('Entry all-in', money(row.initial_cost ?? row.risk), 'initial-cost', null, entryDetail)}
+            ${tradeStat('Bought price', price(row.entry_price), 'entry-price', null, entryDetail)}
             ${tradeStat('Contracts', fmt(row.contracts, 2), 'contract', null, `${price(row.cost_per_contract)} cost per contract.`)}
           </div>
           <div class="exit-strip">
-            ${exitStat('Take profit bid', profitTarget, 'take-profit', 'good')}
-            ${exitStat('Stop loss bid', stopTarget, 'stop-loss', 'bad')}
-            ${exitStat('Max profit / loss', `${money(row.max_profit)} / -${money(row.max_loss)}`, 'max-profit')}
+            ${exitStat('Take profit bid', profitTarget, 'take-profit', 'good', takeProfitDetail)}
+            ${exitStat('Stop loss bid', stopTarget, 'stop-loss', 'bad', stopLossDetail)}
+            ${exitStat('Max profit / loss', `${money(row.max_profit)} / -${money(row.max_loss)}`, 'max-profit', null, 'If held to settlement.')}
           </div>
-          <p class="trade-diagnostic ${tone}"><b>${htmlEscape(markDiagnosticTitle)}</b> ${htmlEscape(instantMarkDetail)}</p>
           <div class="trade-grid trade-metrics">
             ${tradeStat('Model probability', pct(row.probability, 1), 'model-probability')}
             ${tradeStat('Edge', pct(row.edge, 1), 'edge', number(row.edge) >= 0 ? 'good' : 'bad')}

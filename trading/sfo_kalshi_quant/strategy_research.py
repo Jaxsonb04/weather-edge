@@ -28,6 +28,7 @@ CHALLENGER_CALIBRATION_SOURCE = "clean-blend/combined"
 MIN_CLEAN_WINNER_SAMPLE = 60
 DEFAULT_TAKE_PROFIT_PCT = 35.0
 DEFAULT_STOP_LOSS_PCT = 35.0
+DEFAULT_MODEL_VETO_MAX_LOSS_PCT = 60.0
 PRIMARY_PROFILE = "balanced"
 EXPERIMENTAL_PROFILES = {"exploratory", "fast-feedback"}
 
@@ -1652,9 +1653,15 @@ def _side_from_row(row: sqlite3.Row) -> str:
 def _paper_monitor_config() -> dict[str, Any]:
     take_profit = _env_float("PAPER_TAKE_PROFIT_PCT")
     stop_loss = _env_float("PAPER_STOP_LOSS_PCT")
+    model_veto_max_loss = _env_float("PAPER_MODEL_VETO_MAX_LOSS_PCT")
     return {
         "take_profit_pct": take_profit if take_profit is not None else DEFAULT_TAKE_PROFIT_PCT,
         "stop_loss_pct": stop_loss if stop_loss is not None else DEFAULT_STOP_LOSS_PCT,
+        "model_veto_max_loss_pct": (
+            model_veto_max_loss
+            if model_veto_max_loss is not None
+            else DEFAULT_MODEL_VETO_MAX_LOSS_PCT
+        ),
     }
 
 

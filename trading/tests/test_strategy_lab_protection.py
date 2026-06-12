@@ -108,6 +108,34 @@ def test_strategy_lab_public_mode_removes_stale_protected_artifact():
         _restore_env(old_values)
 
 
+def test_strategy_lab_placeholder_refreshes_old_monitor_schema():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "strategy_research.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "available": False,
+                    "local_runtime_placeholder": True,
+                    "source": "AWS runtime only",
+                    "paper_trading": {
+                        "monitor": {
+                            "take_profit_pct": 35.0,
+                            "stop_loss_pct": 35.0,
+                        }
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        build_dashboard.write_strategy_research_placeholder(path)
+        payload = json.loads(path.read_text())
+
+        assert payload["paper_trading"]["monitor"]["model_veto_max_loss_pct"] == 60.0
+
+
 def test_strategy_lab_temporary_public_mode_overrides_password():
     old_values = _with_env(
         **{

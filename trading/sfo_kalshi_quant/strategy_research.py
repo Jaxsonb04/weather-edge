@@ -967,7 +967,17 @@ def _paper_payload(db_path: Path) -> dict[str, Any]:
     monitor_action_rows = [_paper_monitor_snapshot_row(row) for row in monitor_rows] + [
         _paper_action_row(row) for row in closed_action_rows
     ]
-    action_rows = monitor_action_rows + [_paper_open_action_row(row) for row in open_rows]
+    monitor_action_rows = sorted(
+        monitor_action_rows,
+        key=lambda row: str(row.get("time") or ""),
+        reverse=True,
+    )
+    open_action_rows = [_paper_open_action_row(row) for row in open_rows]
+    open_reserve = min(4, len(open_action_rows))
+    action_rows = (
+        monitor_action_rows[: max(0, 12 - open_reserve)]
+        + open_action_rows[:open_reserve]
+    )
     action_rows = sorted(action_rows, key=lambda row: str(row.get("time") or ""), reverse=True)[:12]
     duplicate_groups = [_duplicate_group_row(row) for row in duplicate_rows]
     today = settlement_today()

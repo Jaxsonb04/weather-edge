@@ -255,18 +255,19 @@ def test_strategy_research_prefers_monitor_marks_for_open_positions():
         store.record_decisions("2026-06-03", [decision])
         store.record_paper_order("2026-06-03", decision)
         order = store.open_paper_orders(1)[0]
-        store.record_monitor_snapshot(
-            order,
-            side="YES",
-            action="HOLD",
-            reason="inside exit bands",
-            market_status="active",
-            live_bid=0.60,
-            exit_fee_per_contract=0.02,
-            net_exit_per_contract=0.58,
-            unrealized_pnl=2.70,
-            unrealized_roi=0.87,
-        )
+        for _ in range(13):
+            store.record_monitor_snapshot(
+                order,
+                side="YES",
+                action="HOLD",
+                reason="inside exit bands",
+                market_status="active",
+                live_bid=0.60,
+                exit_fee_per_contract=0.02,
+                net_exit_per_contract=0.58,
+                unrealized_pnl=2.70,
+                unrealized_roi=0.87,
+            )
 
         payload = build_strategy_research(
             forecaster_root=root,
@@ -279,6 +280,10 @@ def test_strategy_research_prefers_monitor_marks_for_open_positions():
         assert position["current_bid"] == 0.6
         assert position["unrealized_pnl"] > 0
         assert payload["paper_trading"]["recent_monitor_actions"][0]["status"] == "HOLD"
+        assert any(
+            row["status"] == "OPEN"
+            for row in payload["paper_trading"]["recent_monitor_actions"]
+        )
 
 
 def test_strategy_research_alerts_on_duplicate_open_positions():

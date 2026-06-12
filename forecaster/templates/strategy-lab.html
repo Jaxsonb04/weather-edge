@@ -923,20 +923,32 @@
       font: 600 0.68rem var(--font-mono);
       text-transform: uppercase;
     }
+    .trade-badges {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 0.4rem;
+      flex-wrap: wrap;
+    }
     .trade-grid {
       display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
-      gap: 0.65rem;
+      border: 1px solid var(--line-2);
+      border-radius: 10px;
+      overflow: hidden;
+      background: var(--surface-2);
     }
     .trade-grid.trade-metrics { margin-top: 0.65rem; }
     .trade-stat,
     .exit-stat {
       min-width: 0;
-      border: 1px solid var(--line-2);
-      border-radius: 10px;
-      background: var(--surface-2);
+      border-right: 1px solid var(--line-2);
+      border-bottom: 1px solid var(--line-2);
+      background: transparent;
       padding: 0.72rem;
     }
+    .trade-stat:nth-child(4n),
+    .exit-stat:nth-child(3n) { border-right: 0; }
     .trade-stat b,
     .exit-stat b {
       display: block;
@@ -970,57 +982,30 @@
     .exit-strip {
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
-      gap: 0.65rem;
       margin-top: 0.65rem;
+      border: 1px solid var(--line-2);
+      border-radius: 10px;
+      overflow: hidden;
+      background: var(--surface-2);
     }
     .trade-reason {
       margin-top: 0.75rem;
       color: var(--ink-2);
       font-size: 0.9rem;
     }
-    .mark-lab {
-      display: grid;
-      grid-template-columns: minmax(170px, 0.4fr) minmax(0, 1fr);
-      gap: 0.7rem;
-      align-items: center;
+    .trade-diagnostic {
       margin-top: 0.85rem;
-      padding-top: 0.85rem;
-      border-top: 1px solid var(--line-2);
-    }
-    .mark-lab label {
-      display: grid;
-      gap: 0.28rem;
-      color: var(--ink);
-      font: 600 0.72rem var(--font-mono);
-      text-transform: uppercase;
-    }
-    .mark-lab input {
-      width: 100%;
-      min-height: 2.75rem;
-      border: 1px solid var(--line);
       border-radius: 10px;
-      background: var(--surface);
-      color: var(--ink);
-      padding: 0.62rem 0.7rem;
-      font: 600 1rem var(--font-mono);
-      font-variant-numeric: tabular-nums;
-    }
-    .mark-result {
-      min-width: 0;
-      border-radius: 10px;
-      padding: 0.72rem;
-      background: var(--surface-2);
       border: 1px solid var(--line-2);
       color: var(--ink-2);
       font-size: 0.9rem;
+      padding: 0.72rem 0.78rem;
+      background: var(--surface-2);
     }
-    .mark-result b {
-      color: var(--ink);
-      font: 600 1rem var(--font-mono);
-      font-variant-numeric: tabular-nums;
-    }
-    .mark-result.good b { color: #0b684f; }
-    .mark-result.bad b { color: var(--danger); }
+    .trade-diagnostic b { color: var(--ink); }
+    .trade-diagnostic.good { border-left: 3px solid var(--mint); }
+    .trade-diagnostic.bad { border-left: 3px solid var(--danger); }
+    .trade-diagnostic.warn { border-left: 3px solid var(--warm); }
     footer {
       display: flex;
       justify-content: space-between;
@@ -1168,7 +1153,6 @@
       .readiness-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .score-row { grid-template-columns: 1fr; }
       .trade-grid, .exit-strip, .rule-grid { grid-template-columns: 1fr; }
-      .mark-lab { grid-template-columns: 1fr; }
       .chart-card { min-height: 250px; }
       .chart-card canvas { height: 200px; }
     }
@@ -1509,7 +1493,6 @@
       'target-date': ['Target date', 'The weather date the Kalshi market will settle against.'],
       'unrealized-pnl': ['Unrealized P&L', 'Estimated profit or loss if the open position sold at the current scanned bid.']
     };
-    let paperRowsById = new Map();
     let labData = null;
     let activeProfileKey = null;
     let refreshInFlight = null;
@@ -1548,27 +1531,6 @@
       return 'warn';
     };
     const toneText = (tone) => tone === 'good' ? 'good-text' : tone === 'bad' ? 'bad-text' : 'muted';
-    const ceilToCent = (value) => value <= 0 ? 0 : Math.ceil((value * 100) - 1e-12) / 100;
-    function exitFeeAverage(priceValue, contractsValue) {
-      const mark = number(priceValue);
-      const contracts = number(contractsValue);
-      if (mark === null || contracts === null || mark <= 0 || mark >= 1 || contracts <= 0) return 0;
-      return ceilToCent(0.07 * contracts * mark * (1 - mark)) / contracts;
-    }
-
-    function paperMarkCalc(row, bidValue) {
-      const bid = number(bidValue);
-      const contracts = number(row.contracts) || 0;
-      const initialCost = number(row.initial_cost ?? row.risk);
-      if (bid === null || bid <= 0 || bid >= 1 || !contracts || initialCost === null) return null;
-      const fee = exitFeeAverage(bid, contracts);
-      const netExit = bid - fee;
-      const currentValue = contracts * netExit;
-      const pnl = currentValue - initialCost;
-      const roi = initialCost > 0 ? pnl / initialCost : null;
-      return { bid, fee, netExit, currentValue, pnl, roi };
-    }
-
     function concatBytes(...chunks) {
       const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
       const result = new Uint8Array(total);
@@ -2152,7 +2114,6 @@
       const closedRows = paper.closed_positions || [];
       const publishedOpen = number(summary.published_open_positions) ?? openRows.length;
       const hiddenOpen = number(summary.hidden_open_positions) || 0;
-      paperRowsById = new Map(openRows.map((row) => [String(row.id), row]));
       const unrealizedTone = toneForValue(summary.unrealized_pnl);
       const realizedTone = toneForValue(summary.realized_pnl || 0);
       $('paperDashboard').innerHTML = paperDashboard(paper, summary);
@@ -2173,7 +2134,6 @@
         : '<p class="empty">No open paper positions are published.</p>';
       $('closedPaperTable').innerHTML = closedPaperTable(closedRows);
       $('paperActionTable').innerHTML = actionTable(paper.recent_monitor_actions || []);
-      bindPaperMarkInputs();
     }
 
     function paperDashboard(paper, summary) {
@@ -2240,31 +2200,55 @@
       const pnlText = row.unrealized_pnl == null
         ? 'Mark pending'
         : `${signedMoney(row.unrealized_pnl)} (${signedPct(row.unrealized_roi)})`;
+      const currentAsk = number(row.current_ask);
+      const currentMarket = row.current_bid == null
+        ? 'No current scan'
+        : currentAsk !== null && currentAsk > 0
+          ? `${price(row.current_bid)} bid / ${price(row.current_ask)} ask`
+          : `${price(row.current_bid)} sell bid`;
       const currentDetail = row.current_bid == null
-        ? 'No latest scanned sell bid'
-        : `${price(row.current_bid)} bid, net ${price(row.current_net_exit)} after exit fee`;
+        ? 'P&L waits for the next monitor mark.'
+        : `Exit net ${price(row.current_net_exit)} after ${price(row.current_exit_fee_per_contract)} fee.`;
+      const entryDetail = `${price(row.entry_price)} entry + ${price(row.entry_fee_per_contract)} fee = ${price(row.cost_per_contract)} all-in.`;
+      const currentValueDetail = row.current_value == null
+        ? 'No marked value yet.'
+        : `Marked value ${money(row.current_value)} vs cost ${money(row.initial_cost ?? row.risk)}.`;
+      const costDrag = number(row.cost_per_contract) !== null && number(row.current_net_exit) !== null
+        ? number(row.cost_per_contract) - number(row.current_net_exit)
+        : null;
+      const dragTotal = costDrag === null
+        ? null
+        : costDrag * (number(row.contracts) || 0);
+      const markDiagnosticTitle = costDrag !== null && costDrag > 0.005
+        ? 'Why it can turn red immediately:'
+        : 'Current mark explanation:';
+      const instantMarkDetail = costDrag === null
+        ? 'Immediate mark waits for a current bid. Once marked, open P&L uses the sellable bid after exit fee, not the entry ask.'
+        : costDrag > 0.005
+          ? `Immediate mark crosses from ${price(row.cost_per_contract)} all-in to ${price(row.current_net_exit)} sellable net, a ${price(costDrag)} per-contract drag (${money(dragTotal)} total) before any forecast change.`
+          : `Current sellable net is ${price(Math.abs(costDrag))} above the ${price(row.cost_per_contract)} all-in entry cost, so the mark is ahead by ${money(Math.abs(dragTotal))}.`;
       const profitTarget = row.take_profit_bid == null
         ? 'Not reachable before 99c'
         : `${price(row.take_profit_bid)} or higher`;
       const stopTarget = row.stop_loss_bid == null ? '-' : `${price(row.stop_loss_bid)} or lower`;
-      const markValue = row.current_bid == null ? '' : String(row.current_bid);
       return `
         <article class="trade-card ${tone}" data-order-id="${htmlEscape(row.id)}">
           <div class="trade-card-head">
             <h3>${htmlEscape(row.label || row.ticker || 'Paper position')}<span>#${htmlEscape(row.id)} - ${htmlEscape(row.target_date || '-')} - ${htmlEscape(row.side || '-')}</span></h3>
-            <span>${profilePill(row.risk_profile)} <span class="pill ${tone}">${htmlEscape(row.position_status_label || 'Mark pending')}</span></span>
+            <div class="trade-badges">${profilePill(row.risk_profile)} <span class="pill ${tone}">${htmlEscape(row.position_status_label || 'Mark pending')}</span></div>
           </div>
           <div class="trade-grid">
-            ${tradeStat('Bought initially', money(row.initial_cost ?? row.risk), 'initial-cost')}
-            ${tradeStat('Contracts', fmt(row.contracts, 2), 'contract')}
-            ${tradeStat('Entry', `${price(row.entry_price)} + ${price(row.entry_fee_per_contract)} fee`, 'entry-price')}
-            ${tradeStat('Current P&L', pnlText, 'unrealized-pnl', tone, currentDetail)}
+            ${tradeStat('Current price', currentMarket, 'current-bid', tone, currentDetail)}
+            ${tradeStat('Current P&L', pnlText, 'unrealized-pnl', tone, currentValueDetail)}
+            ${tradeStat('Entry all-in', money(row.initial_cost ?? row.risk), 'initial-cost', null, entryDetail)}
+            ${tradeStat('Contracts', fmt(row.contracts, 2), 'contract', null, `${price(row.cost_per_contract)} cost per contract.`)}
           </div>
           <div class="exit-strip">
-            ${exitStat('Take profit sell bid', profitTarget, 'take-profit', 'good')}
-            ${exitStat('Stop loss sell bid', stopTarget, 'stop-loss', 'bad')}
+            ${exitStat('Take profit bid', profitTarget, 'take-profit', 'good')}
+            ${exitStat('Stop loss bid', stopTarget, 'stop-loss', 'bad')}
             ${exitStat('Max profit / loss', `${money(row.max_profit)} / -${money(row.max_loss)}`, 'max-profit')}
           </div>
+          <p class="trade-diagnostic ${tone}"><b>${htmlEscape(markDiagnosticTitle)}</b> ${htmlEscape(instantMarkDetail)}</p>
           <div class="trade-grid trade-metrics">
             ${tradeStat('Model probability', pct(row.probability, 1), 'model-probability')}
             ${tradeStat('Edge', pct(row.edge, 1), 'edge', number(row.edge) >= 0 ? 'good' : 'bad')}
@@ -2272,41 +2256,7 @@
             ${tradeStat('Quality score', fmt(row.quality_score, 1), 'quality-score')}
           </div>
           <p class="trade-reason"><b>Why it passed:</b> ${htmlEscape(row.why_good || '-')}</p>
-          <div class="mark-lab">
-            <label for="paperMark${htmlEscape(row.id)}">${term('Try sell bid', 'current-bid')}
-              <input id="paperMark${htmlEscape(row.id)}" name="paper_mark_${htmlEscape(row.id)}" data-paper-mark="${htmlEscape(row.id)}" type="number" inputmode="decimal" min="0.01" max="0.99" step="0.01" autocomplete="off" value="${htmlEscape(markValue)}" placeholder="0.42">
-            </label>
-            <output class="mark-result ${tone}" data-paper-result="${htmlEscape(row.id)}">${paperMarkResultHtml(row, markValue)}</output>
-          </div>
         </article>`;
-    }
-
-    function monitorAction(row, calc) {
-      if (!calc || calc.roi === null) return 'Enter a sell bid to mark this position.';
-      const takeProfit = (number(row.take_profit_pct) ?? 35) / 100;
-      const stopLoss = (number(row.stop_loss_pct) ?? 35) / 100;
-      if (calc.roi >= takeProfit) return 'Take-profit trigger would be hit.';
-      if (calc.roi <= -stopLoss) return 'Stop-loss trigger would be hit.';
-      return 'Monitor would keep holding.';
-    }
-
-    function paperMarkResultHtml(row, bidValue) {
-      const calc = paperMarkCalc(row, bidValue);
-      if (!calc) return '<span class="muted">No sell bid mark yet.</span>';
-      return `<b>${htmlEscape(signedMoney(calc.pnl))} (${htmlEscape(signedPct(calc.roi))})</b><br><span>${htmlEscape(monitorAction(row, calc))} Bid ${htmlEscape(price(calc.bid))}, exit fee ${htmlEscape(price(calc.fee))}, marked value ${htmlEscape(money(calc.currentValue))}.</span>`;
-    }
-
-    function bindPaperMarkInputs() {
-      for (const input of document.querySelectorAll('[data-paper-mark]')) {
-        input.addEventListener('input', () => {
-          const row = paperRowsById.get(String(input.dataset.paperMark));
-          const output = input.closest('.mark-lab')?.querySelector('[data-paper-result]');
-          if (!row || !output) return;
-          const calc = paperMarkCalc(row, input.value);
-          output.className = `mark-result ${toneForValue(calc?.pnl)}`;
-          output.innerHTML = paperMarkResultHtml(row, input.value);
-        });
-      }
     }
 
     function closedPaperTable(rows) {

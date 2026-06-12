@@ -115,6 +115,14 @@ class PaperTrader:
     ) -> list[int]:
         if stake_dollars is not None and daily_budget is not None:
             raise ValueError("use either paper stake or daily budget, not both")
+        if bankroll is not None:
+            pause_reason = self.store.paper_entry_pause_reason(
+                self.risk_profile,
+                bankroll=bankroll,
+                target_date=target_date,
+            )
+            if pause_reason is not None:
+                return []
         if daily_budget is not None:
             decisions = self.with_daily_budget(decisions, daily_budget)
         exposure_remaining = self._target_exposure_remaining(target_date, bankroll)

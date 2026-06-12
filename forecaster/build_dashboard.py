@@ -176,7 +176,11 @@ def write_strategy_research_placeholder(path):
         )
         is_outdated_local_placeholder = (
             is_local_strategy_placeholder
-            and "model_veto_max_loss_pct" not in monitor
+            and (
+                "model_veto_max_loss_pct" not in monitor
+                or "yes_stop_loss_pct" not in monitor
+                or "model_veto_buffer" not in monitor
+            )
         )
         is_generic_local_placeholder = (
             is_local_strategy_placeholder
@@ -278,9 +282,14 @@ def write_strategy_research_placeholder(path):
         "paper_trading": {
             "available": False,
             "monitor": {
-                "take_profit_pct": 35.0,
+                "take_profit_pct": 40.0,
                 "stop_loss_pct": 35.0,
-                "model_veto_max_loss_pct": 60.0,
+                "yes_take_profit_pct": 50.0,
+                "yes_stop_loss_pct": 25.0,
+                "no_take_profit_pct": 35.0,
+                "no_stop_loss_pct": 35.0,
+                "model_veto_max_loss_pct": 45.0,
+                "model_veto_buffer": 0.08,
             },
             "summary": {
                 "open_positions": 0,

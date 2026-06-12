@@ -911,6 +911,66 @@ class PaperStore:
             "open_capital_at_risk": open_capital,
         }
 
+    def paper_entry_pause_reason(
+        self,
+        risk_profile: str | None,
+        *,
+        bankroll: float,
+        target_date: str,
+        min_resolved_trades: int = 5,
+        max_resolved_roi: float = -0.25,
+        daily_loss_pct: float = 0.005,
+    ) -> str | None:
+        profile = normalize_risk_profile_name(risk_profile)
+        if profile != "fast-feedback":
+            return None
+
+        with self.connect() as conn:
+            resolved = conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS trades,
+                    COALESCE(SUM(realized_pnl), 0) AS pnl,
+                    COALESCE(SUM(contracts * cost_per_contract), 0) AS capital
+                FROM paper_orders
+                WHERE realized_pnl IS NOT NULL
+                  AND status != 'REJECTED'
+                  AND COALESCE(risk_profile, 'balanced') = ?
+                """,
+                (profile,),
+            ).fetchone()
+            daily = conn.execute(
+                """
+                SELECT COALESCE(SUM(realized_pnl), 0) AS pnl
+                FROM paper_orders
+                WHERE realized_pnl IS NOT NULL
+                  AND status != 'REJECTED'
+                  AND target_date = ?
+                  AND COALESCE(risk_profile, 'balanced') = ?
+                """,
+                (target_date, profile),
+            ).fetchone()
+
+        trades = int(resolved[0] or 0)
+        pnl = float(resolved[1] or 0.0)
+        capital = float(resolved[2] or 0.0)
+        roi = pnl / capital if capital > 0 else 0.0
+        if trades >= min_resolved_trades and roi <= max_resolved_roi:
+            return (
+                f"fast-feedback paused: resolved ROI {roi:.1%} across "
+                f"{trades} paper trade(s) is below {max_resolved_roi:.0%}; "
+                "recording near-misses only"
+            )
+
+        daily_pnl = float(daily[0] or 0.0)
+        daily_loss_limit = -abs(float(bankroll) * daily_loss_pct)
+        if daily_pnl <= daily_loss_limit:
+            return (
+                f"fast-feedback paused: daily loss ${daily_pnl:.2f} reached "
+                f"${daily_loss_limit:.2f}; recording near-misses only"
+            )
+        return None
+
     def signal_backtest_summary(
         self,
         settlements: dict[object, float],

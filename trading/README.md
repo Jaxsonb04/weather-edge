@@ -348,7 +348,10 @@ You can also let the paper monitor close open positions when the live bid
 implies a stop-loss or take-profit threshold:
 
 ```bash
-python3 -m sfo_kalshi_quant.cli --no-color paper-monitor --take-profit-pct 35 --stop-loss-pct 35
+python3 -m sfo_kalshi_quant.cli --no-color paper-monitor \
+  --yes-take-profit-pct 50 --yes-stop-loss-pct 25 \
+  --no-take-profit-pct 35 --no-stop-loss-pct 35 \
+  --model-veto-max-loss-pct 45 --model-veto-buffer 0.08
 ```
 
 The unrealized ROI math is:

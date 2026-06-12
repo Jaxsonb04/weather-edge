@@ -76,7 +76,10 @@ Only rows that pass all risk gates are recorded.
 ## Paper Monitor
 
 ```bash
-python -m sfo_kalshi_quant.cli --no-color paper-monitor --take-profit-pct 35 --stop-loss-pct 35
+python -m sfo_kalshi_quant.cli --no-color paper-monitor \
+  --yes-take-profit-pct 50 --yes-stop-loss-pct 25 \
+  --no-take-profit-pct 35 --no-stop-loss-pct 35 \
+  --model-veto-max-loss-pct 45 --model-veto-buffer 0.08
 ```
 
 ## Paper Settle

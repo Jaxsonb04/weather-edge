@@ -114,6 +114,13 @@ class _FakeYesStopClient(_FakeKalshiClient):
     no_ask = 0.94
 
 
+class _FakeYesSoftStopClient(_FakeKalshiClient):
+    yes_bid = 0.075
+    yes_ask = 0.09
+    no_bid = 0.91
+    no_ask = 0.925
+
+
 class _FakeNoStopClient(_FakeKalshiClient):
     yes_bid = 0.53
     yes_ask = 0.55
@@ -243,6 +250,39 @@ def test_paper_monitor_yes_stop_loss_does_not_model_veto_before_hard_floor():
         assert "HOLD_MODEL_VETO" not in out.getvalue()
 
 
+def test_paper_monitor_yes_uses_tighter_default_stop_loss():
+    with TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "paper.db"
+        store = PaperStore(db_path)
+        order_id = store.record_paper_order(
+            "2026-06-12",
+            _cheap_yes_decision(yes_ask=0.09),
+        )
+
+        out = StringIO()
+        with patch("sfo_kalshi_quant.cli.KalshiPublicClient", _FakeYesSoftStopClient), redirect_stdout(out):
+            code = main(["--db-path", str(db_path), "--no-color", "paper-monitor"])
+
+        assert code == 0
+        row = store.paper_orders(1)[0]
+        assert row["id"] == order_id
+        assert row["status"] == "PAPER_CLOSED"
+        with store.connect() as conn:
+            action, reason = conn.execute(
+                """
+                SELECT action, reason
+                FROM paper_monitor_snapshots
+                WHERE order_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (order_id,),
+            ).fetchone()
+        assert action == "CLOSE_STOP_LOSS"
+        assert "25.0%" in reason
+        assert "HOLD_MODEL_VETO" not in out.getvalue()
+
+
 def test_paper_monitor_no_stop_loss_can_model_veto_before_hard_floor():
     with TemporaryDirectory() as tmp:
         db_path = Path(tmp) / "paper.db"
@@ -282,4 +322,38 @@ def test_paper_monitor_no_stop_loss_can_model_veto_before_hard_floor():
                 (order_id,),
             ).fetchone()[0]
         assert action == "HOLD_MODEL_VETO"
+        assert "+ 0.08 buffer" in out.getvalue()
         assert "HOLD order" in out.getvalue()
+
+
+def test_paper_monitor_default_no_hard_floor_closes_past_45_pct_loss():
+    with TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "paper.db"
+        store = PaperStore(db_path)
+        order_id = store.record_paper_order("2026-06-12", _stopped_no_decision())
+        store.record_probabilities(
+            "2026-06-12",
+            [_probability("KXHIGHTSFO-TEST-B82.5", 0.35)],
+        )
+
+        out = StringIO()
+        with patch("sfo_kalshi_quant.cli.KalshiPublicClient", _FakeNoStopClient), redirect_stdout(out):
+            code = main(["--db-path", str(db_path), "--no-color", "paper-monitor"])
+
+        assert code == 0
+        row = store.paper_orders(1)[0]
+        assert row["id"] == order_id
+        assert row["status"] == "PAPER_CLOSED"
+        with store.connect() as conn:
+            action = conn.execute(
+                """
+                SELECT action
+                FROM paper_monitor_snapshots
+                WHERE order_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (order_id,),
+            ).fetchone()[0]
+        assert action == "CLOSE_STOP_LOSS"
+        assert "HOLD_MODEL_VETO" not in out.getvalue()

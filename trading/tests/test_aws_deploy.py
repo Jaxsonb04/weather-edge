@@ -84,10 +84,25 @@ def test_paper_trading_timers_run_around_the_clock_and_auto_settle():
     installer = _read(AWS_DIR / "install_systemd.sh")
 
     assert "OnCalendar=*-*-* *:00,15,30,45" in scan
-    assert "OnCalendar=*-*-* *:02,07,12,17,22,27,32,37,42,47,52,57" in monitor
+    assert "OnCalendar=*-*-* *:01,03,05,07,09,11,13,15,17,19,21,23,25,27,29,31,33,35,37,39,41,43,45,47,49,51,53,55,57,59" in monitor
     assert "OnCalendar=*-*-* *:10,40" in settle
     assert "sfo-kalshi-paper-settle.service.in" in installer
     assert "sfo-kalshi-paper-settle.timer" in installer
+
+
+def test_paper_monitor_service_uses_side_aware_exit_env():
+    service = _read(AWS_DIR / "systemd" / "sfo-kalshi-paper-monitor.service.in")
+    example_env = _read(AWS_DIR / "sfo-weather.env.example")
+
+    assert "--yes-take-profit-pct ${PAPER_YES_TAKE_PROFIT_PCT}" in service
+    assert "--yes-stop-loss-pct ${PAPER_YES_STOP_LOSS_PCT}" in service
+    assert "--no-take-profit-pct ${PAPER_NO_TAKE_PROFIT_PCT}" in service
+    assert "--no-stop-loss-pct ${PAPER_NO_STOP_LOSS_PCT}" in service
+    assert "--model-veto-max-loss-pct ${PAPER_MODEL_VETO_MAX_LOSS_PCT}" in service
+    assert "--model-veto-buffer ${PAPER_MODEL_VETO_BUFFER}" in service
+    assert "PAPER_YES_STOP_LOSS_PCT=25" in example_env
+    assert "PAPER_MODEL_VETO_MAX_LOSS_PCT=45" in example_env
+    assert "PAPER_MODEL_VETO_BUFFER=0.08" in example_env
 
 
 def test_dataset_backfill_timer_is_lightsail_safe_and_installed():

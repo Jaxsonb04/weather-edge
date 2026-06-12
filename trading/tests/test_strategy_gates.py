@@ -326,10 +326,11 @@ def test_fast_feedback_profile_is_more_active_than_exploratory_but_tiny_sized():
 
     assert fast.min_edge < exploratory.min_edge
     assert fast.min_edge_lcb < exploratory.min_edge_lcb
-    assert fast.kelly_lcb_weight == 0.0
+    assert fast.kelly_lcb_weight == 0.5
     assert fast.max_contracts_per_market < exploratory.max_contracts_per_market
     assert fast.max_position_risk_pct < exploratory.max_position_risk_pct
     assert fast_alias.min_edge == fast.min_edge
+    assert fast.max_source_spread_f == 10.0
 
 
 def test_fast_feedback_can_collect_raw_edge_trade_rejected_by_balanced_lcb():
@@ -343,14 +344,14 @@ def test_fast_feedback_can_collect_raw_edge_trade_rejected_by_balanced_lcb():
     probability = BucketProbability(
         ticker=market.ticker,
         label=market.yes_sub_title,
-        probability=0.35,
-        lower_confidence=0.27,
-        empirical_probability=0.35,
-        normal_probability=0.35,
+        probability=0.40,
+        lower_confidence=0.305,
+        empirical_probability=0.40,
+        normal_probability=0.40,
         effective_n=220,
-        residual_probability=0.35,
-        ensemble_probability=0.34,
-        model_probability=0.35,
+        residual_probability=0.40,
+        ensemble_probability=0.39,
+        model_probability=0.40,
         market_probability=0.30,
     )
 
@@ -368,10 +369,46 @@ def test_fast_feedback_can_collect_raw_edge_trade_rejected_by_balanced_lcb():
     assert not balanced.approved
     assert any("lower-bound edge" in reason for reason in balanced.reasons)
     assert fast.approved
-    assert 1.0 <= fast.recommended_contracts <= 5.0
+    assert 1.0 <= fast.recommended_contracts <= 3.0
 
 
-def test_fast_feedback_collects_tiny_trade_on_wide_next_day_raw_edge():
+def test_fast_feedback_collects_tiny_trade_on_moderate_source_disagreement():
+    market = _bin(
+        "74° or above",
+        yes_bid=0.47,
+        yes_ask=0.48,
+        no_bid=0.52,
+        no_ask=0.53,
+        yes_bid_size=40.0,
+        yes_ask_size=40.0,
+    )
+    probability = BucketProbability(
+        ticker=market.ticker,
+        label=market.yes_sub_title,
+        probability=0.38,
+        lower_confidence=0.35,
+        empirical_probability=0.38,
+        normal_probability=0.38,
+        effective_n=180,
+        residual_probability=0.38,
+        ensemble_probability=0.39,
+        model_probability=0.38,
+        market_probability=0.4460,
+    )
+
+    decision = TradeEvaluator(strategy_config_for_profile("fast-feedback")).evaluate_market(
+        market,
+        probability,
+        bankroll=1000,
+        side="NO",
+        source_spread_f=9.6,
+    )
+
+    assert decision.approved, decision.reasons
+    assert decision.recommended_contracts <= 3.0
+
+
+def test_fast_feedback_blocks_deep_negative_lcb_research_trade():
     market = _bin(
         "74° or above",
         yes_bid=0.47,
@@ -400,11 +437,11 @@ def test_fast_feedback_collects_tiny_trade_on_wide_next_day_raw_edge():
         probability,
         bankroll=1000,
         side="NO",
-        source_spread_f=16.7,
+        source_spread_f=9.6,
     )
 
-    assert decision.approved, decision.reasons
-    assert decision.recommended_contracts <= 5.0
+    assert not decision.approved
+    assert any("lower-bound edge" in reason for reason in decision.reasons)
 
 
 def test_fast_feedback_still_blocks_extreme_source_disagreement():
@@ -436,11 +473,43 @@ def test_fast_feedback_still_blocks_extreme_source_disagreement():
         probability,
         bankroll=1000,
         side="NO",
-        source_spread_f=24.5,
+        source_spread_f=10.1,
     )
 
     assert not decision.approved
     assert any("source spread" in reason for reason in decision.reasons)
+
+
+def test_fast_feedback_cheap_tail_requires_positive_lcb_after_tightening():
+    market = _bin(
+        "66° to 67°",
+        yes_bid=0.03,
+        yes_ask=0.04,
+        yes_bid_size=10.0,
+        yes_ask_size=50.0,
+    )
+    probability = BucketProbability(
+        ticker=market.ticker,
+        label=market.yes_sub_title,
+        probability=0.09,
+        lower_confidence=0.04,
+        empirical_probability=0.09,
+        normal_probability=0.09,
+        effective_n=250,
+        residual_probability=0.09,
+        ensemble_probability=0.06,
+        model_probability=0.09,
+        market_probability=0.04,
+    )
+
+    decision = TradeEvaluator(strategy_config_for_profile("fast-feedback")).evaluate_market(
+        market,
+        probability,
+        bankroll=1000,
+    )
+
+    assert not decision.approved
+    assert any("1c/2c tail requires exceptional support" in reason for reason in decision.reasons)
 
 
 def test_event_risk_cap_scales_total_approved_exposure():
@@ -527,5 +596,5 @@ def test_balanced_blocks_trade_when_forecast_sources_disagree():
     fast = TradeEvaluator(strategy_config_for_profile("fast-feedback"))
     research = fast.evaluate_market(market, probability, bankroll=1000, source_spread_f=9.6)
     assert research.approved, research.reasons
-    extreme = fast.evaluate_market(market, probability, bankroll=1000, source_spread_f=24.5)
+    extreme = fast.evaluate_market(market, probability, bankroll=1000, source_spread_f=10.1)
     assert not extreme.approved

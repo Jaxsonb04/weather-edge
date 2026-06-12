@@ -26,9 +26,14 @@ from .synthetic_blend import build_synthetic_blend_calibration
 ACTIVE_CALIBRATION_SOURCE = "lstm"
 CHALLENGER_CALIBRATION_SOURCE = "clean-blend/combined"
 MIN_CLEAN_WINNER_SAMPLE = 60
-DEFAULT_TAKE_PROFIT_PCT = 35.0
+DEFAULT_TAKE_PROFIT_PCT = 40.0
 DEFAULT_STOP_LOSS_PCT = 35.0
-DEFAULT_MODEL_VETO_MAX_LOSS_PCT = 60.0
+DEFAULT_YES_TAKE_PROFIT_PCT = 50.0
+DEFAULT_YES_STOP_LOSS_PCT = 25.0
+DEFAULT_NO_TAKE_PROFIT_PCT = 35.0
+DEFAULT_NO_STOP_LOSS_PCT = 35.0
+DEFAULT_MODEL_VETO_MAX_LOSS_PCT = 45.0
+DEFAULT_MODEL_VETO_BUFFER = 0.08
 PRIMARY_PROFILE = "balanced"
 EXPERIMENTAL_PROFILES = {"exploratory", "fast-feedback"}
 
@@ -1653,16 +1658,46 @@ def _side_from_row(row: sqlite3.Row) -> str:
 def _paper_monitor_config() -> dict[str, Any]:
     take_profit = _env_float("PAPER_TAKE_PROFIT_PCT")
     stop_loss = _env_float("PAPER_STOP_LOSS_PCT")
+    yes_take_profit = _env_float("PAPER_YES_TAKE_PROFIT_PCT")
+    yes_stop_loss = _env_float("PAPER_YES_STOP_LOSS_PCT")
+    no_take_profit = _env_float("PAPER_NO_TAKE_PROFIT_PCT")
+    no_stop_loss = _env_float("PAPER_NO_STOP_LOSS_PCT")
     model_veto_max_loss = _env_float("PAPER_MODEL_VETO_MAX_LOSS_PCT")
+    model_veto_buffer = _env_float("PAPER_MODEL_VETO_BUFFER")
     return {
         "take_profit_pct": take_profit if take_profit is not None else DEFAULT_TAKE_PROFIT_PCT,
         "stop_loss_pct": stop_loss if stop_loss is not None else DEFAULT_STOP_LOSS_PCT,
+        "yes_take_profit_pct": (
+            yes_take_profit if yes_take_profit is not None else DEFAULT_YES_TAKE_PROFIT_PCT
+        ),
+        "yes_stop_loss_pct": yes_stop_loss if yes_stop_loss is not None else DEFAULT_YES_STOP_LOSS_PCT,
+        "no_take_profit_pct": no_take_profit if no_take_profit is not None else DEFAULT_NO_TAKE_PROFIT_PCT,
+        "no_stop_loss_pct": no_stop_loss if no_stop_loss is not None else DEFAULT_NO_STOP_LOSS_PCT,
         "model_veto_max_loss_pct": (
             model_veto_max_loss
             if model_veto_max_loss is not None
             else DEFAULT_MODEL_VETO_MAX_LOSS_PCT
         ),
+        "model_veto_buffer": model_veto_buffer if model_veto_buffer is not None else DEFAULT_MODEL_VETO_BUFFER,
     }
+
+
+def _monitor_thresholds_for_side(monitor: dict[str, Any], side: str) -> tuple[float, float]:
+    normalized = side.upper()
+    if normalized == "YES":
+        return (
+            _to_float(monitor.get("yes_take_profit_pct"), DEFAULT_YES_TAKE_PROFIT_PCT),
+            _to_float(monitor.get("yes_stop_loss_pct"), DEFAULT_YES_STOP_LOSS_PCT),
+        )
+    if normalized == "NO":
+        return (
+            _to_float(monitor.get("no_take_profit_pct"), DEFAULT_NO_TAKE_PROFIT_PCT),
+            _to_float(monitor.get("no_stop_loss_pct"), DEFAULT_NO_STOP_LOSS_PCT),
+        )
+    return (
+        _to_float(monitor.get("take_profit_pct"), DEFAULT_TAKE_PROFIT_PCT),
+        _to_float(monitor.get("stop_loss_pct"), DEFAULT_STOP_LOSS_PCT),
+    )
 
 
 def _net_exit_per_contract(bid: float, contracts: float) -> float:
@@ -1693,6 +1728,7 @@ def _position_mark_status(
     unrealized_pnl: float | None,
     unrealized_roi: float | None,
     monitor: dict[str, Any],
+    side: str,
 ) -> dict[str, str]:
     if unrealized_pnl is None or unrealized_roi is None:
         return {
@@ -1702,8 +1738,9 @@ def _position_mark_status(
             "monitor_action": "WAITING_FOR_MARK",
         }
 
-    take_profit = _to_float(monitor.get("take_profit_pct")) / 100.0
-    stop_loss = _to_float(monitor.get("stop_loss_pct")) / 100.0
+    take_profit_pct, stop_loss_pct = _monitor_thresholds_for_side(monitor, side)
+    take_profit = take_profit_pct / 100.0
+    stop_loss = stop_loss_pct / 100.0
     if unrealized_roi >= take_profit:
         monitor_action = "TAKE_PROFIT_READY"
     elif unrealized_roi <= -stop_loss:
@@ -1740,6 +1777,7 @@ def _paper_row(
 ) -> dict[str, Any]:
     reasons = _json_list(row["reasons_json"])
     monitor = monitor or _paper_monitor_config()
+    side = _side_from_row(row)
     contracts = _to_float(row["contracts"])
     entry_price = row["entry_price"] if row["entry_price"] is not None else row["yes_ask"]
     cost_per_contract = _to_float(row["cost_per_contract"])
@@ -1772,18 +1810,19 @@ def _paper_row(
         if unrealized_pnl is not None and risk > 0
         else None
     )
-    take_profit = _to_float(monitor.get("take_profit_pct")) / 100.0
-    stop_loss = _to_float(monitor.get("stop_loss_pct")) / 100.0
+    take_profit_pct, stop_loss_pct = _monitor_thresholds_for_side(monitor, side)
+    take_profit = take_profit_pct / 100.0
+    stop_loss = stop_loss_pct / 100.0
     take_profit_net = cost_per_contract * (1.0 + take_profit)
     stop_loss_net = max(0.0, cost_per_contract * (1.0 - stop_loss))
-    mark_status = _position_mark_status(unrealized_pnl, unrealized_roi, monitor)
+    mark_status = _position_mark_status(unrealized_pnl, unrealized_roi, monitor, side)
     return {
         "id": row["id"],
         "created_at": row["created_at"],
         "target_date": row["target_date"],
         "ticker": row["market_ticker"],
         "label": row["label"],
-        "side": row["side"],
+        "side": side,
         "status": row["status"],
         "risk_profile": _row_risk_profile(row),
         "contracts": _round(contracts, 4),
@@ -1815,8 +1854,8 @@ def _paper_row(
         "position_status_label": mark_status["label"],
         "position_status_tone": mark_status["tone"],
         "monitor_action": mark_status["monitor_action"],
-        "take_profit_pct": _round(monitor.get("take_profit_pct"), 2),
-        "stop_loss_pct": _round(monitor.get("stop_loss_pct"), 2),
+        "take_profit_pct": _round(take_profit_pct, 2),
+        "stop_loss_pct": _round(stop_loss_pct, 2),
         "take_profit_pnl": _round(risk * take_profit, 2),
         "stop_loss_pnl": _round(-(risk * stop_loss), 2),
         "take_profit_net_exit": _round(take_profit_net, 4),

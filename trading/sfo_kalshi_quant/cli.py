@@ -61,7 +61,14 @@ from .tail_basket import TailBasket, build_tail_basket
 # settlement-day unification (and one hour earlier in winter, which only
 # tightens the gate).
 DEFAULT_SAME_DAY_ENTRY_CUTOFF_HOUR = 14
-DEFAULT_MODEL_VETO_MAX_LOSS_PCT = 60.0
+DEFAULT_TAKE_PROFIT_PCT = 40.0
+DEFAULT_STOP_LOSS_PCT = 35.0
+DEFAULT_YES_TAKE_PROFIT_PCT = 50.0
+DEFAULT_YES_STOP_LOSS_PCT = 25.0
+DEFAULT_NO_TAKE_PROFIT_PCT = 35.0
+DEFAULT_NO_STOP_LOSS_PCT = 35.0
+DEFAULT_MODEL_VETO_MAX_LOSS_PCT = 45.0
+DEFAULT_MODEL_VETO_BUFFER = 0.08
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -555,14 +562,38 @@ def build_parser() -> argparse.ArgumentParser:
     monitor.add_argument(
         "--take-profit-pct",
         type=float,
-        default=35.0,
-        help="Close when unrealized paper ROI is at or above this percent. Default: 35.",
+        default=_env_float_default("PAPER_TAKE_PROFIT_PCT", DEFAULT_TAKE_PROFIT_PCT),
+        help="Fallback close threshold when unrealized paper ROI is at/above this percent.",
     )
     monitor.add_argument(
         "--stop-loss-pct",
         type=float,
-        default=35.0,
-        help="Close when unrealized paper ROI is at or below negative this percent. Default: 35.",
+        default=_env_float_default("PAPER_STOP_LOSS_PCT", DEFAULT_STOP_LOSS_PCT),
+        help="Fallback close threshold when unrealized paper ROI is at/below negative this percent.",
+    )
+    monitor.add_argument(
+        "--yes-take-profit-pct",
+        type=float,
+        default=_env_float_default("PAPER_YES_TAKE_PROFIT_PCT", DEFAULT_YES_TAKE_PROFIT_PCT),
+        help="YES-specific take-profit ROI percent. Default: 50.",
+    )
+    monitor.add_argument(
+        "--yes-stop-loss-pct",
+        type=float,
+        default=_env_float_default("PAPER_YES_STOP_LOSS_PCT", DEFAULT_YES_STOP_LOSS_PCT),
+        help="YES-specific stop-loss ROI percent. Default: 25.",
+    )
+    monitor.add_argument(
+        "--no-take-profit-pct",
+        type=float,
+        default=_env_float_default("PAPER_NO_TAKE_PROFIT_PCT", DEFAULT_NO_TAKE_PROFIT_PCT),
+        help="NO-specific take-profit ROI percent. Default: 35.",
+    )
+    monitor.add_argument(
+        "--no-stop-loss-pct",
+        type=float,
+        default=_env_float_default("PAPER_NO_STOP_LOSS_PCT", DEFAULT_NO_STOP_LOSS_PCT),
+        help="NO-specific stop-loss ROI percent. Default: 35.",
     )
     monitor.add_argument(
         "--model-veto-max-loss-pct",
@@ -570,8 +601,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=_env_float_default("PAPER_MODEL_VETO_MAX_LOSS_PCT", DEFAULT_MODEL_VETO_MAX_LOSS_PCT),
         help=(
             "Allow a fresh model snapshot to veto stop-loss exits only while the "
-            "position is above negative this ROI percent. Default: 60."
+            "position is above negative this ROI percent. Default: 45."
         ),
+    )
+    monitor.add_argument(
+        "--model-veto-buffer",
+        type=float,
+        default=_env_float_default("PAPER_MODEL_VETO_BUFFER", DEFAULT_MODEL_VETO_BUFFER),
+        help="Extra model-probability cushion required to veto a NO stop-loss. Default: 0.08.",
     )
     monitor.add_argument("--dry-run", action="store_true", help="Print actions without closing paper positions")
     monitor.set_defaults(func=cmd_paper_monitor)
@@ -837,6 +874,15 @@ def _analyze_one_target(
         else:
             entry_allowed, entry_block_reason = _paper_entry_gate_for_target(target, forecast, intraday)
     risk_profile = _risk_profile_name(args)
+    if args.place_paper and entry_allowed:
+        pause_reason = store.paper_entry_pause_reason(
+            risk_profile,
+            bankroll=config.paper_bankroll,
+            target_date=target.isoformat(),
+        )
+        if pause_reason is not None:
+            entry_allowed = False
+            entry_block_reason = pause_reason
     paper_trader = PaperTrader(store, config, risk_profile=risk_profile)
     display_decisions = paper_trader.with_paper_stakes(decisions, args.paper_stake)
     daily_budget_remaining = None
@@ -971,6 +1017,15 @@ def _tail_basket_one_target(
             entry_allowed, entry_block_reason = _paper_entry_gate_for_target(target, forecast, intraday)
 
     risk_profile = _risk_profile_name(args)
+    if args.place_paper and entry_allowed:
+        pause_reason = store.paper_entry_pause_reason(
+            risk_profile,
+            bankroll=config.paper_bankroll,
+            target_date=target.isoformat(),
+        )
+        if pause_reason is not None:
+            entry_allowed = False
+            entry_block_reason = pause_reason
     decisions_to_record = basket.decisions_for_recording()
     if not entry_allowed and entry_block_reason:
         decisions_to_record = _block_entry_decisions(decisions_to_record, entry_block_reason)
@@ -1593,6 +1648,31 @@ def cmd_paper_close(args: argparse.Namespace) -> int:
     return 0
 
 
+def _validate_monitor_args(args: argparse.Namespace) -> None:
+    values = [
+        args.take_profit_pct,
+        args.stop_loss_pct,
+        args.yes_take_profit_pct,
+        args.yes_stop_loss_pct,
+        args.no_take_profit_pct,
+        args.no_stop_loss_pct,
+        args.model_veto_max_loss_pct,
+    ]
+    if any(value <= 0 for value in values) or args.model_veto_buffer < 0:
+        raise ValueError(
+            "take-profit, stop-loss, model-veto loss percentages, and model-veto buffer must be non-negative; percentages must be greater than zero"
+        )
+
+
+def _monitor_thresholds_for_side(args: argparse.Namespace, side: str) -> tuple[float, float]:
+    normalized = side.upper()
+    if normalized == "YES":
+        return float(args.yes_take_profit_pct), float(args.yes_stop_loss_pct)
+    if normalized == "NO":
+        return float(args.no_take_profit_pct), float(args.no_stop_loss_pct)
+    return float(args.take_profit_pct), float(args.stop_loss_pct)
+
+
 def cmd_paper_monitor(args: argparse.Namespace) -> int:
     color = Color.from_no_color(args.no_color)
     store = PaperStore(args.db_path)
@@ -1601,11 +1681,8 @@ def cmd_paper_monitor(args: argparse.Namespace) -> int:
         print(color.yellow("no open paper positions"))
         return 0
 
-    take_profit = args.take_profit_pct / 100.0
-    stop_loss = args.stop_loss_pct / 100.0
     model_veto_max_loss = args.model_veto_max_loss_pct / 100.0
-    if take_profit <= 0 or stop_loss <= 0 or model_veto_max_loss <= 0:
-        raise ValueError("take-profit, stop-loss, and model-veto loss percentages must be greater than zero")
+    _validate_monitor_args(args)
 
     client = KalshiPublicClient()
     closed = 0
@@ -1613,6 +1690,9 @@ def cmd_paper_monitor(args: argparse.Namespace) -> int:
     for row in rows:
         inspected += 1
         side = str(row["side"] or ("NO" if "NO" in str(row["action"]).upper() else "YES")).upper()
+        take_profit_pct, stop_loss_pct = _monitor_thresholds_for_side(args, side)
+        take_profit = take_profit_pct / 100.0
+        stop_loss = stop_loss_pct / 100.0
         try:
             market = client.get_market(row["market_ticker"])
         except Exception as exc:
@@ -1654,9 +1734,9 @@ def cmd_paper_monitor(args: argparse.Namespace) -> int:
 
         reason = None
         if pnl_pct >= take_profit:
-            reason = f"take-profit {pnl_pct * 100:.1f}% >= {args.take_profit_pct:.1f}%"
+            reason = f"{side} take-profit {pnl_pct * 100:.1f}% >= {take_profit_pct:.1f}%"
         elif pnl_pct <= -stop_loss:
-            reason = f"stop-loss {pnl_pct * 100:.1f}% <= -{args.stop_loss_pct:.1f}%"
+            reason = f"{side} stop-loss {pnl_pct * 100:.1f}% <= -{stop_loss_pct:.1f}%"
             allow_model_veto = side == "NO" and pnl_pct > -model_veto_max_loss
             # Daily-settlement binaries reprice violently intraday; a pure
             # price stop converts that noise into realized losses (June 2026
@@ -1676,10 +1756,10 @@ def cmd_paper_monitor(args: argparse.Namespace) -> int:
             )
             if model_yes_p is not None:
                 side_p = model_yes_p if side == "YES" else 1.0 - model_yes_p
-                if side_p >= net_exit + 0.05:
+                if side_p >= net_exit + args.model_veto_buffer:
                     veto_reason = (
                         f"stop-loss vetoed: model p={side_p:.2f} at settlement beats "
-                        f"net exit {net_exit:.2f} + 0.05 buffer"
+                        f"net exit {net_exit:.2f} + {args.model_veto_buffer:.2f} buffer"
                     )
                     store.record_monitor_snapshot(
                         row,

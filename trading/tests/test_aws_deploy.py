@@ -162,6 +162,8 @@ def test_pages_deploy_key_path_matches_lightsail_setup_docs():
 def test_initial_lightsail_sync_does_not_copy_local_runtime_state():
     syncer = _read(AWS_DIR / "sync_to_lightsail.sh")
 
+    assert syncer.count("--exclude '.pytest_cache'") == 2
+
     for artifact in (
         "weather.db",
         "*.db-journal",

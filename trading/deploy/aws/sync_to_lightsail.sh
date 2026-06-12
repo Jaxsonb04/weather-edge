@@ -43,6 +43,7 @@ rsync -av \
   -e "ssh -i '$LIGHTSAIL_KEY' -o StrictHostKeyChecking=accept-new" \
   --exclude '.git' \
   --exclude '__pycache__' \
+  --exclude '.pytest_cache' \
   --exclude '.DS_Store' \
   --exclude '.env' \
   --exclude '.google_weather_usage.json' \
@@ -69,6 +70,7 @@ rsync -av \
   -e "ssh -i '$LIGHTSAIL_KEY' -o StrictHostKeyChecking=accept-new" \
   --exclude '.git' \
   --exclude '__pycache__' \
+  --exclude '.pytest_cache' \
   --exclude '.DS_Store' \
   --exclude '.env' \
   --exclude '.venv' \

@@ -176,7 +176,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="rolling",
         help=(
             "today, tomorrow, both, rolling, comma-list, or YYYY-MM-DD. "
-            "Default rolling waits for the nearest active Kalshi event."
+            "Default rolling waits for the next active Kalshi events."
         ),
     )
     basket.add_argument("--offline-events", type=Path, help="Saved Kalshi events JSON")
@@ -727,7 +727,7 @@ def _rolling_live_event_targets(
     events: list[EventSnapshot],
     *,
     now: datetime | None = None,
-    max_targets: int = 1,
+    max_targets: int = 2,
 ) -> tuple[list[date], dict[date, EventSnapshot]]:
     local_now = settlement_clock(now)
     today = local_now.date()

@@ -156,9 +156,10 @@ Risk profiles:
 - `exploratory`: paper-only data collection mode. It is more permissive than
   balanced, but uses smaller per-position and per-event risk caps.
 - `fast-feedback`: paper-only acceleration mode. It lets small positive raw-edge
-  trades through even when the lower-confidence edge is negative, but caps size
-  harder so you can quickly collect examples without treating them as validated
-  live-money signals.
+  trades through even when the lower-confidence edge is negative and forecast
+  sources are moderately wide, but caps size harder so you can quickly collect
+  examples without treating them as validated live-money signals. It still
+  blocks extreme source conflict.
 - `conservative`: strict baseline. Sizes from the lower-confidence probability
   and intentionally under-trades.
 

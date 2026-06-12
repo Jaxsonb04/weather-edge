@@ -136,12 +136,12 @@ FAST_FEEDBACK_PROFILE_OVERRIDES = {
     # small in the paper journal.
     **BALANCED_PROFILE_OVERRIDES,
     "min_edge": 0.00,
-    "min_edge_lcb": -0.08,
+    "min_edge_lcb": -0.18,
     "max_spread": 0.12,
     "max_spread_fraction_of_cost": 0.75,
     "min_yes_bid": 0.01,
     "min_yes_bid_size": 1.0,
-    "max_model_market_gap": 0.35,
+    "max_model_market_gap": 0.40,
     "min_posterior_probability": 0.03,
     "fractional_kelly": 0.03,
     "kelly_lcb_weight": 0.0,
@@ -149,10 +149,10 @@ FAST_FEEDBACK_PROFILE_OVERRIDES = {
     "max_event_risk_pct": 0.010,
     "max_target_exposure_pct": 0.015,
     "max_contracts_per_market": 5.0,
-    # Research profile stays looser so disagreement days still produce
-    # decision snapshots, but it no longer trades straight through extreme
-    # source conflict either.
-    "max_source_spread_f": 12.0,
+    # Research profile stays looser so disagreement days still produce tiny
+    # paper entries, but it no longer trades straight through extreme source
+    # conflict either.
+    "max_source_spread_f": 18.0,
     "cheap_tail_min_yes_bid": 0.01,
     "cheap_tail_min_yes_bid_size": 1.0,
     "cheap_tail_min_probability_lcb": 0.02,

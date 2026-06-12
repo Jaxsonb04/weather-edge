@@ -499,3 +499,46 @@ def test_dataset_research_summary_keeps_legacy_top_level_candidates_readable():
 
     assert summary["candidate_count"] == 1
     assert summary["candidates"][0]["dataset_mae_f"] == 2.4
+
+
+def test_dataset_research_summary_derives_actionable_legacy_verdict():
+    payload = {
+        "generated_at": "2026-06-11T09:25:08+00:00",
+        "status": "collect_only",
+        "baseline": {
+            "source": "lstm",
+            "outcome_count": 475,
+            "settlement": "rounded SFO high temperature",
+        },
+        "promotion_rule": "rule text",
+        "accuracy_gate": {
+            "available": True,
+            "candidate_count": 9,
+            "accuracy_candidate_count": 0,
+            "candidates": [
+                {
+                    "dataset_key": "open-meteo/best_match/temperature_2m_max/none",
+                    "decision": "collect_only",
+                    "matched_rows": 0,
+                    "reason": "needs at least 30 matched settlement rows; has 0",
+                }
+            ],
+        },
+        "profitability_gate": {
+            "decision": "collect_only",
+            "market_history": {"markets": 180, "candles": 365, "trades": 0},
+            "minimum_after_cost_trades": 30,
+        },
+    }
+
+    summary = _dataset_research_summary(payload)
+
+    assert summary["headline"].startswith("Dataset collection is live")
+    assert summary["action_items"]
+    assert any(
+        "accuracy gate: best dataset feature has 0 matched settlement rows" in gate
+        for gate in summary["blocking_gates"]
+    )
+    assert "market gate: 0 after-cost trade rows; needs 30" in summary["blocking_gates"]
+    assert summary["dataset_stack"]["reason"].startswith("Combined dataset stack is waiting")
+    assert summary["candidates"][0]["next_use"].startswith("Keep collecting")

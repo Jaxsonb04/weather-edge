@@ -300,6 +300,11 @@ python3 -m sfo_kalshi_quant.cli analyze --target-date today --paper-stake 10 --p
 This records only approved `TRADE` rows and spends $10 of paper money on each
 one. It does not send orders to Kalshi.
 
+For paper buy-limit simulation, use `--paper-entry-mode limit` or set
+`PAPER_ENTRY_MODE=limit`. The analyzer records a resting paper limit when the
+lower-confidence reservation price is below the visible ask; resting limits do
+not settle or monitor as filled positions.
+
 For tomorrow:
 
 ```bash
@@ -351,7 +356,7 @@ implies a stop-loss or take-profit threshold:
 python3 -m sfo_kalshi_quant.cli --no-color paper-monitor \
   --yes-take-profit-pct 50 --yes-stop-loss-pct 25 \
   --no-take-profit-pct 35 --no-stop-loss-pct 35 \
-  --model-veto-max-loss-pct 45 --model-veto-buffer 0.08
+  --model-veto-max-loss-pct 60 --model-veto-buffer 0.08
 ```
 
 The unrealized ROI math is:

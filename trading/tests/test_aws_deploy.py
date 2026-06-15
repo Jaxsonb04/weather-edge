@@ -66,12 +66,15 @@ def test_paper_scan_pins_calibration_source():
 
     assert "run_paper_scan_profiles.sh" in service
     assert 'CALIBRATION_SOURCE="${SFO_TRADING_SIGNAL_CALIBRATION_SOURCE:-lstm}"' in runner
+    assert 'PAPER_ENTRY_MODE="${PAPER_ENTRY_MODE:-market}"' in runner
     assert '--calibration-source "$CALIBRATION_SOURCE"' in runner
+    assert '--paper-entry-mode "$PAPER_ENTRY_MODE"' in runner
     assert 'TARGET_DATE="${SFO_PAPER_SCAN_TARGET_DATE:-rolling}"' in runner
     assert 'TAIL_BASKET_ENABLED="${SFO_PAPER_SCAN_TAIL_BASKET_ENABLED:-1}"' in runner
     assert "tail-basket" in runner
     assert "--max-worst-case-loss" in runner
     assert "PAPER_RISK_PROFILES=balanced,fast-feedback" in example_env
+    assert "PAPER_ENTRY_MODE=market" in example_env
     assert "SFO_PAPER_SCAN_TAIL_BASKET_ENABLED=1" in example_env
     assert "SFO_TAIL_BASKET_TAIL_STAKE=5" in example_env
     assert "SFO_TAIL_BASKET_CENTER_STAKE=1" in example_env
@@ -101,7 +104,7 @@ def test_paper_monitor_service_uses_side_aware_exit_env():
     assert "--model-veto-max-loss-pct ${PAPER_MODEL_VETO_MAX_LOSS_PCT}" in service
     assert "--model-veto-buffer ${PAPER_MODEL_VETO_BUFFER}" in service
     assert "PAPER_YES_STOP_LOSS_PCT=25" in example_env
-    assert "PAPER_MODEL_VETO_MAX_LOSS_PCT=45" in example_env
+    assert "PAPER_MODEL_VETO_MAX_LOSS_PCT=60" in example_env
     assert "PAPER_MODEL_VETO_BUFFER=0.08" in example_env
 
 

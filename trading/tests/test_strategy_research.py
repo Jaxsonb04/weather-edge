@@ -311,6 +311,65 @@ def test_strategy_research_alerts_on_duplicate_open_positions():
         assert payload["paper_trading"]["summary"]["largest_duplicate_open_group"] == 2
 
 
+def test_strategy_research_does_not_alert_on_same_market_across_profiles():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "forecaster"
+        db_path = Path(tmp) / "trading" / "paper.db"
+        _write_lstm_fixture(root)
+        _write_settlement(root)
+
+        store = PaperStore(db_path)
+        decision = _approved_decision()
+        store.record_paper_order("2026-06-03", decision, risk_profile="balanced")
+        store.record_paper_order("2026-06-03", decision, risk_profile="fast-feedback")
+
+        payload = build_strategy_research(
+            forecaster_root=root,
+            db_path=db_path,
+            calibration_min_train=40,
+        )
+
+        alert_codes = {alert["code"] for alert in payload["status"]["alerts"]}
+        assert "duplicate-open-markets" not in alert_codes
+        assert payload["paper_trading"]["summary"]["duplicate_open_groups"] == 0
+
+
+def test_strategy_research_scopes_duplicate_alerts_to_profile_views():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "forecaster"
+        db_path = Path(tmp) / "trading" / "paper.db"
+        _write_lstm_fixture(root)
+        target = (datetime.now(UTC).astimezone(SFO_TZ).date() + timedelta(days=1)).isoformat()
+
+        store = PaperStore(db_path)
+        balanced = replace(_approved_decision(), ticker="KXHIGHTSFO-TEST-B65.5")
+        fast = _approved_decision()
+        store.record_paper_order(target, balanced, risk_profile="balanced")
+        store.record_paper_order(target, fast, risk_profile="fast-feedback")
+        store.record_paper_order(target, fast, risk_profile="fast-feedback")
+
+        payload = build_strategy_research(
+            forecaster_root=root,
+            db_path=db_path,
+            calibration_min_train=40,
+        )
+
+        profiles = {row["risk_profile"]: row for row in payload["profiles"]}
+        balanced_alerts = {
+            alert["code"] for alert in profiles["balanced"]["status"]["alerts"]
+        }
+        fast_alerts = {
+            alert["code"] for alert in profiles["fast-feedback"]["status"]["alerts"]
+        }
+
+        assert "duplicate-open-markets" in {
+            alert["code"] for alert in payload["status"]["alerts"]
+        }
+        assert "duplicate-open-markets" not in balanced_alerts
+        assert "duplicate-open-markets" in fast_alerts
+        assert profiles["fast-feedback"]["paper_trading"]["summary"]["duplicate_open_groups"] == 1
+
+
 def test_strategy_research_builds_isolated_profile_views():
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp) / "forecaster"

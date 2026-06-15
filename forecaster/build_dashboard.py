@@ -288,7 +288,7 @@ def write_strategy_research_placeholder(path):
                 "yes_stop_loss_pct": 25.0,
                 "no_take_profit_pct": 35.0,
                 "no_stop_loss_pct": 35.0,
-                "model_veto_max_loss_pct": 45.0,
+                "model_veto_max_loss_pct": 60.0,
                 "model_veto_buffer": 0.08,
             },
             "summary": {

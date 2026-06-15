@@ -10,6 +10,7 @@ from pathlib import Path
 from urllib.error import URLError
 
 from .backtest import run_walk_forward_calibration_backtest
+from .arbitrage import ArbitrageOpportunity, build_arbitrage_opportunities
 from .colors import Color
 from .config import (
     DEFAULT_DB_PATH,
@@ -67,7 +68,7 @@ DEFAULT_YES_TAKE_PROFIT_PCT = 50.0
 DEFAULT_YES_STOP_LOSS_PCT = 25.0
 DEFAULT_NO_TAKE_PROFIT_PCT = 35.0
 DEFAULT_NO_STOP_LOSS_PCT = 35.0
-DEFAULT_MODEL_VETO_MAX_LOSS_PCT = 45.0
+DEFAULT_MODEL_VETO_MAX_LOSS_PCT = 60.0
 DEFAULT_MODEL_VETO_BUFFER = 0.08
 
 
@@ -92,6 +93,13 @@ def _default_calibration_source() -> str:
     """
 
     return os.getenv("SFO_TRADING_SIGNAL_CALIBRATION_SOURCE", "lstm")
+
+
+def _default_paper_entry_mode() -> str:
+    raw = os.getenv("PAPER_ENTRY_MODE", "market").strip().lower().replace("_", "-")
+    if raw in {"limit", "limit-order", "paper-limit"}:
+        return "limit"
+    return "market"
 
 
 def _env_float_default(name: str, default: float) -> float:
@@ -142,6 +150,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override today's observed high-so-far in F, e.g. 67 if the current official/app high is 67F.",
     )
     analyze.add_argument("--place-paper", action="store_true", help="Record approved paper orders")
+    analyze.add_argument(
+        "--paper-entry-mode",
+        choices=("market", "limit"),
+        default=_default_paper_entry_mode(),
+        help=(
+            "How --place-paper books approved analyzer entries. market preserves "
+            "the historical immediate paper fill; limit records a paper buy-limit "
+            "at the lower-confidence reservation price. Default: PAPER_ENTRY_MODE or market."
+        ),
+    )
     analyze.add_argument(
         "--skip-context-snapshots",
         action="store_true",
@@ -268,6 +286,38 @@ def build_parser() -> argparse.ArgumentParser:
         help="Seconds to wait for the station-aligned Open-Meteo ensemble fetch.",
     )
     basket.set_defaults(func=cmd_tail_basket)
+
+    arbitrage = sub.add_parser(
+        "arbitrage",
+        help="Scan active daily temperature bins for paper-only arbitrage portfolios",
+    )
+    arbitrage.add_argument(
+        "--target-date",
+        default="rolling",
+        help=(
+            "today, tomorrow, both, rolling, comma-list, or YYYY-MM-DD. "
+            "Default rolling waits for the next active Kalshi events."
+        ),
+    )
+    arbitrage.add_argument("--offline-events", type=Path, help="Saved Kalshi events JSON")
+    arbitrage.add_argument("--place-paper", action="store_true", help="Record approved paper arbitrage legs")
+    arbitrage.add_argument(
+        "--skip-context-snapshots",
+        action="store_true",
+        help="Skip market snapshot writes; paper orders can still be recorded.",
+    )
+    arbitrage.add_argument(
+        "--max-arb-spend",
+        type=float,
+        help="Maximum paper dollars to spend per arbitrage portfolio.",
+    )
+    arbitrage.add_argument(
+        "--min-profit",
+        type=float,
+        default=0.01,
+        help="Minimum guaranteed paper profit per arbitrage portfolio. Default: 0.01.",
+    )
+    arbitrage.set_defaults(func=cmd_arbitrage)
 
     collect = sub.add_parser("collect", help="Fetch and store live Kalshi event plus forecast snapshot")
     collect.add_argument("--target-date", default="today", help="today, tomorrow, both, comma-list, or YYYY-MM-DD")
@@ -601,7 +651,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=_env_float_default("PAPER_MODEL_VETO_MAX_LOSS_PCT", DEFAULT_MODEL_VETO_MAX_LOSS_PCT),
         help=(
             "Allow a fresh model snapshot to veto stop-loss exits only while the "
-            "position is above negative this ROI percent. Default: 45."
+            "position is above negative this ROI percent. Default: 60."
         ),
     )
     monitor.add_argument(
@@ -720,6 +770,34 @@ def cmd_tail_basket(args: argparse.Namespace) -> int:
             target,
             adapter,
             calibrator,
+            config,
+            store,
+            color,
+            event_hint=live_events_by_target.get(target),
+            event_lookup_done=target in live_events_by_target,
+            kalshi_client=kalshi_client,
+        )
+    return 0
+
+
+def cmd_arbitrage(args: argparse.Namespace) -> int:
+    color = Color.from_no_color(args.no_color)
+    config = _config(args)
+    kalshi_client = KalshiPublicClient()
+    targets, live_events_by_target = _resolve_analysis_targets(args, color, kalshi_client)
+    if not targets:
+        print(color.yellow("no eligible target dates found"))
+        return 0
+    store = PaperStore(args.db_path)
+
+    for idx, target in enumerate(targets):
+        if idx:
+            print("")
+            print("=" * 92)
+            print("")
+        _arbitrage_one_target(
+            args,
+            target,
             config,
             store,
             color,
@@ -883,7 +961,12 @@ def _analyze_one_target(
         if pause_reason is not None:
             entry_allowed = False
             entry_block_reason = pause_reason
-    paper_trader = PaperTrader(store, config, risk_profile=risk_profile)
+    paper_trader = PaperTrader(
+        store,
+        config,
+        risk_profile=risk_profile,
+        entry_mode=args.paper_entry_mode,
+    )
     display_decisions = paper_trader.with_paper_stakes(decisions, args.paper_stake)
     daily_budget_remaining = None
     if args.daily_budget is not None:
@@ -893,6 +976,7 @@ def _analyze_one_target(
             risk_profile=risk_profile,
         )
         display_decisions = paper_trader.with_daily_budget(display_decisions, daily_budget_remaining)
+    display_decisions = paper_trader.with_entry_mode(display_decisions)
     if not entry_allowed and entry_block_reason:
         display_decisions = _block_entry_decisions(display_decisions, entry_block_reason)
 
@@ -934,7 +1018,104 @@ def _analyze_one_target(
         intraday=intraday,
         ensemble=ensemble,
         entry_block_reason=entry_block_reason,
+    )
+
+
+def _arbitrage_one_target(
+    args: argparse.Namespace,
+    target,
+    config: StrategyConfig,
+    store: PaperStore,
+    color: Color,
+    *,
+    event_hint: EventSnapshot | None = None,
+    event_lookup_done: bool = False,
+    kalshi_client: KalshiPublicClient | None = None,
+) -> None:
+    event = event_hint
+    if event_lookup_done:
+        pass
+    elif args.offline_events:
+        events = load_event_snapshots(args.offline_events, target)
+        event = events[0] if events else None
+    else:
+        try:
+            client = kalshi_client or KalshiPublicClient()
+            event = client.find_event_by_date(target, series_ticker=SERIES_TICKER)
+        except URLError as exc:
+            print(color.yellow(f"warning: live Kalshi lookup failed ({exc}); no active ladder available"), file=sys.stderr)
+            event = None
+
+    if event:
+        markets = event.active_markets or event.markets
+        event_title = event.title
+        market_available = True
+    else:
+        markets = standard_sfo_bins(f"{SERIES_TICKER}-{target.strftime('%y%b%d').upper()}-PAPER")
+        event_title = "No live Kalshi event found; arbitrage scan is research-only"
+        market_available = False
+
+    opportunities = build_arbitrage_opportunities(
+        markets,
+        config=config,
+        bankroll=config.paper_bankroll,
+        max_spend=args.max_arb_spend,
+        min_profit=args.min_profit,
+    )
+
+    entry_allowed = True
+    entry_block_reason = None
+    if args.place_paper:
+        if event is None:
+            entry_allowed = False
+            entry_block_reason = (
+                "paper arbitrage disabled: target date is not listed as a live Kalshi event yet"
+            )
+        elif not event.active_markets:
+            entry_allowed = False
+            entry_block_reason = "paper arbitrage disabled: Kalshi event has no active markets"
+        else:
+            entry_allowed, entry_block_reason = _paper_entry_gate_for_target(target, None, None)
+
+    risk_profile = _risk_profile_name(args)
+    paper_trader = PaperTrader(store, config, risk_profile=risk_profile)
+    if args.place_paper and entry_allowed:
+        pause_reason = store.paper_entry_pause_reason(
+            risk_profile,
+            bankroll=config.paper_bankroll,
+            target_date=target.isoformat(),
         )
+        if pause_reason is not None:
+            entry_allowed = False
+            entry_block_reason = pause_reason
+
+    if event and not getattr(args, "skip_context_snapshots", False):
+        store.record_market(event)
+
+    placed_ids: list[int] = []
+    if args.place_paper and entry_allowed:
+        for opportunity in opportunities:
+            if not opportunity.approved:
+                continue
+            placed_ids.extend(
+                paper_trader.place_arbitrage(
+                    target.isoformat(),
+                    opportunity,
+                    bankroll=config.paper_bankroll,
+                )
+            )
+
+    _print_arbitrage(
+        event_title,
+        target.isoformat(),
+        opportunities,
+        placed_ids=placed_ids,
+        market_available=market_available,
+        color=color,
+        max_spend=args.max_arb_spend,
+        min_profit=args.min_profit,
+        entry_block_reason=entry_block_reason,
+    )
 
 
 def _tail_basket_one_target(
@@ -1742,10 +1923,11 @@ def cmd_paper_monitor(args: argparse.Namespace) -> int:
             # price stop converts that noise into realized losses (June 2026
             # failure mode, and again on 2026-06-10 when a stopped NO position
             # was on track to win at settlement). If a fresh model snapshot
-            # says holding a NO to settlement is worth more than the stop exit,
-            # hold instead of selling noise. Cheap YES buckets have been the
-            # live failure mode, so YES stop-losses close instead of using this
-            # veto. Once any loss crosses the hard floor, discipline wins too.
+            # says holding a NO to settlement still clears entry cost and the
+            # stop exit, hold instead of selling noise. Cheap YES buckets have
+            # been the live failure mode, so YES stop-losses close instead of
+            # using this veto. Once any loss crosses the hard floor, discipline
+            # wins too.
             model_yes_p = (
                 store.latest_model_probability(
                     str(row["target_date"]),
@@ -1756,10 +1938,12 @@ def cmd_paper_monitor(args: argparse.Namespace) -> int:
             )
             if model_yes_p is not None:
                 side_p = model_yes_p if side == "YES" else 1.0 - model_yes_p
-                if side_p >= net_exit + args.model_veto_buffer:
+                veto_floor = max(entry_cost, net_exit + args.model_veto_buffer)
+                if side_p >= veto_floor:
                     veto_reason = (
-                        f"stop-loss vetoed: model p={side_p:.2f} at settlement beats "
-                        f"net exit {net_exit:.2f} + {args.model_veto_buffer:.2f} buffer"
+                        f"stop-loss vetoed: model p={side_p:.2f} at settlement is above "
+                        f"entry cost {entry_cost:.2f} and net exit {net_exit:.2f} + "
+                        f"{args.model_veto_buffer:.2f} buffer"
                     )
                     store.record_monitor_snapshot(
                         row,
@@ -2272,6 +2456,61 @@ def _print_tail_basket(
         print(color.green(f"recorded paper basket orders: {', '.join(str(order_id) for order_id in placed_ids)}"))
 
 
+def _print_arbitrage(
+    event_title,
+    target_date: str,
+    opportunities: list[ArbitrageOpportunity],
+    *,
+    placed_ids: list[int],
+    market_available: bool,
+    color: Color,
+    max_spend: float | None,
+    min_profit: float,
+    entry_block_reason: str | None = None,
+) -> None:
+    print(color.cyan(color.bold(event_title)))
+    spend_text = "profile event cap" if max_spend is None else f"${max_spend:.2f}"
+    print(
+        f"{color.bold('arbitrage scan')} {target_date}: "
+        f"max_spend={spend_text} min_profit=${min_profit:.2f}"
+    )
+    if not market_available:
+        print(color.yellow("no active Kalshi market; arbitrage placement is disabled"))
+    if entry_block_reason:
+        print(color.yellow(entry_block_reason))
+
+    print("")
+    print(color.gray("kind             legs contracts spend    payout   profit   roi     decision"))
+    print(color.gray("-" * 88))
+    if not opportunities:
+        print(color.yellow("no arbitrage portfolios could be evaluated"))
+        return
+
+    for opportunity in opportunities:
+        status = color.green(color.bold("TRADE")) if opportunity.approved else color.red("NO")
+        reason = "" if opportunity.approved else color.gray("; ".join(opportunity.reasons[:2]))
+        roi = opportunity.return_on_spend * 100.0
+        print(
+            f"{opportunity.kind:16s} {len(opportunity.legs):4d} "
+            f"{opportunity.contracts:9.4f} ${opportunity.total_spend:7.2f} "
+            f"${opportunity.guaranteed_payout:7.2f} ${opportunity.guaranteed_profit:7.2f} "
+            f"{roi:6.2f}% {status} {reason}"
+        )
+        if opportunity.approved:
+            for leg in opportunity.legs:
+                print(
+                    color.gray(
+                        f"  {leg.side:3s} {leg.market.yes_sub_title[:18]:18s} "
+                        f"ask={leg.price:.2f} fee={leg.fee_per_contract:.4f} "
+                        f"cost={leg.cost_per_contract:.4f}"
+                    )
+                )
+
+    if placed_ids:
+        print("")
+        print(color.green(f"recorded paper arbitrage orders: {', '.join(str(order_id) for order_id in placed_ids)}"))
+
+
 def _color_prob(color: Color, value: float) -> str:
     text = f"{float(value):5.3f}"
     if value >= 0.25:
@@ -2365,6 +2604,8 @@ def _color_edge(color: Color, value: float) -> str:
 def _color_status(color: Color, status: str) -> str:
     if status in {"PAPER_FILLED", "PAPER_SETTLED"}:
         return color.green(status)
+    if status == "PAPER_LIMIT_RESTING":
+        return color.yellow(status)
     if status == "PAPER_CLOSED":
         return color.cyan(status)
     if status == "REJECTED":

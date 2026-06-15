@@ -1,0 +1,124 @@
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+from sfo_kalshi_quant.cli import build_parser
+from sfo_kalshi_quant.config import StrategyConfig
+from sfo_kalshi_quant.db import PaperStore
+from sfo_kalshi_quant.execution import buy_limit_for_decision, with_buy_limit
+from sfo_kalshi_quant.models import TradeDecision
+from sfo_kalshi_quant.paper import PaperTrader
+
+
+def _decision(**overrides) -> TradeDecision:
+    values = {
+        "ticker": "KXHIGHTSFO-TEST-B74.5",
+        "label": "74° to 75°",
+        "action": "BUY_NO",
+        "approved": True,
+        "probability": 0.82,
+        "probability_lcb": 0.78,
+        "yes_bid": 0.22,
+        "yes_ask": 0.24,
+        "spread": 0.03,
+        "fee_per_contract": 0.02,
+        "cost_per_contract": 0.77,
+        "edge": 0.05,
+        "edge_lcb": 0.01,
+        "kelly_fraction": 0.01,
+        "recommended_contracts": 2.0,
+        "expected_profit": 0.1,
+        "reasons": [],
+        "side": "NO",
+        "entry_bid": 0.73,
+        "entry_ask": 0.75,
+        "entry_bid_size": 10.0,
+        "entry_ask_size": 10.0,
+    }
+    values.update(overrides)
+    return TradeDecision(**values)
+
+
+def test_buy_limit_uses_probability_lcb_reservation_price_before_ask():
+    decision = _decision(probability_lcb=0.81, entry_bid=0.73, entry_ask=0.75)
+    quote = buy_limit_for_decision(
+        decision,
+        StrategyConfig(limit_price_edge_lcb_buffer=0.02),
+    )
+
+    assert quote is not None
+    assert quote.price == 0.74
+    assert quote.would_cross is False
+    assert quote.edge_lcb >= 0.02
+
+
+def test_buy_limit_rejects_trade_when_no_price_preserves_lcb_edge():
+    decision = _decision(probability_lcb=0.70, entry_bid=0.68, entry_ask=0.69)
+
+    assert buy_limit_for_decision(
+        decision,
+        StrategyConfig(limit_price_edge_lcb_buffer=0.02),
+    ) is None
+
+
+def test_paper_limit_mode_records_resting_order_but_not_open_position():
+    with TemporaryDirectory() as tmp:
+        store = PaperStore(Path(tmp) / "paper.db")
+        trader = PaperTrader(
+            store,
+            StrategyConfig(limit_price_edge_lcb_buffer=0.02),
+            entry_mode="limit",
+        )
+        decision = _decision(probability_lcb=0.81, entry_bid=0.73, entry_ask=0.75)
+
+        order_ids = trader.place_approved("2026-06-15", [decision])
+
+        assert len(order_ids) == 1
+        row = store.paper_order(order_ids[0])
+        assert row is not None
+        assert row["status"] == "PAPER_LIMIT_RESTING"
+        assert row["limit_price"] == 0.74
+        assert row["entry_price"] == 0.74
+        assert row["edge_lcb"] == row["limit_edge_lcb"]
+        assert row["expected_profit"] == row["limit_edge"] * row["contracts"]
+        assert store.open_paper_orders(10) == []
+        assert store.settle_paper_orders("2026-06-15", 73.0) == 0
+
+
+def test_paper_limit_mode_fills_when_limit_crosses_visible_ask():
+    with TemporaryDirectory() as tmp:
+        store = PaperStore(Path(tmp) / "paper.db")
+        trader = PaperTrader(
+            store,
+            StrategyConfig(limit_price_edge_lcb_buffer=0.02),
+            entry_mode="limit",
+        )
+        decision = _decision(probability_lcb=0.90, entry_bid=0.74, entry_ask=0.75)
+
+        order_ids = trader.place_approved("2026-06-15", [decision])
+
+        assert len(order_ids) == 1
+        row = store.paper_order(order_ids[0])
+        assert row is not None
+        assert row["status"] == "PAPER_FILLED"
+        assert row["limit_price"] == 0.75
+        assert row["entry_price"] == 0.75
+        assert len(store.open_paper_orders(10)) == 1
+
+
+def test_with_buy_limit_exposes_limit_math_on_decision_for_reporting():
+    limited = with_buy_limit(
+        _decision(probability_lcb=0.81, entry_bid=0.73, entry_ask=0.75),
+        StrategyConfig(limit_price_edge_lcb_buffer=0.02),
+    )
+
+    assert limited.limit_price == 0.74
+    assert limited.limit_cost_per_contract < limited.cost_per_contract
+    assert limited.limit_edge_lcb >= 0.02
+
+
+def test_analyze_entry_mode_defaults_from_environment(monkeypatch):
+    monkeypatch.setenv("PAPER_ENTRY_MODE", "limit")
+
+    args = build_parser().parse_args(["analyze"])
+
+    assert args.paper_entry_mode == "limit"

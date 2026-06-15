@@ -124,6 +124,12 @@ CREATE TABLE IF NOT EXISTS paper_orders (
     strike_type TEXT,
     floor_strike REAL,
     cap_strike REAL,
+    entry_mode TEXT NOT NULL DEFAULT 'market',
+    limit_price REAL,
+    limit_fee_per_contract REAL,
+    limit_cost_per_contract REAL,
+    limit_edge REAL,
+    limit_edge_lcb REAL,
     fee_per_contract REAL NOT NULL,
     cost_per_contract REAL NOT NULL,
     probability REAL NOT NULL,
@@ -178,6 +184,12 @@ PAPER_ORDER_AUDIT_COLUMNS = {
     "strike_type": "TEXT",
     "floor_strike": "REAL",
     "cap_strike": "REAL",
+    "entry_mode": "TEXT NOT NULL DEFAULT 'market'",
+    "limit_price": "REAL",
+    "limit_fee_per_contract": "REAL",
+    "limit_cost_per_contract": "REAL",
+    "limit_edge": "REAL",
+    "limit_edge_lcb": "REAL",
     "risk_profile": "TEXT",
 }
 
@@ -482,24 +494,39 @@ class PaperStore:
         decision: TradeDecision,
         *,
         risk_profile: str | None = None,
+        status: str | None = None,
+        entry_mode: str = "market",
     ) -> int:
         contracts = float(decision.recommended_contracts)
-        entry_price = float(decision.ask)
-        fee_per_contract = quadratic_fee_average_per_contract(entry_price, contracts)
+        entry_price = float(decision.limit_price if decision.limit_price is not None else decision.ask)
+        fee_per_contract = (
+            float(decision.limit_fee_per_contract)
+            if decision.limit_fee_per_contract is not None
+            else quadratic_fee_average_per_contract(entry_price, contracts)
+        )
         cost_per_contract = entry_price + fee_per_contract
+        edge = float(decision.limit_edge) if decision.limit_edge is not None else float(decision.edge)
+        edge_lcb = (
+            float(decision.limit_edge_lcb)
+            if decision.limit_edge_lcb is not None
+            else float(decision.edge_lcb)
+        )
+        expected_profit = edge * contracts
         profile = normalize_risk_profile_name(risk_profile) if risk_profile else None
+        normalized_status = status or ("PAPER_FILLED" if decision.approved else "REJECTED")
         with self.connect() as conn:
             cursor = conn.execute(
                 """
                 INSERT INTO paper_orders (
                     created_at, target_date, market_ticker, label, action, risk_profile,
                     side, contracts, yes_ask, entry_price, entry_bid, entry_bid_size, entry_ask_size,
-                    strike_type, floor_strike, cap_strike,
+                    strike_type, floor_strike, cap_strike, entry_mode,
+                    limit_price, limit_fee_per_contract, limit_cost_per_contract, limit_edge, limit_edge_lcb,
                     fee_per_contract, cost_per_contract, probability,
                     probability_lcb, edge, edge_lcb, trade_quality_score,
                     expected_profit, status, reasons_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     _now(),
@@ -518,15 +545,21 @@ class PaperStore:
                     decision.strike_type,
                     decision.floor_strike,
                     decision.cap_strike,
+                    entry_mode,
+                    decision.limit_price,
+                    decision.limit_fee_per_contract,
+                    decision.limit_cost_per_contract,
+                    decision.limit_edge,
+                    decision.limit_edge_lcb,
                     fee_per_contract,
                     cost_per_contract,
                     decision.probability,
                     decision.probability_lcb,
-                    decision.edge,
-                    decision.edge_lcb,
+                    edge,
+                    edge_lcb,
                     decision.trade_quality_score,
-                    decision.expected_profit,
-                    "PAPER_FILLED" if decision.approved else "REJECTED",
+                    expected_profit,
+                    normalized_status,
                     json.dumps(decision.reasons),
                 ),
             )
@@ -689,6 +722,36 @@ class PaperStore:
         if side is not None:
             filters.append("UPPER(side) = ?")
             params.append(side.upper())
+        if risk_profile is not None:
+            filters.append("COALESCE(risk_profile, 'balanced') = ?")
+            params.append(normalize_risk_profile_name(risk_profile))
+        with self.connect() as conn:
+            row = conn.execute(
+                f"""
+                SELECT 1
+                FROM paper_orders
+                WHERE {' AND '.join(filters)}
+                LIMIT 1
+                """,
+                params,
+            ).fetchone()
+        return row is not None
+
+    def has_active_paper_entry(
+        self,
+        target_date: str,
+        market_ticker: str,
+        *,
+        risk_profile: str | None = None,
+    ) -> bool:
+        filters = [
+            "target_date = ?",
+            "market_ticker = ?",
+            "status IN ('PAPER_FILLED', 'PAPER_LIMIT_RESTING')",
+            "settled_at IS NULL",
+            "closed_at IS NULL",
+        ]
+        params: list[object] = [target_date, market_ticker]
         if risk_profile is not None:
             filters.append("COALESCE(risk_profile, 'balanced') = ?")
             params.append(normalize_risk_profile_name(risk_profile))

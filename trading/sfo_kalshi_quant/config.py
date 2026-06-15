@@ -49,6 +49,8 @@ class StrategyConfig:
     taker_fee_rate: float = 0.07
     maker_fee_rate: float = 0.0175
     fee_multiplier: float = 1.0
+    limit_price_tick: float = 0.01
+    limit_price_edge_lcb_buffer: float = 0.02
     min_conditional_samples: int = 35
     shrinkage_samples: int = 70
     empirical_weight: float = 0.75

@@ -134,7 +134,7 @@ def test_strategy_lab_placeholder_refreshes_old_monitor_schema():
         payload = json.loads(path.read_text())
 
         monitor = payload["paper_trading"]["monitor"]
-        assert monitor["model_veto_max_loss_pct"] == 45.0
+        assert monitor["model_veto_max_loss_pct"] == 60.0
         assert monitor["yes_stop_loss_pct"] == 25.0
         assert monitor["model_veto_buffer"] == 0.08
 

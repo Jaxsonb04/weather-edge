@@ -45,6 +45,29 @@ cd /path/to/WeatherEdge
 python -m sfo_kalshi_quant.cli --no-color analyze --target-date both
 ```
 
+To simulate conservative paper buy limits instead of immediate paper fills:
+
+```bash
+PAPER_ENTRY_MODE=limit python -m sfo_kalshi_quant.cli --no-color analyze --target-date rolling --side both --place-paper
+```
+
+## Paper Arbitrage Scan
+
+```bash
+cd /path/to/WeatherEdge
+python -m sfo_kalshi_quant.cli --no-color arbitrage --target-date rolling --max-arb-spend 12
+```
+
+To record approved paper arbitrage portfolios:
+
+```bash
+python -m sfo_kalshi_quant.cli --no-color arbitrage --target-date rolling --max-arb-spend 12 --place-paper
+```
+
+This scans all active temperature bins for the target day. Same-bin YES+NO boxes
+and full-ladder YES/NO sets are paper-placed only when the guaranteed payout is
+above all-in cost after rounded fees.
+
 ## Public Paper Research Artifact
 
 ```bash
@@ -79,7 +102,7 @@ Only rows that pass all risk gates are recorded.
 python -m sfo_kalshi_quant.cli --no-color paper-monitor \
   --yes-take-profit-pct 50 --yes-stop-loss-pct 25 \
   --no-take-profit-pct 35 --no-stop-loss-pct 35 \
-  --model-veto-max-loss-pct 45 --model-veto-buffer 0.08
+  --model-veto-max-loss-pct 60 --model-veto-buffer 0.08
 ```
 
 ## Paper Settle

@@ -32,7 +32,7 @@ DEFAULT_YES_TAKE_PROFIT_PCT = 50.0
 DEFAULT_YES_STOP_LOSS_PCT = 25.0
 DEFAULT_NO_TAKE_PROFIT_PCT = 35.0
 DEFAULT_NO_STOP_LOSS_PCT = 35.0
-DEFAULT_MODEL_VETO_MAX_LOSS_PCT = 45.0
+DEFAULT_MODEL_VETO_MAX_LOSS_PCT = 60.0
 DEFAULT_MODEL_VETO_BUFFER = 0.08
 PRIMARY_PROFILE = "balanced"
 EXPERIMENTAL_PROFILES = {"exploratory", "fast-feedback"}
@@ -344,6 +344,11 @@ def _profile_paper_payload(paper: dict[str, Any], name: str) -> dict[str, Any]:
     ]
     monitor_action_rows = [row for row in action_rows if row.get("status") != "OPEN"]
     profile = _profile_row(paper.get("profiles") or [], name)
+    duplicate_rows = [
+        row
+        for row in paper.get("duplicate_open_groups") or []
+        if _profile_key(row.get("risk_profile")) == name
+    ]
     open_positions = int(_to_float(profile.get("open_positions")))
     marked_open = [row for row in open_rows if row.get("unrealized_pnl") is not None]
     unrealized_pnl = (
@@ -360,8 +365,11 @@ def _profile_paper_payload(paper: dict[str, Any], name: str) -> dict[str, Any]:
         "open_positions": open_positions,
         "published_open_positions": len(open_rows),
         "hidden_open_positions": max(0, open_positions - len(open_rows)),
-        "duplicate_open_groups": 0,
-        "largest_duplicate_open_group": 0,
+        "duplicate_open_groups": len(duplicate_rows),
+        "largest_duplicate_open_group": max(
+            [row["open_orders"] for row in duplicate_rows],
+            default=0,
+        ),
         "unresolved_past_targets": [],
         "latest_opened_at": open_rows[0].get("created_at") if open_rows else None,
         "latest_monitor_action_at": (
@@ -386,7 +394,7 @@ def _profile_paper_payload(paper: dict[str, Any], name: str) -> dict[str, Any]:
         "open_positions": open_rows,
         "closed_positions": closed_rows,
         "recent_monitor_actions": action_rows,
-        "duplicate_open_groups": [],
+        "duplicate_open_groups": duplicate_rows,
         "profiles": [profile] if profile else [],
     }
 
@@ -475,6 +483,11 @@ def _profile_status(
 ) -> dict[str, Any]:
     totals = daily_summary.get("totals") or {}
     paper_summary = paper.get("summary") or {}
+    entry_block_reason = _entry_block_reason(signal_quality.get("latest_candidates") or [])
+    alerts = _strategy_alerts(
+        paper=paper,
+        entry_block_reason=entry_block_reason,
+    )
     return {
         "risk_profile": name,
         "profile_label": _profile_label(name),
@@ -489,6 +502,9 @@ def _profile_status(
         "realized_pnl": _round(totals.get("realized_pnl"), 2),
         "hit_rate": totals.get("hit_rate"),
         "latest_signal_count": len(signal_quality.get("latest_candidates") or []),
+        "entry_scanner_reason": entry_block_reason,
+        "alerts": alerts,
+        "alert_level": _alert_level(alerts),
     }
 
 
@@ -898,6 +914,7 @@ def _paper_payload(db_path: Path) -> dict[str, Any]:
         duplicate_rows = conn.execute(
             """
             SELECT target_date,
+                   COALESCE(risk_profile, 'balanced') AS risk_profile,
                    market_ticker,
                    UPPER(COALESCE(side, 'YES')) AS side,
                    COUNT(*) AS open_orders
@@ -905,9 +922,12 @@ def _paper_payload(db_path: Path) -> dict[str, Any]:
             WHERE status = 'PAPER_FILLED'
               AND settled_at IS NULL
               AND closed_at IS NULL
-            GROUP BY target_date, market_ticker, UPPER(COALESCE(side, 'YES'))
+            GROUP BY target_date,
+                     COALESCE(risk_profile, 'balanced'),
+                     market_ticker,
+                     UPPER(COALESCE(side, 'YES'))
             HAVING COUNT(*) > 1
-            ORDER BY open_orders DESC, target_date, market_ticker
+            ORDER BY open_orders DESC, target_date, risk_profile, market_ticker
             LIMIT 5
             """
         ).fetchall()
@@ -1826,6 +1846,24 @@ def _paper_row(
         "status": row["status"],
         "risk_profile": _row_risk_profile(row),
         "contracts": _round(contracts, 4),
+        "entry_mode": row["entry_mode"] if "entry_mode" in row.keys() else "market",
+        "limit_price": _round(row["limit_price"], 4) if "limit_price" in row.keys() else None,
+        "limit_fee_per_contract": (
+            _round(row["limit_fee_per_contract"], 4)
+            if "limit_fee_per_contract" in row.keys()
+            else None
+        ),
+        "limit_cost_per_contract": (
+            _round(row["limit_cost_per_contract"], 4)
+            if "limit_cost_per_contract" in row.keys()
+            else None
+        ),
+        "limit_edge": _round(row["limit_edge"], 4) if "limit_edge" in row.keys() else None,
+        "limit_edge_lcb": (
+            _round(row["limit_edge_lcb"], 4)
+            if "limit_edge_lcb" in row.keys()
+            else None
+        ),
         "entry_price": _round(entry_price, 4),
         "entry_fee_per_contract": _round(fee_per_contract, 4),
         "cost_per_contract": _round(cost_per_contract, 4),
@@ -1967,6 +2005,7 @@ def _paper_monitor_snapshot_row(row: sqlite3.Row) -> dict[str, Any]:
 def _duplicate_group_row(row: sqlite3.Row) -> dict[str, Any]:
     return {
         "target_date": str(row["target_date"]),
+        "risk_profile": str(row["risk_profile"]),
         "ticker": row["market_ticker"],
         "side": row["side"],
         "open_orders": int(row["open_orders"]),

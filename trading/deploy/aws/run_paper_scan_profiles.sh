@@ -8,8 +8,12 @@ DB_PATH="${SFO_KALSHI_DB:-$TRADING_DIR/data/paper_trading.db}"
 BANKROLL="${PAPER_BANKROLL:-1000}"
 PROFILES_CSV="${PAPER_RISK_PROFILES:-${PAPER_RISK_PROFILE:-balanced}}"
 CALIBRATION_SOURCE="${SFO_TRADING_SIGNAL_CALIBRATION_SOURCE:-lstm}"
+PAPER_ENTRY_MODE="${PAPER_ENTRY_MODE:-market}"
 TARGET_DATE="${SFO_PAPER_SCAN_TARGET_DATE:-rolling}"
 SIDE="${SFO_PAPER_SCAN_SIDE:-both}"
+ARBITRAGE_ENABLED="${SFO_PAPER_SCAN_ARBITRAGE_ENABLED:-1}"
+ARBITRAGE_MAX_SPEND="${SFO_ARBITRAGE_MAX_SPEND:-12}"
+ARBITRAGE_MIN_PROFIT="${SFO_ARBITRAGE_MIN_PROFIT:-0.01}"
 TAIL_BASKET_ENABLED="${SFO_PAPER_SCAN_TAIL_BASKET_ENABLED:-1}"
 TAIL_BASKET_DISTANCE="${SFO_TAIL_BASKET_DISTANCE:-3}"
 TAIL_BASKET_TAIL_STAKE="${SFO_TAIL_BASKET_TAIL_STAKE:-5}"
@@ -41,6 +45,30 @@ for raw_profile in "${profiles[@]}"; do
   skip_context=0
   if (( profile_index > 0 )); then
     skip_context=1
+  fi
+
+  if [[ "$ARBITRAGE_ENABLED" != "0" ]]; then
+    arbitrage_args=(
+      --no-color
+      --db-path "$DB_PATH"
+      --bankroll "$BANKROLL"
+      --risk-profile "$profile"
+      arbitrage
+      --target-date "$TARGET_DATE"
+      --max-arb-spend "$ARBITRAGE_MAX_SPEND"
+      --min-profit "$ARBITRAGE_MIN_PROFIT"
+      --place-paper
+    )
+    if (( skip_context > 0 )); then
+      arbitrage_args+=(--skip-context-snapshots)
+    fi
+
+    echo "running arbitrage scan profile=$profile db=$DB_PATH"
+    if ! "$PYTHON_BIN" -m sfo_kalshi_quant.cli "${arbitrage_args[@]}"; then
+      echo "warning: arbitrage scan failed for profile=$profile; continuing with broad scan" >&2
+    else
+      skip_context=1
+    fi
   fi
 
   if [[ "$TAIL_BASKET_ENABLED" != "0" ]]; then
@@ -88,6 +116,7 @@ for raw_profile in "${profiles[@]}"; do
     --target-date "$TARGET_DATE"
     --side "$SIDE"
     --calibration-source "$CALIBRATION_SOURCE"
+    --paper-entry-mode "$PAPER_ENTRY_MODE"
     --place-paper
   )
   # Forecast/probability/market context is identical across profiles in one

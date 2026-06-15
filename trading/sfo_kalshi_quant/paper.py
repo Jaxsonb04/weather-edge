@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from .arbitrage import ArbitrageOpportunity
 from .config import StrategyConfig
 from .db import PaperStore
 from .fees import (
     contracts_for_budget,
     quadratic_fee_average_per_contract,
 )
+from .execution import buy_limit_for_decision, with_buy_limit
 from .models import TradeDecision
 
 
@@ -18,10 +20,12 @@ class PaperTrader:
         config: StrategyConfig | None = None,
         *,
         risk_profile: str | None = None,
+        entry_mode: str = "market",
     ) -> None:
         self.store = store
         self.config = config or StrategyConfig()
         self.risk_profile = risk_profile
+        self.entry_mode = _normalize_entry_mode(entry_mode)
 
     def with_paper_stake(self, decision: TradeDecision, stake_dollars: float | None) -> TradeDecision:
         if stake_dollars is None or not decision.approved:
@@ -104,6 +108,16 @@ class PaperTrader:
                 adjusted.append(decision)
         return adjusted
 
+    def with_entry_mode(self, decisions: list[TradeDecision]) -> list[TradeDecision]:
+        if self.entry_mode != "limit":
+            return decisions
+        return [
+            with_buy_limit(decision, self.config)
+            if decision.approved and decision.recommended_contracts > 0
+            else decision
+            for decision in decisions
+        ]
+
     def place_approved(
         self,
         target_date: str,
@@ -140,7 +154,7 @@ class PaperTrader:
             # YES and NO on the same bucket locks in the combined entry costs
             # plus fees, so an open position blocks the opposite side too; the
             # monitor's exit rules manage the existing leg instead.
-            if self.store.has_open_paper_position(
+            if self.store.has_active_paper_entry(
                 target_date,
                 adjusted.ticker,
                 risk_profile=self.risk_profile,
@@ -158,15 +172,104 @@ class PaperTrader:
                 adjusted = self._fit_to_exposure(adjusted, exposure_remaining)
                 if adjusted is None:
                     continue
+            status = "PAPER_FILLED"
+            entry_mode = "market"
+            if self.entry_mode == "limit":
+                quote = buy_limit_for_decision(adjusted, self.config)
+                if quote is None:
+                    continue
+                adjusted = with_buy_limit(adjusted, self.config)
+                if not adjusted.approved:
+                    continue
+                status = "PAPER_FILLED" if quote.would_cross else "PAPER_LIMIT_RESTING"
+                entry_mode = "limit"
             order_ids.append(
                 self.store.record_paper_order(
                     target_date,
                     adjusted,
                     risk_profile=self.risk_profile,
+                    status=status,
+                    entry_mode=entry_mode,
                 )
             )
             if exposure_remaining is not None:
                 exposure_remaining -= adjusted.recommended_contracts * adjusted.cost_per_contract
+        return order_ids
+
+    def place_arbitrage(
+        self,
+        target_date: str,
+        opportunity: ArbitrageOpportunity,
+        *,
+        bankroll: float | None = None,
+    ) -> list[int]:
+        """Record an approved arbitrage portfolio as one preflighted group.
+
+        A same-market YES+NO box deliberately violates the normal side-agnostic
+        single-position guard inside one portfolio. Existing open exposure still
+        blocks the group before any new leg is recorded.
+        """
+
+        if not opportunity.approved or not opportunity.legs:
+            return []
+        if bankroll is not None:
+            pause_reason = self.store.paper_entry_pause_reason(
+                self.risk_profile,
+                bankroll=bankroll,
+                target_date=target_date,
+            )
+            if pause_reason is not None:
+                return []
+        decisions = list(opportunity.decisions)
+        if any(not decision.approved or decision.recommended_contracts <= 0 for decision in decisions):
+            return []
+        if any(decision.cost_per_contract <= 0 or decision.cost_per_contract >= 1 for decision in decisions):
+            return []
+
+        tickers = {decision.ticker for decision in decisions}
+        for ticker in tickers:
+            if self.store.has_open_paper_position(
+                target_date,
+                ticker,
+                risk_profile=self.risk_profile,
+            ):
+                return []
+        for decision in decisions:
+            entries = self.store.entries_for_market_side(
+                target_date,
+                decision.ticker,
+                decision.side,
+                risk_profile=self.risk_profile,
+            )
+            if entries >= self.config.max_entries_per_market_side:
+                return []
+
+        adjusted = opportunity
+        exposure_remaining = self._target_exposure_remaining(target_date, bankroll)
+        if exposure_remaining is not None:
+            adjusted = self._fit_arbitrage_to_exposure(opportunity, exposure_remaining)
+            if adjusted is None:
+                return []
+
+        normalized = self._normalize_arbitrage_contracts(adjusted)
+        if normalized is None:
+            return []
+
+        order_ids: list[int] = []
+        try:
+            for decision in normalized.decisions:
+                order_ids.append(
+                    self.store.record_paper_order(
+                        target_date,
+                        decision,
+                        risk_profile=self.risk_profile,
+                    )
+                )
+        except Exception:
+            # The SQLite store autocommits each insert, so there is no safe
+            # partial rollback API here. Preflight checks above keep expected
+            # failure modes before the first insert.
+            raise
         return order_ids
 
     def _target_exposure_remaining(self, target_date: str, bankroll: float | None) -> float | None:
@@ -224,6 +327,57 @@ class PaperTrader:
             recommended_contracts=contracts,
             expected_profit=decision.edge * contracts,
         )
+
+    def _normalize_arbitrage_contracts(
+        self,
+        opportunity: ArbitrageOpportunity,
+    ) -> ArbitrageOpportunity | None:
+        if self.config.allow_fractional_contracts:
+            return opportunity
+        contracts = float(int(opportunity.contracts))
+        if contracts < 1:
+            return None
+        if contracts == opportunity.contracts:
+            return opportunity
+        adjusted = opportunity.with_contracts(contracts)
+        return adjusted if adjusted.approved else None
+
+    def _fit_arbitrage_to_exposure(
+        self,
+        opportunity: ArbitrageOpportunity,
+        exposure_remaining: float,
+    ) -> ArbitrageOpportunity | None:
+        if opportunity.total_spend <= exposure_remaining + 1e-9:
+            return opportunity
+        if exposure_remaining <= 0:
+            return None
+        lo = 0.0
+        hi = opportunity.contracts
+        for _ in range(54):
+            mid = (lo + hi) / 2.0
+            candidate = opportunity.with_contracts(mid)
+            if candidate.total_spend <= exposure_remaining:
+                lo = mid
+            else:
+                hi = mid
+        contracts = lo
+        if not self.config.allow_fractional_contracts:
+            contracts = float(int(contracts))
+        if contracts <= 0:
+            return None
+        adjusted = opportunity.with_contracts(contracts)
+        if not adjusted.approved or adjusted.total_spend > exposure_remaining + 1e-9:
+            return None
+        return adjusted
+
+
+def _normalize_entry_mode(entry_mode: str) -> str:
+    normalized = entry_mode.strip().lower().replace("_", "-")
+    if normalized in {"market", "market-order", "immediate"}:
+        return "market"
+    if normalized in {"limit", "limit-order", "paper-limit"}:
+        return "limit"
+    raise ValueError("entry mode must be market or limit")
 
 
 def _decision_key(decision: TradeDecision) -> tuple[str, str]:

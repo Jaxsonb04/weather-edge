@@ -128,6 +128,25 @@ new entries on either side of that bucket. Holding both sides locks in the
 combined entry costs plus fees, so the monitor's exit rules manage the open leg
 instead of hedging it.
 
+The `arbitrage` command is the explicit exception to that side-agnostic block.
+It is paper-only and scans every active temperature bin for the target day
+before placing anything. It evaluates three guaranteed-payoff structures:
+
+- same-bin YES+NO boxes, approved only when `yes_cost + no_cost < 1`
+- full-ladder BUY_YES sets, approved only when the active ladder is complete
+  from lower tail to upper tail and `sum(yes_costs) < 1`
+- full-ladder BUY_NO sets, approved only when the active ladder is complete
+  and `sum(no_costs) < number_of_bins - 1`
+
+Sizing is equal-contract dutching: every leg in the portfolio receives the same
+whole-contract quantity so settlement payout is fixed by construction. The
+calculator uses the same rounded Kalshi fee model as normal paper orders at the
+final group size, caps size by visible ask depth, max contracts, configured
+event risk, and optional `--max-arb-spend`, then places the group only after a
+preflight confirms there is no existing open exposure in any affected market.
+If a ladder is missing an active bin or has a gap/overlap, full-ladder
+arbitrage is rejected rather than treated as hedged.
+
 `backtest-signals` reports per-stream calibration (`weather_model`,
 `market_prior`, `traded`) over the same settled rows. The traded posterior
 blends the market prior in, so only a weather-model stream that beats the

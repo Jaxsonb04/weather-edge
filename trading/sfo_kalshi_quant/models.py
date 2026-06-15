@@ -321,6 +321,11 @@ class TradeDecision:
     intraday_probability: float | None = None
     remaining_heat_risk: float | None = None
     trade_quality_score: float = 0.0
+    limit_price: float | None = None
+    limit_fee_per_contract: float | None = None
+    limit_cost_per_contract: float | None = None
+    limit_edge: float | None = None
+    limit_edge_lcb: float | None = None
 
     @property
     def bid(self) -> float:

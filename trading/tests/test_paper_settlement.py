@@ -6,9 +6,11 @@ from datetime import date
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+from sfo_kalshi_quant.arbitrage import build_arbitrage_opportunities
 from sfo_kalshi_quant.cli import main
+from sfo_kalshi_quant.config import StrategyConfig
 from sfo_kalshi_quant.db import PaperStore
-from sfo_kalshi_quant.models import ForecastSnapshot, IntradaySnapshot, TradeDecision
+from sfo_kalshi_quant.models import ForecastSnapshot, IntradaySnapshot, MarketBin, TradeDecision
 from sfo_kalshi_quant.paper import PaperTrader
 
 
@@ -522,6 +524,99 @@ def test_place_approved_skips_existing_open_market_position():
 
         assert len(first_ids) == 1
         assert second_ids == []
+        assert len(store.open_paper_orders(10)) == 1
+
+
+def test_place_arbitrage_records_same_market_yes_and_no_as_group():
+    with TemporaryDirectory() as tmp:
+        store = PaperStore(Path(tmp) / "paper.db")
+        trader = PaperTrader(store)
+        market = MarketBin(
+            ticker="KXHIGHTSFO-TEST-B68.5",
+            event_ticker="KXHIGHTSFO-TEST",
+            title="SFO high 68 to 69",
+            yes_sub_title="68° to 69°",
+            strike_type="between",
+            floor_strike=68,
+            cap_strike=69,
+            yes_bid=0.44,
+            yes_ask=0.45,
+            no_bid=0.47,
+            no_ask=0.48,
+            yes_bid_size=20.0,
+            yes_ask_size=20.0,
+            status="active",
+        )
+        box = next(
+            opportunity
+            for opportunity in build_arbitrage_opportunities(
+                [market],
+                config=StrategyConfig(max_event_risk_pct=0.50),
+                bankroll=1000.0,
+            )
+            if opportunity.kind == "BOX_YES_NO"
+        )
+
+        order_ids = trader.place_arbitrage("2026-06-03", box, bankroll=1000.0)
+
+        assert len(order_ids) == 2
+        rows = store.paper_orders(10)
+        assert {row["side"] for row in rows} == {"YES", "NO"}
+        assert {row["market_ticker"] for row in rows} == {"KXHIGHTSFO-TEST-B68.5"}
+        assert len({float(row["contracts"]) for row in rows}) == 1
+
+
+def test_place_arbitrage_blocks_when_market_already_has_open_position():
+    with TemporaryDirectory() as tmp:
+        store = PaperStore(Path(tmp) / "paper.db")
+        trader = PaperTrader(store)
+        existing = TradeDecision(
+            ticker="KXHIGHTSFO-TEST-B68.5",
+            label="68° to 69°",
+            action="BUY_YES",
+            approved=True,
+            probability=0.65,
+            probability_lcb=0.55,
+            yes_bid=0.30,
+            yes_ask=0.32,
+            spread=0.02,
+            fee_per_contract=0.01,
+            cost_per_contract=0.33,
+            edge=0.32,
+            edge_lcb=0.22,
+            kelly_fraction=0.01,
+            recommended_contracts=10.0,
+            expected_profit=3.2,
+            reasons=[],
+        )
+        assert len(trader.place_approved("2026-06-03", [existing])) == 1
+        market = MarketBin(
+            ticker="KXHIGHTSFO-TEST-B68.5",
+            event_ticker="KXHIGHTSFO-TEST",
+            title="SFO high 68 to 69",
+            yes_sub_title="68° to 69°",
+            strike_type="between",
+            floor_strike=68,
+            cap_strike=69,
+            yes_bid=0.44,
+            yes_ask=0.45,
+            no_bid=0.47,
+            no_ask=0.48,
+            yes_bid_size=20.0,
+            yes_ask_size=20.0,
+            status="active",
+        )
+        box = next(
+            opportunity
+            for opportunity in build_arbitrage_opportunities(
+                [market],
+                config=StrategyConfig(max_event_risk_pct=0.50),
+                bankroll=1000.0,
+            )
+            if opportunity.kind == "BOX_YES_NO"
+        )
+
+        assert trader.place_arbitrage("2026-06-03", box, bankroll=1000.0) == []
         assert len(store.open_paper_orders(10)) == 1
 
 

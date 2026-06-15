@@ -133,11 +133,11 @@ floor `60%`. The next version should make exits side-aware:
 | YES model veto | disabled |
 | NO take profit | `35%` |
 | NO stop loss | `35%` |
-| NO model-veto hard floor | `45%` |
+| NO model-veto hard floor | `60%` |
 | NO model-veto buffer | `0.08` probability / dollars |
 
 If side-aware exits are not implemented yet, use global take-profit `40%`,
-stop-loss `35%`, and model-veto hard floor `45%`.
+stop-loss `35%`, and model-veto hard floor `60%`.
 
 ### Timers
 

@@ -80,6 +80,16 @@ def test_strategy_lab_trade_cards_show_entry_price_without_sell_bid_lab():
     assert "trade-diagnostic" not in html
 
 
+def test_strategy_lab_surfaces_pending_limits_and_daily_percentage_recap():
+    html = STRATEGY_TEMPLATE.read_text()
+
+    assert 'id="pendingLimitCards"' in html
+    assert "pending_limit_orders" in html
+    assert "Pending limit orders" in html
+    assert "Daily %" in html
+    assert "signedPct(row.roi)" in html
+
+
 def test_strategy_lab_supports_password_unlock_flow():
     html = STRATEGY_TEMPLATE.read_text()
 

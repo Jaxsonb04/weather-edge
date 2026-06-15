@@ -200,6 +200,8 @@ def _profile_names(
     for bucket in ("open_positions", "closed_positions", "recent_monitor_actions"):
         for row in paper.get(bucket) or []:
             names.add(_profile_key(row.get("risk_profile")))
+    for row in paper.get("pending_limit_orders") or []:
+        names.add(_profile_key(row.get("risk_profile")))
     for row in signal_quality.get("latest_candidates") or []:
         names.add(_profile_key(row.get("risk_profile")))
     names.discard("unknown")
@@ -332,6 +334,11 @@ def _profile_paper_payload(paper: dict[str, Any], name: str) -> dict[str, Any]:
         for row in paper.get("open_positions") or []
         if _profile_key(row.get("risk_profile")) == name
     ]
+    pending_limit_rows = [
+        row
+        for row in paper.get("pending_limit_orders") or []
+        if _profile_key(row.get("risk_profile")) == name
+    ]
     closed_rows = [
         row
         for row in paper.get("closed_positions") or []
@@ -342,7 +349,11 @@ def _profile_paper_payload(paper: dict[str, Any], name: str) -> dict[str, Any]:
         for row in paper.get("recent_monitor_actions") or []
         if _profile_key(row.get("risk_profile")) == name
     ]
-    monitor_action_rows = [row for row in action_rows if row.get("status") != "OPEN"]
+    monitor_action_rows = [
+        row
+        for row in action_rows
+        if row.get("status") not in {"OPEN", "LIMIT_RESTING"}
+    ]
     profile = _profile_row(paper.get("profiles") or [], name)
     duplicate_rows = [
         row
@@ -350,6 +361,7 @@ def _profile_paper_payload(paper: dict[str, Any], name: str) -> dict[str, Any]:
         if _profile_key(row.get("risk_profile")) == name
     ]
     open_positions = int(_to_float(profile.get("open_positions")))
+    pending_limit_count = int(_to_float(profile.get("pending_limit_orders")))
     marked_open = [row for row in open_rows if row.get("unrealized_pnl") is not None]
     unrealized_pnl = (
         _round(sum(_to_float(row.get("unrealized_pnl")) for row in marked_open), 2)
@@ -365,6 +377,10 @@ def _profile_paper_payload(paper: dict[str, Any], name: str) -> dict[str, Any]:
         "open_positions": open_positions,
         "published_open_positions": len(open_rows),
         "hidden_open_positions": max(0, open_positions - len(open_rows)),
+        "pending_limit_orders": pending_limit_count,
+        "published_pending_limit_orders": len(pending_limit_rows),
+        "hidden_pending_limit_orders": max(0, pending_limit_count - len(pending_limit_rows)),
+        "pending_limit_risk": _round(profile.get("pending_limit_risk"), 2),
         "duplicate_open_groups": len(duplicate_rows),
         "largest_duplicate_open_group": max(
             [row["open_orders"] for row in duplicate_rows],
@@ -392,6 +408,7 @@ def _profile_paper_payload(paper: dict[str, Any], name: str) -> dict[str, Any]:
         "monitor": paper.get("monitor") or {},
         "summary": summary,
         "open_positions": open_rows,
+        "pending_limit_orders": pending_limit_rows,
         "closed_positions": closed_rows,
         "recent_monitor_actions": action_rows,
         "duplicate_open_groups": duplicate_rows,
@@ -488,17 +505,26 @@ def _profile_status(
         paper=paper,
         entry_block_reason=entry_block_reason,
     )
+    open_count = int(_to_float(paper_summary.get("open_positions")))
+    pending_count = int(_to_float(paper_summary.get("pending_limit_orders")))
+    if open_count and pending_count:
+        paper_status = (
+            f"{open_count} open {name} paper position(s); "
+            f"{pending_count} resting limit order(s)"
+        )
+    elif open_count:
+        paper_status = f"{open_count} open {name} paper position(s)"
+    elif pending_count:
+        paper_status = f"{pending_count} resting limit order(s) for {name}"
+    else:
+        paper_status = f"no open {name} paper positions"
     return {
         "risk_profile": name,
         "profile_label": _profile_label(name),
         "profile_type": "experimental" if name in EXPERIMENTAL_PROFILES else "primary",
-        "paper_trading_status": (
-            f"{int(_to_float(paper_summary.get('open_positions')))} open "
-            f"{name} paper position(s)"
-            if _to_float(paper_summary.get("open_positions"))
-            else f"no open {name} paper positions"
-        ),
+        "paper_trading_status": paper_status,
         "open_risk": _round(paper_summary.get("open_risk"), 2),
+        "pending_limit_risk": _round(paper_summary.get("pending_limit_risk"), 2),
         "realized_pnl": _round(totals.get("realized_pnl"), 2),
         "hit_rate": totals.get("hit_rate"),
         "latest_signal_count": len(signal_quality.get("latest_candidates") or []),
@@ -524,6 +550,8 @@ def _profile_row(rows: list[dict[str, Any]], name: str) -> dict[str, Any]:
         "roi": None,
         "open_positions": 0,
         "open_risk": 0.0,
+        "pending_limit_orders": 0,
+        "pending_limit_risk": 0.0,
         "signals": 0,
         "approved": 0,
     }
@@ -841,6 +869,10 @@ def _paper_payload(db_path: Path) -> dict[str, Any]:
             "open_positions": 0,
             "published_open_positions": 0,
             "hidden_open_positions": 0,
+            "pending_limit_orders": 0,
+            "published_pending_limit_orders": 0,
+            "hidden_pending_limit_orders": 0,
+            "pending_limit_risk": 0.0,
             "duplicate_open_groups": 0,
             "largest_duplicate_open_group": 0,
             "unresolved_past_targets": [],
@@ -855,6 +887,7 @@ def _paper_payload(db_path: Path) -> dict[str, Any]:
             "loss_count": 0,
         },
         "open_positions": [],
+        "pending_limit_orders": [],
         "closed_positions": [],
         "recent_monitor_actions": [],
         "profiles": [],
@@ -882,6 +915,27 @@ def _paper_payload(db_path: Path) -> dict[str, Any]:
             LIMIT 30
             """
         ).fetchall()
+        pending_limit_rows = conn.execute(
+            """
+            SELECT *
+            FROM paper_orders
+            WHERE status = 'PAPER_LIMIT_RESTING'
+              AND settled_at IS NULL
+              AND closed_at IS NULL
+            ORDER BY created_at DESC
+            LIMIT 30
+            """
+        ).fetchall()
+        pending_limit_summary = conn.execute(
+            """
+            SELECT COUNT(*) AS pending_orders,
+                   COALESCE(SUM(contracts * cost_per_contract), 0.0) AS pending_risk
+            FROM paper_orders
+            WHERE status = 'PAPER_LIMIT_RESTING'
+              AND settled_at IS NULL
+              AND closed_at IS NULL
+            """
+        ).fetchone()
         closed_rows = conn.execute(
             """
             SELECT *
@@ -971,6 +1025,14 @@ def _paper_payload(db_path: Path) -> dict[str, Any]:
                              AND settled_at IS NULL
                              AND closed_at IS NULL
                             THEN contracts * cost_per_contract ELSE 0.0 END) AS open_risk,
+                   SUM(CASE WHEN status = 'PAPER_LIMIT_RESTING'
+                             AND settled_at IS NULL
+                             AND closed_at IS NULL
+                            THEN 1 ELSE 0 END) AS pending_limit_orders,
+                   SUM(CASE WHEN status = 'PAPER_LIMIT_RESTING'
+                             AND settled_at IS NULL
+                             AND closed_at IS NULL
+                            THEN contracts * cost_per_contract ELSE 0.0 END) AS pending_limit_risk,
                    SUM(CASE WHEN realized_pnl IS NOT NULL
                             THEN contracts * cost_per_contract ELSE 0.0 END) AS capital_resolved
             FROM paper_orders
@@ -989,6 +1051,7 @@ def _paper_payload(db_path: Path) -> dict[str, Any]:
         )
         for row in open_rows
     ]
+    pending_limit_orders = [_paper_row(row, None, monitor) for row in pending_limit_rows]
     closed_positions = [_paper_row(row, None, monitor) for row in closed_rows]
     monitor_action_rows = [_paper_monitor_snapshot_row(row) for row in monitor_rows] + [
         _paper_action_row(row) for row in closed_action_rows
@@ -999,10 +1062,12 @@ def _paper_payload(db_path: Path) -> dict[str, Any]:
         reverse=True,
     )
     open_action_rows = [_paper_open_action_row(row) for row in open_rows]
-    open_reserve = min(4, len(open_action_rows))
+    pending_action_rows = [_paper_limit_action_row(row) for row in pending_limit_rows]
+    open_reserve = min(4, len(open_action_rows) + len(pending_action_rows))
     action_rows = (
         monitor_action_rows[: max(0, 12 - open_reserve)]
-        + open_action_rows[:open_reserve]
+        + pending_action_rows[:open_reserve]
+        + open_action_rows[: max(0, open_reserve - len(pending_action_rows))]
     )
     action_rows = sorted(action_rows, key=lambda row: str(row.get("time") or ""), reverse=True)[:12]
     duplicate_groups = [_duplicate_group_row(row) for row in duplicate_rows]
@@ -1031,6 +1096,8 @@ def _paper_payload(db_path: Path) -> dict[str, Any]:
     )
     win_count = sum(1 for row in closed_rows if _to_float(row["realized_pnl"]) > 0)
     loss_count = sum(1 for row in closed_rows if _to_float(row["realized_pnl"]) < 0)
+    pending_limit_count = int(pending_limit_summary["pending_orders"] or 0) if pending_limit_summary else 0
+    pending_limit_risk = _to_float(pending_limit_summary["pending_risk"]) if pending_limit_summary else 0.0
     return {
         "available": True,
         "monitor": monitor,
@@ -1038,6 +1105,10 @@ def _paper_payload(db_path: Path) -> dict[str, Any]:
             "open_positions": int(summary["open_orders"]),
             "published_open_positions": len(open_positions),
             "hidden_open_positions": max(0, int(summary["open_orders"]) - len(open_positions)),
+            "pending_limit_orders": pending_limit_count,
+            "published_pending_limit_orders": len(pending_limit_orders),
+            "hidden_pending_limit_orders": max(0, pending_limit_count - len(pending_limit_orders)),
+            "pending_limit_risk": _round(pending_limit_risk, 2),
             "duplicate_open_groups": len(duplicate_groups),
             "largest_duplicate_open_group": max(
                 [row["open_orders"] for row in duplicate_groups],
@@ -1061,6 +1132,7 @@ def _paper_payload(db_path: Path) -> dict[str, Any]:
             "loss_count": loss_count,
         },
         "open_positions": open_positions,
+        "pending_limit_orders": pending_limit_orders,
         "closed_positions": closed_positions,
         "recent_monitor_actions": action_rows,
         "duplicate_open_groups": duplicate_groups,
@@ -1094,6 +1166,8 @@ def _profiles_with_scanners(
                 "roi": None,
                 "open_positions": 0,
                 "open_risk": 0.0,
+                "pending_limit_orders": 0,
+                "pending_limit_risk": 0.0,
             }
         )
     profiles.sort(key=lambda row: row["risk_profile"])
@@ -1117,6 +1191,8 @@ def _profile_summary_row(row: sqlite3.Row) -> dict[str, Any]:
         "roi": _round(pnl / capital, 4) if capital > 0 else None,
         "open_positions": int(row["open_positions"] or 0),
         "open_risk": _round(_to_float(row["open_risk"]), 2),
+        "pending_limit_orders": int(row["pending_limit_orders"] or 0),
+        "pending_limit_risk": _round(_to_float(row["pending_limit_risk"]), 2),
     }
 
 
@@ -1836,6 +1912,13 @@ def _paper_row(
     take_profit_net = cost_per_contract * (1.0 + take_profit)
     stop_loss_net = max(0.0, cost_per_contract * (1.0 - stop_loss))
     mark_status = _position_mark_status(unrealized_pnl, unrealized_roi, monitor, side)
+    if row["status"] == "PAPER_LIMIT_RESTING":
+        mark_status = {
+            "status": "LIMIT_RESTING",
+            "label": "Limit pending",
+            "tone": "warn",
+            "monitor_action": "LIMIT_RESTING",
+        }
     return {
         "id": row["id"],
         "created_at": row["created_at"],
@@ -1972,6 +2055,34 @@ def _paper_open_action_row(row: sqlite3.Row) -> dict[str, Any]:
         "realized_pnl": None,
         "realized_roi": None,
         "note": "paper order opened",
+    }
+
+
+def _paper_limit_action_row(row: sqlite3.Row) -> dict[str, Any]:
+    contracts = _to_float(row["contracts"])
+    risk = contracts * _to_float(row["cost_per_contract"])
+    return {
+        "id": row["id"],
+        "time": row["created_at"],
+        "ticker": row["market_ticker"],
+        "label": row["label"],
+        "target_date": row["target_date"],
+        "side": row["side"],
+        "risk_profile": _row_risk_profile(row),
+        "contracts": _round(contracts, 4),
+        "status": "LIMIT_RESTING",
+        "entry_price": _round(
+            row["entry_price"] if row["entry_price"] is not None else row["yes_ask"],
+            4,
+        ),
+        "cost_per_contract": _round(row["cost_per_contract"], 4),
+        "initial_cost": _round(risk, 2),
+        "exit_price": None,
+        "exit_fee_per_contract": None,
+        "settlement_high_f": None,
+        "realized_pnl": None,
+        "realized_roi": None,
+        "note": "paper buy-limit resting until market ask trades at or below limit",
     }
 
 
@@ -2156,9 +2267,15 @@ def _why_trade_good(row: sqlite3.Row, reasons: list[str]) -> str:
 def _paper_status(paper: dict[str, Any]) -> str:
     if not paper.get("available"):
         return "paper database unavailable"
-    open_count = int(paper["summary"]["open_positions"])
+    summary = paper["summary"]
+    open_count = int(_to_float(summary.get("open_positions"), default=0.0))
+    pending_count = int(_to_float(summary.get("pending_limit_orders"), default=0.0))
+    if open_count and pending_count:
+        return f"{open_count} open paper position(s); {pending_count} resting limit order(s)"
     if open_count:
         return f"{open_count} open paper position(s)"
+    if pending_count:
+        return f"{pending_count} resting limit order(s)"
     return "no open paper positions"
 
 

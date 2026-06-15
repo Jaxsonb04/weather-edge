@@ -12,7 +12,7 @@ from pathlib import Path
 from sfo_kalshi_quant.cli import main
 from sfo_kalshi_quant.db import PaperStore
 from sfo_kalshi_quant.models import TradeDecision
-from sfo_kalshi_quant.config import SFO_TZ
+from sfo_kalshi_quant.config import SFO_TZ, StrategyConfig
 from sfo_kalshi_quant.strategy_research import (
     _dataset_research_summary,
     _entry_block_reason,
@@ -20,6 +20,7 @@ from sfo_kalshi_quant.strategy_research import (
     _status_target_date,
     build_strategy_research,
 )
+from sfo_kalshi_quant.paper import PaperTrader
 
 
 def _write_lstm_fixture(root: Path, n: int = 90) -> None:
@@ -153,6 +154,46 @@ def test_strategy_research_reads_decisions_and_open_paper_positions():
         assert payload["signal_quality"]["charts"]["probability_vs_market"]
         alert_codes = {alert["code"] for alert in payload["status"]["alerts"]}
         assert "settlement-backlog" in alert_codes
+
+
+def test_strategy_research_surfaces_resting_limit_orders():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "forecaster"
+        db_path = Path(tmp) / "trading" / "paper.db"
+        _write_lstm_fixture(root)
+
+        store = PaperStore(db_path)
+        trader = PaperTrader(
+            store,
+            StrategyConfig(limit_price_edge_lcb_buffer=0.02),
+            entry_mode="limit",
+        )
+        decision = _approved_decision()
+
+        order_ids = trader.place_approved("2026-06-15", [decision])
+        assert len(order_ids) == 1
+        row = store.paper_order(order_ids[0])
+        assert row is not None
+        assert row["status"] == "PAPER_LIMIT_RESTING"
+
+        payload = build_strategy_research(
+            forecaster_root=root,
+            db_path=db_path,
+            calibration_min_train=40,
+        )
+
+        summary = payload["paper_trading"]["summary"]
+        assert summary["open_positions"] == 0
+        assert summary["pending_limit_orders"] == 1
+        assert summary["published_pending_limit_orders"] == 1
+        assert summary["pending_limit_risk"] > 0
+        assert payload["paper_trading"]["pending_limit_orders"][0]["status"] == "PAPER_LIMIT_RESTING"
+        assert payload["paper_trading"]["pending_limit_orders"][0]["limit_price"] == 0.29
+        assert "resting limit" in payload["status"]["paper_trading_status"]
+        assert any(
+            action["status"] == "LIMIT_RESTING"
+            for action in payload["paper_trading"]["recent_monitor_actions"]
+        )
 
 
 def test_strategy_research_ignores_probability_only_targets_for_latest_status():

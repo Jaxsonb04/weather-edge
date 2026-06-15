@@ -2156,7 +2156,7 @@
         </article>
         <article class="paper-exit-rules">
           <h3>Exit monitor</h3>
-          <p>The monitor sells paper positions when scanned bid-based ROI reaches the side-specific profit or loss rule. YES stop-losses close; NO stop-losses can be model-vetoed before the hard loss floor, and losses past -${fmt(monitor.model_veto_max_loss_pct ?? 45, 1)}% close.</p>
+          <p>The monitor sells paper positions when scanned bid-based ROI reaches the side-specific profit or loss rule. YES stop-losses close; NO stop-losses can be model-vetoed before the hard loss floor, and losses past -${fmt(monitor.model_veto_max_loss_pct ?? 60, 1)}% close.</p>
           <div class="rule-grid">
             <div class="rule-tile"><b>+${fmt(monitor.yes_take_profit_pct ?? 50, 1)}% / -${fmt(monitor.yes_stop_loss_pct ?? 25, 1)}%</b><span>YES exits</span></div>
             <div class="rule-tile"><b>+${fmt(monitor.no_take_profit_pct ?? 35, 1)}% / -${fmt(monitor.no_stop_loss_pct ?? 35, 1)}%</b><span>NO exits</span></div>
@@ -2626,7 +2626,7 @@
             yes_stop_loss_pct: 25,
             no_take_profit_pct: 35,
             no_stop_loss_pct: 35,
-            model_veto_max_loss_pct: 45,
+            model_veto_max_loss_pct: 60,
             model_veto_buffer: 0.08
           },
           summary: {

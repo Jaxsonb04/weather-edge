@@ -865,12 +865,26 @@ def _resolve_analysis_targets(
     return clock_targets, {}
 
 
+def _rolling_targets_count() -> int:
+    # Kalshi lists SFO events several days out; scanning more of them grows the
+    # distinct-candidate universe (and the paper sample) without touching any
+    # edge gate. Bounded so a misconfig can't fan out unboundedly.
+    raw = os.getenv("PAPER_ROLLING_TARGETS", "3")
+    try:
+        value = int(raw)
+    except ValueError:
+        return 3
+    return max(1, min(value, 7))
+
+
 def _rolling_live_event_targets(
     events: list[EventSnapshot],
     *,
     now: datetime | None = None,
-    max_targets: int = 2,
+    max_targets: int | None = None,
 ) -> tuple[list[date], dict[date, EventSnapshot]]:
+    if max_targets is None:
+        max_targets = _rolling_targets_count()
     local_now = settlement_clock(now)
     today = local_now.date()
     min_target = today

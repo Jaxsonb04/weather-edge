@@ -33,7 +33,7 @@ def test_completed_open_target_dates_excludes_today_and_future():
     assert targets == ["2026-06-07"]
 
 
-def test_rolling_live_event_targets_include_today_and_next_day_before_peak_cutoff():
+def test_rolling_live_event_targets_include_today_and_next_two_days_before_peak_cutoff():
     now = datetime(2026, 6, 10, 2, 10, tzinfo=SFO_TZ)
     events = [
         _kalshi_event("KXHIGHTSFO-26JUN10", status="active"),
@@ -41,11 +41,14 @@ def test_rolling_live_event_targets_include_today_and_next_day_before_peak_cutof
         _kalshi_event("KXHIGHTSFO-26JUN12", status="active"),
     ]
 
+    # The rolling scanner now reaches three settlement dates by default
+    # (PAPER_ROLLING_TARGETS), widening the candidate universe.
     targets, events_by_target = _rolling_live_event_targets(events, now=now)
 
-    assert targets == [date(2026, 6, 10), date(2026, 6, 11)]
+    assert targets == [date(2026, 6, 10), date(2026, 6, 11), date(2026, 6, 12)]
     assert events_by_target[date(2026, 6, 10)].event_ticker == "KXHIGHTSFO-26JUN10"
     assert events_by_target[date(2026, 6, 11)].event_ticker == "KXHIGHTSFO-26JUN11"
+    assert events_by_target[date(2026, 6, 12)].event_ticker == "KXHIGHTSFO-26JUN12"
 
 
 def test_rolling_live_event_targets_can_be_capped_to_one_day_after_peak_cutoff():

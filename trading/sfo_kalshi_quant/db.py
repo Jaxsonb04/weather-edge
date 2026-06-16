@@ -4,7 +4,7 @@ import json
 import math
 import re
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
 
@@ -210,6 +210,25 @@ PAPER_ORDER_AUDIT_COLUMNS = {
     "limit_edge_lcb": "REAL",
     "risk_profile": "TEXT",
     "group_id": "TEXT",
+}
+
+# Fixed-PST settlement clock (UTC-8 year round) used for the daily-loss window so
+# the breaker measures loss on the same day math the rest of trading settles on.
+SETTLEMENT_TZ = timezone(timedelta(hours=-8))
+
+# Rolling window (days) for the resolved-ROI circuit breaker, so a bad early
+# cohort ages out and the pause can clear instead of latching off forever.
+PAUSE_LOOKBACK_DAYS = 21
+
+# Per-profile entry circuit breaker: (min_resolved_trades, max_resolved_roi,
+# daily_loss_pct of bankroll). fast-feedback keeps its original aggressive trip;
+# the trading-intent profiles get a looser breaker so the real-money-candidate
+# profile is no longer the only one without downside protection.
+PAUSE_THRESHOLDS = {
+    "fast-feedback": (5, -0.25, 0.005),
+    "exploratory": (8, -0.40, 0.010),
+    "balanced": (10, -0.35, 0.010),
+    "conservative": (10, -0.35, 0.010),
 }
 
 PROBABILITY_AUDIT_COLUMNS = {
@@ -1093,13 +1112,40 @@ class PaperStore:
         *,
         bankroll: float,
         target_date: str,
-        min_resolved_trades: int = 5,
-        max_resolved_roi: float = -0.25,
-        daily_loss_pct: float = 0.005,
+        min_resolved_trades: int | None = None,
+        max_resolved_roi: float | None = None,
+        daily_loss_pct: float | None = None,
+        lookback_days: int = PAUSE_LOOKBACK_DAYS,
+        now: datetime | None = None,
     ) -> str | None:
+        """Circuit breaker for paper entries, per profile.
+
+        Extends the original fast-feedback-only breaker to the trading-intent
+        profiles (the ones that could one day fund real money) with looser
+        thresholds. The resolved-ROI gate now uses a rolling lookback window so
+        an unlucky early cohort can age out and the pause can clear, and the
+        daily-loss gate measures loss realized on the current fixed-PST
+        settlement day (via closed_at/settled_at) rather than loss attributable
+        to whichever target date happens to be settling.
+        """
+
         profile = normalize_risk_profile_name(risk_profile)
-        if profile != "fast-feedback":
+        thresholds = PAUSE_THRESHOLDS.get(profile)
+        if thresholds is None:
             return None
+        d_min, d_roi, d_daily = thresholds
+        min_resolved_trades = d_min if min_resolved_trades is None else min_resolved_trades
+        max_resolved_roi = d_roi if max_resolved_roi is None else max_resolved_roi
+        daily_loss_pct = d_daily if daily_loss_pct is None else daily_loss_pct
+
+        now_utc = now.astimezone(UTC) if now is not None else datetime.now(UTC)
+        window_start = (now_utc - timedelta(days=lookback_days)).isoformat()
+        pst_now = now_utc.astimezone(SETTLEMENT_TZ)
+        day_start = (
+            pst_now.replace(hour=0, minute=0, second=0, microsecond=0)
+            .astimezone(UTC)
+            .isoformat()
+        )
 
         with self.connect() as conn:
             resolved = conn.execute(
@@ -1112,8 +1158,9 @@ class PaperStore:
                 WHERE realized_pnl IS NOT NULL
                   AND status != 'REJECTED'
                   AND COALESCE(risk_profile, 'balanced') = ?
+                  AND COALESCE(closed_at, settled_at) >= ?
                 """,
-                (profile,),
+                (profile, window_start),
             ).fetchone()
             daily = conn.execute(
                 """
@@ -1121,10 +1168,10 @@ class PaperStore:
                 FROM paper_orders
                 WHERE realized_pnl IS NOT NULL
                   AND status != 'REJECTED'
-                  AND target_date = ?
                   AND COALESCE(risk_profile, 'balanced') = ?
+                  AND COALESCE(closed_at, settled_at) >= ?
                 """,
-                (target_date, profile),
+                (profile, day_start),
             ).fetchone()
 
         trades = int(resolved[0] or 0)
@@ -1133,16 +1180,16 @@ class PaperStore:
         roi = pnl / capital if capital > 0 else 0.0
         if trades >= min_resolved_trades and roi <= max_resolved_roi:
             return (
-                f"fast-feedback paused: resolved ROI {roi:.1%} across "
-                f"{trades} paper trade(s) is below {max_resolved_roi:.0%}; "
-                "recording near-misses only"
+                f"{profile} paused: resolved ROI {roi:.1%} across "
+                f"{trades} paper trade(s) in the last {lookback_days}d is below "
+                f"{max_resolved_roi:.0%}; recording near-misses only"
             )
 
         daily_pnl = float(daily[0] or 0.0)
         daily_loss_limit = -abs(float(bankroll) * daily_loss_pct)
         if daily_pnl <= daily_loss_limit:
             return (
-                f"fast-feedback paused: daily loss ${daily_pnl:.2f} reached "
+                f"{profile} paused: daily loss ${daily_pnl:.2f} reached "
                 f"${daily_loss_limit:.2f}; recording near-misses only"
             )
         return None

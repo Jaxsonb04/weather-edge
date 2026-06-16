@@ -270,9 +270,14 @@ def _with_budget_stake(
         reasons.append(f"all-in cost {cost_per_contract:.2f} meets or exceeds the $1 contract payout")
     if edge < config.min_edge:
         reasons.append(f"edge {edge:.3f} below min {config.min_edge:.3f} after basket sizing")
-    if edge_lcb < config.min_edge_lcb:
+    # Basket legs hold to settlement, so a negative lower-bound edge is exactly
+    # the documented failure mode (3/190). Require a non-negative LCB even on
+    # profiles whose general min_edge_lcb is negative for data collection.
+    basket_edge_lcb_floor = max(0.0, config.min_edge_lcb)
+    if edge_lcb < basket_edge_lcb_floor:
         reasons.append(
-            f"lower-bound edge {edge_lcb:.3f} below min {config.min_edge_lcb:.3f} after basket sizing"
+            f"lower-bound edge {edge_lcb:.3f} below basket floor "
+            f"{basket_edge_lcb_floor:.3f} after basket sizing"
         )
     return replace(
         decision,

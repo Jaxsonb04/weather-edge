@@ -1,3 +1,4 @@
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -78,6 +79,52 @@ def test_balanced_does_not_pause_from_fast_feedback_losses():
             "balanced",
             bankroll=1000.0,
             target_date="2026-06-13",
+        ) is None
+
+
+def test_balanced_pauses_on_its_own_bad_resolved_cohort():
+    # The trading-intent profile now has its own (looser) breaker: 10 resolved
+    # balanced losers trip it on resolved ROI.
+    with TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "paper.db"
+        store = PaperStore(db_path)
+        for idx in range(10):
+            order_id = store.record_paper_order(
+                "2026-06-12",
+                _decision(f"KXHIGHTSFO-TEST-B{70 + idx}.5"),
+                risk_profile="balanced",
+            )
+            store.close_paper_order(order_id, 0.01)
+
+        reason = store.paper_entry_pause_reason(
+            "balanced", bankroll=1000.0, target_date="2026-06-13"
+        )
+        assert reason is not None
+        assert "balanced paused" in reason
+
+
+def test_resolved_pause_clears_after_the_window_ages_out():
+    # The same bad cohort no longer latches the profile off forever: evaluated
+    # far enough in the future, the losers fall outside the rolling window.
+    with TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "paper.db"
+        store = PaperStore(db_path)
+        for idx in range(10):
+            order_id = store.record_paper_order(
+                "2026-06-12",
+                _decision(f"KXHIGHTSFO-TEST-B{70 + idx}.5"),
+                risk_profile="balanced",
+            )
+            store.close_paper_order(order_id, 0.01)
+
+        # Paused now...
+        assert store.paper_entry_pause_reason(
+            "balanced", bankroll=1000.0, target_date="2026-06-13"
+        ) is not None
+        # ...but recovered once the cohort is older than the lookback window.
+        later = datetime.now(UTC) + timedelta(days=60)
+        assert store.paper_entry_pause_reason(
+            "balanced", bankroll=1000.0, target_date="2026-08-13", now=later
         ) is None
 
 

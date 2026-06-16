@@ -1106,6 +1106,29 @@ class PaperStore:
             "open_capital_at_risk": open_capital,
         }
 
+    def paper_equity(self, starting_bankroll: float, *, risk_profile: str | None = None) -> float:
+        """Live paper equity = starting bankroll + realized PnL to date.
+
+        Kelly and the percentage risk caps should fraction CURRENT wealth, not a
+        frozen notional. This is the realized-equity base used when
+        size_against_live_equity is enabled (open-position mark-to-market is left
+        out so the value is deterministic for a given settled history).
+        """
+
+        profile_filter, profile_params = _paper_profile_filter(risk_profile)
+        with self.connect() as conn:
+            row = conn.execute(
+                f"""
+                SELECT COALESCE(SUM(realized_pnl), 0)
+                FROM paper_orders
+                WHERE realized_pnl IS NOT NULL
+                  AND status != 'REJECTED'
+                  {profile_filter}
+                """,
+                tuple(profile_params),
+            ).fetchone()
+        return float(starting_bankroll) + float(row[0] or 0.0)
+
     def paper_entry_pause_reason(
         self,
         risk_profile: str | None,

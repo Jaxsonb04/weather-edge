@@ -865,6 +865,18 @@ def _resolve_analysis_targets(
     return clock_targets, {}
 
 
+def _sizing_bankroll(store: PaperStore, config: StrategyConfig, risk_profile: str | None) -> float:
+    """Bankroll used for Kelly and the risk caps.
+
+    Frozen notional by default (reproducible paper runs); live realized equity
+    when size_against_live_equity is set, so sizing fractions current wealth.
+    """
+
+    if config.size_against_live_equity:
+        return store.paper_equity(config.paper_bankroll, risk_profile=risk_profile)
+    return config.paper_bankroll
+
+
 def _rolling_targets_count() -> int:
     # Kalshi lists SFO events several days out; scanning more of them grows the
     # distinct-candidate universe (and the paper sample) without touching any
@@ -951,11 +963,13 @@ def _analyze_one_target(
         ensemble=ensemble,
         intraday=intraday,
     )
+    risk_profile = _risk_profile_name(args)
+    paper_bankroll = _sizing_bankroll(store, config, risk_profile)
     evaluator = TradeEvaluator(config)
     decisions = evaluator.rank(
         markets,
         probabilities,
-        bankroll=config.paper_bankroll,
+        bankroll=paper_bankroll,
         sides=_analysis_sides(args.side),
         source_spread_f=forecast.source_spread_f,
     )
@@ -972,11 +986,10 @@ def _analyze_one_target(
             entry_block_reason = "paper entry disabled: Kalshi event has no active markets"
         else:
             entry_allowed, entry_block_reason = _paper_entry_gate_for_target(target, forecast, intraday)
-    risk_profile = _risk_profile_name(args)
     if args.place_paper and entry_allowed:
         pause_reason = store.paper_entry_pause_reason(
             risk_profile,
-            bankroll=config.paper_bankroll,
+            bankroll=paper_bankroll,
             target_date=target.isoformat(),
         )
         if pause_reason is not None:
@@ -1013,7 +1026,7 @@ def _analyze_one_target(
         intraday=intraday,
         event=event,
         risk_profile=risk_profile,
-        bankroll=config.paper_bankroll,
+        bankroll=paper_bankroll,
     )
 
     order_ids = []
@@ -1023,7 +1036,7 @@ def _analyze_one_target(
             decisions,
             stake_dollars=args.paper_stake,
             daily_budget=daily_budget_remaining,
-            bankroll=config.paper_bankroll,
+            bankroll=paper_bankroll,
         )
 
     _print_analysis(
@@ -1076,10 +1089,12 @@ def _arbitrage_one_target(
         event_title = "No live Kalshi event found; arbitrage scan is research-only"
         market_available = False
 
+    risk_profile = _risk_profile_name(args)
+    paper_bankroll = _sizing_bankroll(store, config, risk_profile)
     opportunities = build_arbitrage_opportunities(
         markets,
         config=config,
-        bankroll=config.paper_bankroll,
+        bankroll=paper_bankroll,
         max_spend=args.max_arb_spend,
         min_profit=args.min_profit,
     )
@@ -1098,12 +1113,11 @@ def _arbitrage_one_target(
         else:
             entry_allowed, entry_block_reason = _paper_entry_gate_for_target(target, None, None)
 
-    risk_profile = _risk_profile_name(args)
     paper_trader = PaperTrader(store, config, risk_profile=risk_profile)
     if args.place_paper and entry_allowed:
         pause_reason = store.paper_entry_pause_reason(
             risk_profile,
-            bankroll=config.paper_bankroll,
+            bankroll=paper_bankroll,
             target_date=target.isoformat(),
         )
         if pause_reason is not None:
@@ -1122,7 +1136,7 @@ def _arbitrage_one_target(
                 paper_trader.place_arbitrage(
                     target.isoformat(),
                     opportunity,
-                    bankroll=config.paper_bankroll,
+                    bankroll=paper_bankroll,
                 )
             )
 
@@ -1188,13 +1202,15 @@ def _tail_basket_one_target(
         ensemble=ensemble,
         intraday=intraday,
     )
+    risk_profile = _risk_profile_name(args)
+    paper_bankroll = _sizing_bankroll(store, config, risk_profile)
     evaluator = TradeEvaluator(config)
     basket = build_tail_basket(
         markets,
         probabilities,
         predicted_high_f=forecast.predicted_high_f,
         evaluator=evaluator,
-        bankroll=config.paper_bankroll,
+        bankroll=paper_bankroll,
         tail_distance_f=args.tail_distance,
         tail_stake=args.tail_stake,
         center_stake=args.center_stake,
@@ -1218,11 +1234,10 @@ def _tail_basket_one_target(
         else:
             entry_allowed, entry_block_reason = _paper_entry_gate_for_target(target, forecast, intraday)
 
-    risk_profile = _risk_profile_name(args)
     if args.place_paper and entry_allowed:
         pause_reason = store.paper_entry_pause_reason(
             risk_profile,
-            bankroll=config.paper_bankroll,
+            bankroll=paper_bankroll,
             target_date=target.isoformat(),
         )
         if pause_reason is not None:
@@ -1244,7 +1259,7 @@ def _tail_basket_one_target(
         intraday=intraday,
         event=event,
         risk_profile=risk_profile,
-        bankroll=config.paper_bankroll,
+        bankroll=paper_bankroll,
     )
 
     order_ids = []
@@ -1257,7 +1272,7 @@ def _tail_basket_one_target(
             target.isoformat(),
             basket.decisions,
             daily_budget=None,
-            bankroll=config.paper_bankroll,
+            bankroll=paper_bankroll,
             group_id=f"BASKET-{uuid.uuid4().hex[:12]}",
         )
 

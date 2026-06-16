@@ -46,6 +46,11 @@ class StrategyConfig:
     kelly_lcb_weight: float = 1.0
     max_position_risk_pct: float = 0.01
     max_event_risk_pct: float = 0.03
+    # When True, Kelly and the percentage risk caps size against live paper
+    # equity (starting bankroll + realized PnL) instead of the frozen notional,
+    # so sizing compounds correctly after wins/losses. Off by default to keep
+    # paper runs reproducible; enable it for a real-money-shaped run.
+    size_against_live_equity: bool = False
     max_target_exposure_pct: float = 0.05
     max_entries_per_market_side: int = 1
     max_contracts_per_market: float = 25.0

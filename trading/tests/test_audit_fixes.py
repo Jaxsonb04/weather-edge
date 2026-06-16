@@ -142,6 +142,25 @@ def test_settlement_does_not_overwrite_a_closed_orders_pnl():
         assert by_id[open_id]["status"] == "PAPER_SETTLED"
 
 
+def test_paper_equity_tracks_realized_pnl_and_sizing_flag():
+    from sfo_kalshi_quant.cli import _sizing_bankroll
+    from sfo_kalshi_quant.config import StrategyConfig
+
+    with TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "paper.db"
+        store = PaperStore(db_path)
+        order_id = store.record_paper_order("2026-06-12", _yes_decision())
+        closed = store.close_paper_order(order_id, 0.20)  # a winning exit
+
+        equity = store.paper_equity(1000.0)
+        assert abs(equity - (1000.0 + closed["realized_pnl"])) < 1e-9
+
+        notional_cfg = StrategyConfig(size_against_live_equity=False)
+        equity_cfg = StrategyConfig(size_against_live_equity=True)
+        assert _sizing_bankroll(store, notional_cfg, None) == notional_cfg.paper_bankroll
+        assert abs(_sizing_bankroll(store, equity_cfg, None) - equity) < 1e-9
+
+
 def test_resting_limit_order_expires_at_settlement():
     with TemporaryDirectory() as tmp:
         db_path = Path(tmp) / "paper.db"

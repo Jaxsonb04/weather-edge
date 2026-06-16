@@ -176,6 +176,10 @@ def test_strategy_research_surfaces_resting_limit_orders():
         assert row is not None
         assert row["status"] == "PAPER_LIMIT_RESTING"
 
+        # The monitor never marks resting orders, but every scan records a
+        # decision snapshot with the live bid/ask; that mark must reach the card.
+        store.record_decisions("2026-06-15", [decision])
+
         payload = build_strategy_research(
             forecaster_root=root,
             db_path=db_path,
@@ -187,8 +191,12 @@ def test_strategy_research_surfaces_resting_limit_orders():
         assert summary["pending_limit_orders"] == 1
         assert summary["published_pending_limit_orders"] == 1
         assert summary["pending_limit_risk"] > 0
-        assert payload["paper_trading"]["pending_limit_orders"][0]["status"] == "PAPER_LIMIT_RESTING"
-        assert payload["paper_trading"]["pending_limit_orders"][0]["limit_price"] == 0.29
+        pending = payload["paper_trading"]["pending_limit_orders"][0]
+        assert pending["status"] == "PAPER_LIMIT_RESTING"
+        assert pending["limit_price"] == 0.29
+        # The current market price is now shown for resting limits.
+        assert pending["current_ask"] is not None
+        assert pending["current_bid"] is not None
         assert "resting limit" in payload["status"]["paper_trading_status"]
         assert any(
             action["status"] == "LIMIT_RESTING"

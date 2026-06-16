@@ -2381,6 +2381,19 @@
       const risk = row.initial_cost ?? row.risk;
       const limitDetail = `Fills only if the paper-visible ask reaches ${price(limitPrice)} or lower; until then this is not an open position.`;
       const costDetail = `${price(row.limit_fee_per_contract ?? row.entry_fee_per_contract)} estimated fee; ${price(row.limit_cost_per_contract ?? row.cost_per_contract)} all-in per contract.`;
+      // Current market price for a resting BUY limit: the ask is what must fall
+      // to (or below) the limit for the order to fill, so show it and the gap.
+      const currentAsk = number(row.current_ask);
+      const limitNum = number(limitPrice);
+      const gap = (currentAsk != null && limitNum != null) ? currentAsk - limitNum : null;
+      const fillTone = gap == null ? null : (gap <= 1e-9 ? 'good' : gap <= 0.03 ? 'warn' : 'bad');
+      const askDetail = currentAsk == null
+        ? 'No live ask has been marked for this market yet.'
+        : gap <= 1e-9
+          ? `The ask (${price(currentAsk)}) is already at or below your ${price(limitPrice)} limit; it should fill on the next scan.`
+          : `The ask must fall ${price(gap)} (from ${price(currentAsk)} to your ${price(limitPrice)} limit) to fill.`;
+      const fillLabel = currentAsk == null ? '—'
+        : gap <= 1e-9 ? `${price(currentAsk)} · ready` : `${price(currentAsk)} · ${price(gap)} away`;
       return `
         <article class="trade-card warn" data-order-id="${htmlEscape(row.id)}">
           <div class="trade-card-head">
@@ -2389,6 +2402,7 @@
           </div>
           <div class="trade-grid">
             ${tradeStat('Limit price', price(limitPrice), 'pending-limit', 'warn', limitDetail)}
+            ${tradeStat('Current ask', fillLabel, 'ask', fillTone, askDetail)}
             ${tradeStat('Reserved risk', money(risk || 0), 'initial-cost', null, `${fmt(row.contracts, 2)} contract(s) if filled.`)}
             ${tradeStat('All-in limit cost', price(row.limit_cost_per_contract ?? row.cost_per_contract), 'cost-per-contract', null, costDetail)}
             ${tradeStat('Contracts', fmt(row.contracts, 2), 'contract', null, 'Paper quantity reserved for this limit.')}

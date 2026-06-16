@@ -1051,7 +1051,18 @@ def _paper_payload(db_path: Path) -> dict[str, Any]:
         )
         for row in open_rows
     ]
-    pending_limit_orders = [_paper_row(row, None, monitor) for row in pending_limit_rows]
+    # Mark resting limit orders with the latest scanned bid/ask too, so the
+    # card can show the current market price and how far the ask is from the
+    # resting limit. The monitor skips resting orders, so there is no monitor
+    # mark; the decision-snapshot mark (recorded every scan) is the live price.
+    pending_limit_orders = [
+        _paper_row(
+            row,
+            decision_marks.get((row["market_ticker"], _side_from_row(row))),
+            monitor,
+        )
+        for row in pending_limit_rows
+    ]
     closed_positions = [_paper_row(row, None, monitor) for row in closed_rows]
     monitor_action_rows = [_paper_monitor_snapshot_row(row) for row in monitor_rows] + [
         _paper_action_row(row) for row in closed_action_rows

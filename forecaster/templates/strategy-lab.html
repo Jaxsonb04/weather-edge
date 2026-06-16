@@ -1939,7 +1939,15 @@
       $('summaryCounts').innerHTML = [
         countCard(`Realized P&L (${fmt(summary.window_days ?? 7)}d)`, totals.realized_pnl == null ? '-' : signedMoney(totals.realized_pnl), 'realized-pnl', realizedTone),
         countCard('Cumulative P&L', totals.cumulative_realized_pnl == null ? '-' : signedMoney(totals.cumulative_realized_pnl), 'realized-pnl', toneForValue(totals.cumulative_realized_pnl)),
-        countCard('Hit rate', totals.hit_rate == null ? '-' : pct(totals.hit_rate, 1), 'hit-rate', totals.hit_rate == null ? '' : totals.hit_rate >= 0.5 ? 'good' : 'warn'),
+        (() => {
+          // A rate is meaningless without its denominator, and a single-digit
+          // sample must not read as authoritative (the 3/190 lesson). Show the
+          // resolved count and suppress the good/warn tone below 10 resolved.
+          const resolved = (Number(totals.wins) || 0) + (Number(totals.losses) || 0);
+          const label = resolved > 0 ? `Hit rate · ${resolved} resolved` : 'Hit rate';
+          const tone = (totals.hit_rate == null || resolved < 10) ? '' : (totals.hit_rate >= 0.5 ? 'good' : 'warn');
+          return countCard(label, totals.hit_rate == null ? '-' : pct(totals.hit_rate, 1), 'hit-rate', tone);
+        })(),
         countCard('ROI', totals.roi == null ? '-' : pct(totals.roi, 1), 'roi', totals.roi == null ? '' : toneForValue(totals.roi)),
         countCard('Open risk', money(totals.open_risk || 0), 'open-risk'),
         countCard('Forecast MAE', totals.mean_abs_forecast_error_f == null ? '-' : `${fmt(totals.mean_abs_forecast_error_f, 2)}F`)
@@ -2121,6 +2129,12 @@
         score('Brier score', metrics.brier_score == null ? '-' : fmt(metrics.brier_score, 4), 'brier-score'),
         score('Log loss', metrics.log_loss == null ? '-' : fmt(metrics.log_loss, 4), 'log-loss'),
         score('Hit rate', metrics.hit_rate == null ? '-' : pct(metrics.hit_rate, 1), 'hit-rate'),
+        score('Approval rate', metrics.approval_rate == null ? '-' : pct(metrics.approval_rate, 2)),
+        // Avg lower-bound edge of approved signals: the metric that corroborates
+        // the documented negative-LCB failure (approvals with edge_lcb < 0 won
+        // only 3/190). Surfacing it lets a reader verify the gate is honest.
+        score('Avg edge LCB', metrics.avg_edge_lcb == null ? '-' : fmt(metrics.avg_edge_lcb, 3), 'lower-confidence-edge'),
+        score('Approved hit rate', metrics.approved_hit_rate == null ? '-' : pct(metrics.approved_hit_rate, 1), 'hit-rate'),
         score('Approved ROI', metrics.approved_roi == null ? '-' : pct(metrics.approved_roi, 1)),
         score('Approved P&L', metrics.approved_paper_pnl == null ? '-' : money(metrics.approved_paper_pnl)),
         score('Avg quality', metrics.avg_quality == null ? '-' : fmt(metrics.avg_quality, 1), 'quality-score')

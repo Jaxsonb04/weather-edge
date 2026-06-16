@@ -103,7 +103,18 @@ BALANCED_PROFILE_OVERRIDES = {
     "min_edge_lcb": 0.00,
     "max_spread": 0.07,
     "max_model_market_gap": 0.15,
-    "min_posterior_probability": 0.10,
+    # Balanced previously inherited conservative's strict cheap-tail floors and
+    # a 0.10 posterior minimum, so it almost never cleared a tradeable
+    # mid-priced bin (spread aside, this was the dominant volume suppressor on
+    # good-data days). These give balanced its own, looser-but-still-guarded
+    # floors so it can take mid-ladder trades, while the proven edge_lcb >= 0
+    # floor that fenced off the 3/190 negative-LCB failure is kept unchanged.
+    # PENDING: validate with a walk-forward, after-fee backtest before treating
+    # these as final for real money (see docs/codebase_audit_2026-06-15.md).
+    "min_posterior_probability": 0.07,
+    "cheap_tail_min_yes_bid_size": 10.0,
+    "cheap_tail_min_probability_lcb": 0.09,
+    "cheap_tail_min_edge_lcb": 0.03,
     "fractional_kelly": 0.10,
     "kelly_lcb_weight": 1.0,
     "max_position_risk_pct": 0.005,

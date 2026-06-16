@@ -117,6 +117,64 @@ def test_two_cent_tail_is_structurally_blocked_by_relative_spread():
     assert any("stop band" in reason for reason in decision.reasons)
 
 
+def test_balanced_admits_mid_ladder_cheap_tail_that_conservative_rejects():
+    # Identical cheap tail with a moderate (12-contract) bid: conservative
+    # requires a 25-contract bid for cheap tails and refuses it; balanced now
+    # carries its own 10-contract floor and takes the trade. Only the bid-size
+    # floor differs, so this isolates the deliberate balanced loosening.
+    market = _bin(
+        "66° to 67°",
+        yes_bid=0.04,
+        yes_ask=0.05,
+        yes_bid_size=12.0,
+        yes_ask_size=100.0,
+    )
+    probability = BucketProbability(
+        ticker=market.ticker,
+        label=market.yes_sub_title,
+        probability=0.20,
+        lower_confidence=0.14,
+        empirical_probability=0.20,
+        normal_probability=0.20,
+        effective_n=250,
+        residual_probability=0.16,
+        ensemble_probability=0.12,
+        model_probability=0.10,
+        market_probability=0.05,
+    )
+    conservative = TradeEvaluator(strategy_config_for_profile("conservative"))
+    balanced = TradeEvaluator(strategy_config_for_profile("balanced"))
+    assert not conservative.evaluate_market(market, probability, bankroll=350).approved
+    assert balanced.evaluate_market(market, probability, bankroll=350).approved
+
+
+def test_balanced_still_rejects_negative_lower_bound_edge():
+    # The loosening must not reopen the proven failure mode: a trade whose
+    # lower-confidence edge is negative is still refused under balanced.
+    market = _bin(
+        "66° to 67°",
+        yes_bid=0.39,
+        yes_ask=0.40,
+        yes_bid_size=50.0,
+        yes_ask_size=50.0,
+    )
+    probability = BucketProbability(
+        ticker=market.ticker,
+        label=market.yes_sub_title,
+        probability=0.44,
+        lower_confidence=0.34,
+        empirical_probability=0.44,
+        normal_probability=0.44,
+        effective_n=250,
+        model_probability=0.45,
+        market_probability=0.40,
+    )
+    balanced = TradeEvaluator(strategy_config_for_profile("balanced"))
+    decision = balanced.evaluate_market(market, probability, bankroll=350)
+    assert not decision.approved
+    assert any("lower-bound edge" in reason for reason in decision.reasons)
+
+
 def test_model_market_gap_blocks_disagreement_trade():
     market = _bin(
         "66° to 67°",

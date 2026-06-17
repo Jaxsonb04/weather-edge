@@ -831,20 +831,21 @@ def _signal_backtest_payload(adapter: SfoForecasterAdapter, db_path: Path) -> di
     }
 
 
-def _is_live_candidate(row: dict[str, Any], today: Any) -> bool:
+def _is_live_candidate(row: dict[str, Any]) -> bool:
     """A candidate is "live" only if it could actually be traded right now.
 
-    Resolved markets sit at ask ~ $1.00 (no tradeable edge) and past target
-    dates have already settled. Counting those as rejected candidates made the
-    live snapshot read "0 of 24 approved" when ~8 of the 24 were resolved
-    past-date markets that were never tradeable -- an unfair denominator. This
-    drops them so the approval rate is honest. It is a display/denominator fix
-    only; it does not change which trades the scanner takes. See
-    docs/trading_engine_diagnosis_2026-06-16.md (Finding 4).
+    A resolved market sits at ask ~ $1.00 (no tradeable edge), so counting those
+    as rejected candidates made the live snapshot read "0 of 24 approved" when
+    ~8 of the 24 were already-resolved markets that were never tradeable -- an
+    unfair denominator. Dropping them makes the approval rate honest. This is a
+    display/denominator fix only; it does not change which trades the scanner
+    takes. See docs/trading_engine_diagnosis_2026-06-16.md (Finding 4).
+
+    The ask ceiling is used instead of a wall-clock target-date cut on purpose:
+    a date comparison would wrongly empty the candidate list overnight before the
+    day's market opens, and _latest_decision_rows already restricts to the most
+    recent target dates, so the only stale rows left are resolved ones at ~$1.00.
     """
-    target = _date_from_string(row.get("target_date"))
-    if target is not None and today is not None and target < today:
-        return False
     ask = row.get("ask")
     if isinstance(ask, (int, float)) and ask >= 0.999:
         return False
@@ -858,9 +859,8 @@ def _signal_quality_payload(db_path: Path, trading_signal: dict[str, Any] | None
         decisions = _decisions_from_trading_signal(trading_signal)
         source = "trading_signal.json"
 
-    today = settlement_today()
     pre_filter_count = len(decisions)
-    decisions = [row for row in decisions if _is_live_candidate(row, today)]
+    decisions = [row for row in decisions if _is_live_candidate(row)]
     stale_filtered = pre_filter_count - len(decisions)
 
     decisions.sort(

@@ -8,6 +8,7 @@ from sfo_kalshi_quant.probability import (
     _market_implied_probabilities,
     _market_prior_reliability,
     _model_weight,
+    _normalize_weather_probabilities,
 )
 from sfo_kalshi_quant.standard_bins import standard_sfo_bins
 
@@ -201,3 +202,28 @@ def test_predawn_intraday_does_not_crush_high_bracket_tails():
     assert top.intraday_probability > 0.05
     # The blended weather probability must not collapse to near-zero either.
     assert top.probability > 0.05
+
+
+def test_normalize_weather_probabilities_zero_mass_returns_uniform():
+    # When the intraday blend zeroes every bucket, the old code returned the
+    # un-normalized (sum==0) list, silently zeroing every bucket's edge. The fix
+    # falls back to a uniform prior so the vector still sums to 1.
+    markets = standard_sfo_bins()[:3]
+    rows = [(market, 0.0, 0.0, 0.0, None) for market in markets]
+    out = _normalize_weather_probabilities(rows)
+    probs = [p for _, p, _, _, _ in out]
+    assert abs(sum(probs) - 1.0) < 1e-9
+    assert all(abs(p - 1.0 / len(markets)) < 1e-12 for p in probs)
+
+
+def test_normalize_weather_probabilities_empty_returns_empty():
+    assert _normalize_weather_probabilities([]) == []
+
+
+def test_normalize_weather_probabilities_preserves_positive_mass():
+    markets = standard_sfo_bins()[:2]
+    rows = [(markets[0], 1.0, 0.0, 0.0, None), (markets[1], 3.0, 0.0, 0.0, None)]
+    out = _normalize_weather_probabilities(rows)
+    probs = [p for _, p, _, _, _ in out]
+    assert abs(probs[0] - 0.25) < 1e-9
+    assert abs(probs[1] - 0.75) < 1e-9

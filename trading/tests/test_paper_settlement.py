@@ -13,6 +13,8 @@ from sfo_kalshi_quant.db import PaperStore
 from sfo_kalshi_quant.models import ForecastSnapshot, IntradaySnapshot, MarketBin, TradeDecision
 from sfo_kalshi_quant.paper import PaperTrader
 
+from support import pre_resolution_event
+
 
 def test_settle_paper_orders_computes_realized_pnl():
     with TemporaryDirectory() as tmp:
@@ -96,7 +98,11 @@ def test_recorded_decisions_backtest_against_settlements():
             cap_strike=69.0,
         )
 
-        store.record_decisions("2026-06-03", [approved, rejected])
+        store.record_decisions(
+            "2026-06-03",
+            [approved, rejected],
+            event=pre_resolution_event([approved, rejected]),
+        )
         summary = store.signal_backtest_summary({"2026-06-03": 67.0})
 
         assert summary["signals"] == 2.0
@@ -157,8 +163,8 @@ def test_signal_backtest_dedupes_repeated_scans_by_default():
             cap_strike=67.0,
         )
 
-        store.record_decisions("2026-06-03", [first])
-        store.record_decisions("2026-06-03", [latest])
+        store.record_decisions("2026-06-03", [first], event=pre_resolution_event([first]))
+        store.record_decisions("2026-06-03", [latest], event=pre_resolution_event([latest]))
 
         summary = store.signal_backtest_summary({"2026-06-03": 67.0})
         all_rows = store.signal_backtest_summary({"2026-06-03": 67.0}, sample_mode="all")
@@ -1063,9 +1069,9 @@ def test_signal_backtest_entry_mode_keeps_first_approved_row():
             trade_quality_score=90.0,
         )
 
-        store.record_decisions("2026-06-03", [base])
-        store.record_decisions("2026-06-03", [entry])
-        store.record_decisions("2026-06-03", [later])
+        store.record_decisions("2026-06-03", [base], event=pre_resolution_event([base]))
+        store.record_decisions("2026-06-03", [entry], event=pre_resolution_event([entry]))
+        store.record_decisions("2026-06-03", [later], event=pre_resolution_event([later]))
 
         entry_summary = store.signal_backtest_summary(
             {"2026-06-03": 67.0}, sample_mode="entry-per-market-side"
@@ -1107,7 +1113,7 @@ def test_signal_backtest_separates_probability_streams():
             market_probability=0.40,
         )
 
-        store.record_decisions("2026-06-03", [decision])
+        store.record_decisions("2026-06-03", [decision], event=pre_resolution_event([decision]))
         summary = store.signal_backtest_summary({"2026-06-03": 67.0})
 
         streams = summary["probability_streams"]
@@ -1115,3 +1121,47 @@ def test_signal_backtest_separates_probability_streams():
         assert round(streams["weather_model"]["brier_score"], 4) == round((0.80 - 1.0) ** 2, 4)
         assert round(streams["market_prior"]["brier_score"], 4) == round((0.40 - 1.0) ** 2, 4)
         assert streams["weather_model"]["settled"] == 1.0
+
+
+def test_signal_backtest_excludes_null_close_time_recorded_now():
+    # A decision recorded without an event carries market_close_time = NULL.
+    # created_at is wall-clock "now" while target_date is in the past, so the row
+    # cannot be proven to predate market close -- the look-ahead guard must
+    # exclude it by default (otherwise a decision recorded after the market
+    # resolved would leak into the backtest). It is only scored when
+    # post-resolution rows are explicitly included.
+    with TemporaryDirectory() as tmp:
+        store = PaperStore(Path(tmp) / "paper.db")
+        decision = TradeDecision(
+            ticker="KXHIGHTSFO-TEST-B66.5",
+            label="66° to 67°",
+            action="BUY_YES",
+            approved=True,
+            probability=0.70,
+            probability_lcb=0.60,
+            yes_bid=0.20,
+            yes_ask=0.30,
+            spread=0.10,
+            fee_per_contract=0.01,
+            cost_per_contract=0.31,
+            edge=0.39,
+            edge_lcb=0.29,
+            kelly_fraction=0.02,
+            recommended_contracts=10.0,
+            expected_profit=3.9,
+            reasons=[],
+            trade_quality_score=72.0,
+            strike_type="between",
+            floor_strike=66.0,
+            cap_strike=67.0,
+        )
+        store.record_decisions("2026-06-03", [decision])  # no event -> NULL close_time
+
+        strict = store.signal_backtest_summary({"2026-06-03": 67.0})
+        included = store.signal_backtest_summary(
+            {"2026-06-03": 67.0}, pre_resolution_only=False
+        )
+
+        assert strict["signals"] == 0.0
+        assert strict["excluded_post_resolution_signals"] == 1.0
+        assert included["signals"] == 1.0

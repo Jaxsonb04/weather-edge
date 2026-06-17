@@ -312,6 +312,24 @@ def _profile_daily_summary(
         "window_start": daily_summary.get("window_start"),
         "window_end": daily_summary.get("window_end"),
         "bankroll": daily_summary.get("bankroll"),
+        # Per-profile live equity = the shared starting notional + this profile's
+        # all-time realized PnL (paper_total["realized_pnl"], the same value the
+        # cumulative_realized_pnl total uses). Without these the equity card on a
+        # profile tab fell back to "-" because only the aggregate carried them.
+        "starting_bankroll": daily_summary.get(
+            "starting_bankroll", daily_summary.get("bankroll")
+        ),
+        "current_equity": _round(
+            _to_float(daily_summary.get("starting_bankroll", daily_summary.get("bankroll")))
+            + _to_float(paper_total.get("realized_pnl")),
+            2,
+        ),
+        # Profile-scoped YES/NO split and exit-reason mix so these cards render on
+        # a profile tab, not just the All-profiles overview (the template reads
+        # these field names directly).
+        "side_performance": (daily_summary.get("side_performance_by_profile") or {}).get(name)
+        or {},
+        "exit_reasons": (daily_summary.get("exit_reasons_by_profile") or {}).get(name) or {},
         "risk_profile": name,
         "days": days,
         "totals": totals,

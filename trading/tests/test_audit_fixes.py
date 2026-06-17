@@ -6,6 +6,7 @@ resting limit orders expiring at settlement instead of leaking forever.
 """
 
 from contextlib import redirect_stdout
+from dataclasses import replace
 from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -179,3 +180,68 @@ def test_resting_limit_order_expires_at_settlement():
         assert row["status"] == "PAPER_EXPIRED"
         assert row["realized_pnl"] == 0.0
         assert row["settled_at"] is not None
+
+
+def _one_contract_yes(ticker: str, yes_ask: float) -> TradeDecision:
+    return replace(_yes_decision(ticker, yes_ask=yes_ask), recommended_contracts=1.0)
+
+
+def test_break_even_close_is_undecided_not_counted_as_a_loss():
+    # A YES entry at 0.30 costs 0.32 (0.30 ask + 0.02 fee). Selling at 0.34 nets
+    # 0.34 - 0.02 exit fee = 0.32 = exactly the entry cost, so realized_pnl == 0.
+    with TemporaryDirectory() as tmp:
+        store = PaperStore(Path(tmp) / "paper.db")
+        win_id = store.record_paper_order("2026-06-12", _one_contract_yes("KXHIGHTSFO-TEST-WIN", 0.30))
+        be_id = store.record_paper_order("2026-06-12", _one_contract_yes("KXHIGHTSFO-TEST-BE", 0.30))
+
+        store.close_paper_order(win_id, 0.50)  # clear profit
+        be_row = store.close_paper_order(be_id, 0.34)  # exact break-even
+
+        assert abs(be_row["realized_pnl"]) < 1e-9
+        # Break-even is undecided: resolved_yes stays NULL instead of being
+        # coerced to a loss by the old realized_pnl > 0 fallback.
+        assert be_row["resolved_yes"] is None
+
+        summary = store.market_backtest_summary()
+        # Both closes deployed capital, so both are realized orders...
+        assert summary["orders"] == 2
+        # ...but the hit-rate denominator excludes the undecided break-even, so
+        # the one decided trade (a win) gives 1.0, not 0.5 (the old bug bucketed
+        # the break-even as a loss).
+        assert summary["hit_rate"] == 1.0
+
+
+def test_decided_close_records_resolved_yes_per_side():
+    with TemporaryDirectory() as tmp:
+        store = PaperStore(Path(tmp) / "paper.db")
+        yes_id = store.record_paper_order("2026-06-12", _one_contract_yes("KXHIGHTSFO-TEST-Y", 0.30))
+        no_decision = replace(
+            _one_contract_yes("KXHIGHTSFO-TEST-N", 0.30),
+            action="BUY_NO",
+            side="NO",
+            entry_ask=0.30,
+        )
+        no_id = store.record_paper_order("2026-06-12", no_decision)
+
+        yes_row = store.close_paper_order(yes_id, 0.50)  # YES position profits
+        no_row = store.close_paper_order(no_id, 0.50)  # NO position profits
+
+        # A winning YES close resolved YES; a winning NO close resolved NO (0).
+        assert yes_row["realized_pnl"] > 0 and yes_row["resolved_yes"] == 1
+        assert no_row["realized_pnl"] > 0 and no_row["resolved_yes"] == 0
+
+
+def test_settle_is_noop_when_filled_order_already_closed():
+    # The monitor close and settle run on the same DB; once a filled order is
+    # closed, settle must not re-touch it (count it) -- the BEGIN IMMEDIATE read
+    # sees the closed row and the status guard makes the UPDATE a no-op.
+    with TemporaryDirectory() as tmp:
+        store = PaperStore(Path(tmp) / "paper.db")
+        order_id = store.record_paper_order("2026-06-12", _yes_decision())
+        store.close_paper_order(order_id, 0.20)
+
+        settled = store.settle_paper_orders("2026-06-12", 80.0)
+
+        assert settled == 0
+        row = store.paper_orders(50)[0]
+        assert row["status"] == "PAPER_CLOSED"

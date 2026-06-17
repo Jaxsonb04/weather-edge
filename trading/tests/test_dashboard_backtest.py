@@ -8,6 +8,8 @@ from sfo_kalshi_quant.db import PaperStore
 from sfo_kalshi_quant.models import TradeDecision
 from sfo_kalshi_quant.strategy_research import _signal_backtest_payload
 
+from support import pre_resolution_event
+
 
 class _StubAdapter:
     def __init__(self, settlements):
@@ -50,8 +52,10 @@ def test_dashboard_backtest_uses_entry_mode_so_approved_signals_are_not_zeroed()
         # The actual entry (approved), then a later decayed scan (rejected) for the
         # same market-side. latest-per-market-side would keep the decayed row and
         # report 0 approved; entry-per-market-side keeps the entry.
-        store.record_decisions("2026-06-03", [_decision(approved=True, prob=0.70, edge=0.39, edge_lcb=0.29, quality=70.0)])
-        store.record_decisions("2026-06-03", [_decision(approved=False, prob=0.50, edge=-0.01, edge_lcb=-0.11, quality=20.0)])
+        entry = _decision(approved=True, prob=0.70, edge=0.39, edge_lcb=0.29, quality=70.0)
+        decayed = _decision(approved=False, prob=0.50, edge=-0.01, edge_lcb=-0.11, quality=20.0)
+        store.record_decisions("2026-06-03", [entry], event=pre_resolution_event([entry]))
+        store.record_decisions("2026-06-03", [decayed], event=pre_resolution_event([decayed]))
 
         payload = _signal_backtest_payload(_StubAdapter({"2026-06-03": 67.0}), db_path)
 

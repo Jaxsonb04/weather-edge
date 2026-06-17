@@ -61,7 +61,14 @@ def build_paper_summary(
             day_profile = _day_profile(day, profile)
             day_profile["opened"] += 1
             day_profile["opened_spend"] += spend
-        if resolved_day in per_day and pnl is not None:
+        # PAPER_EXPIRED rows are resting limits that never filled (realized_pnl
+        # 0.0); they resolved no position, so they must not inflate the settled
+        # count or the hit-rate denominator as phantom non-wins.
+        if (
+            resolved_day in per_day
+            and pnl is not None
+            and order["status"] != "PAPER_EXPIRED"
+        ):
             day = per_day[resolved_day]
             day["realized_pnl"] += pnl
             day["resolved_spend"] += spend

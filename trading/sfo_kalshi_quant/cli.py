@@ -8,7 +8,7 @@ import uuid
 from dataclasses import replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 
 from .backtest import run_walk_forward_calibration_backtest
 from .arbitrage import ArbitrageOpportunity, build_arbitrage_opportunities
@@ -52,7 +52,7 @@ from .forecast import (
     parse_target_date,
     parse_target_dates,
 )
-from .kalshi import KalshiPublicClient, load_event_snapshots
+from .kalshi import KalshiPublicClient, KalshiUnavailable, load_event_snapshots
 from .models import (
     EnsembleSnapshot,
     EventSnapshot,
@@ -1961,7 +1961,21 @@ def cmd_paper_monitor(args: argparse.Namespace) -> int:
         stop_loss = stop_loss_pct / 100.0
         try:
             market = client.get_market(row["market_ticker"])
-        except Exception as exc:
+        except HTTPError as exc:
+            # An expired/invalid API key (401/403) must NOT be masked as a benign
+            # transient HOLD -- that would silently leave every open position
+            # unmanaged. Surface it loudly by re-raising; transient 4xx (e.g. a
+            # 404 on a delisted market) stay a per-order FETCH_FAILED.
+            if exc.code in (401, 403):
+                raise
+            reason = f"market fetch failed (HTTP {exc.code})"
+            store.record_monitor_snapshot(row, side=side, action="FETCH_FAILED", reason=reason)
+            print(f"HOLD order {row['id']} {row['market_ticker']} {side}: {reason}")
+            continue
+        except (KalshiUnavailable, URLError, OSError, TimeoutError) as exc:
+            # Genuinely transient network failures: hold this position and move on.
+            # Non-network exceptions (e.g. a programming bug) now propagate instead
+            # of being swallowed into a phantom HOLD across the whole book.
             reason = f"market fetch failed ({type(exc).__name__})"
             store.record_monitor_snapshot(row, side=side, action="FETCH_FAILED", reason=reason)
             print(f"HOLD order {row['id']} {row['market_ticker']} {side}: {reason}")

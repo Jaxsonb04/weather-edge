@@ -664,3 +664,133 @@ def test_dataset_research_summary_derives_actionable_legacy_verdict():
     assert "market gate: 0 after-cost trade rows; needs 30" in summary["blocking_gates"]
     assert summary["dataset_stack"]["reason"].startswith("Combined dataset stack is waiting")
     assert summary["candidates"][0]["next_use"].startswith("Keep collecting")
+
+
+def test_signal_quality_filters_resolved_candidates_from_both_extremes():
+    """Resolved markets (winner ask~1.00 AND loser ask~0.00) are dropped from the
+    candidate denominator; a live market (ask on the 1c..99c grid) survives."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "forecaster"
+        db_path = Path(tmp) / "trading" / "paper.db"
+        _write_lstm_fixture(root)
+        _write_settlement(root)
+
+        store = PaperStore(db_path)
+        live = replace(_approved_decision(), ticker="KXHIGHTSFO-TEST-LIVE", entry_ask=0.30)
+        resolved_winner = replace(_approved_decision(), ticker="KXHIGHTSFO-TEST-WIN", entry_ask=0.999)
+        resolved_loser = replace(_approved_decision(), ticker="KXHIGHTSFO-TEST-LOSS", entry_ask=0.001)
+        store.record_decisions("2026-06-03", [live, resolved_winner, resolved_loser])
+
+        payload = build_strategy_research(
+            forecaster_root=root,
+            db_path=db_path,
+            calibration_min_train=40,
+        )
+
+        signal = payload["signal_quality"]
+        assert signal["stale_candidates_filtered"] == 2
+        assert {c["ticker"] for c in signal["latest_candidates"]} == {"KXHIGHTSFO-TEST-LIVE"}
+
+
+def test_recent_monitor_actions_dedup_to_latest_per_order_and_flag_unrealized():
+    """A position that HOLDs across several monitor cycles collapses to one
+    inspection row per order, flagged as an unrealized (open) mark."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "forecaster"
+        db_path = Path(tmp) / "trading" / "paper.db"
+        _write_lstm_fixture(root)
+        _write_settlement(root)
+
+        store = PaperStore(db_path)
+        first = _approved_decision()
+        second = replace(
+            first,
+            ticker="KXHIGHTSFO-TEST-B67.5",
+            label="67 to 68",
+            floor_strike=67.0,
+            cap_strike=68.0,
+        )
+        store.record_decisions("2026-06-03", [first, second])
+        store.record_paper_order("2026-06-03", first)
+        store.record_paper_order("2026-06-03", second)
+        orders = store.open_paper_orders(5)
+        assert len(orders) == 2
+        for cycle in range(3):
+            for order in orders:
+                store.record_monitor_snapshot(
+                    order,
+                    side="YES",
+                    action="HOLD",
+                    reason="inside exit bands",
+                    market_status="active",
+                    live_bid=0.60 + cycle * 0.01,
+                    exit_fee_per_contract=0.02,
+                    net_exit_per_contract=0.58,
+                    unrealized_pnl=2.70,
+                    unrealized_roi=0.87,
+                )
+
+        payload = build_strategy_research(
+            forecaster_root=root,
+            db_path=db_path,
+            calibration_min_train=40,
+        )
+
+        monitor_rows = [
+            row
+            for row in payload["paper_trading"]["recent_monitor_actions"]
+            if row.get("unrealized")
+        ]
+        ids = [row["id"] for row in monitor_rows]
+        # 6 snapshots (2 orders x 3 cycles) dedup to one inspection per order.
+        assert len(monitor_rows) == 2
+        assert len(ids) == len(set(ids))
+        assert all(row["status"] == "HOLD" for row in monitor_rows)
+
+
+def _settlement_alerts(target_date: str, *, now: datetime):
+    """Run _strategy_alerts against a single unresolved past target on an
+    injected clock, isolating the settlement branch (no open positions)."""
+    return _strategy_alerts(
+        paper={
+            "available": True,
+            "summary": {
+                "open_positions": 0,
+                "unresolved_past_targets": [
+                    {"target_date": target_date, "open_orders": 1}
+                ],
+            },
+            "duplicate_open_groups": [],
+        },
+        entry_block_reason=None,
+        now=now,
+    )
+
+
+def test_settlement_alert_is_a_benign_warning_during_normal_overnight_lag():
+    """A target that was yesterday is in normal settlement lag (the official
+    CLISFO high publishes the morning after), so it must read as a 'pending'
+    warning, not a CRITICAL 'backlog' false alarm."""
+    # 12:00 UTC == 04:00 fixed-PST, so settlement_today == 2026-06-12.
+    now = datetime(2026, 6, 12, 12, 0, tzinfo=UTC)
+
+    alerts = _settlement_alerts("2026-06-11", now=now)
+    by_code = {alert["code"]: alert for alert in alerts}
+
+    assert "settlement-pending" in by_code
+    assert "settlement-backlog" not in by_code
+    assert by_code["settlement-pending"]["level"] == "warning"
+
+
+def test_settlement_alert_escalates_to_critical_when_two_days_stale():
+    """A target >= 2 days past settlement means the settlement-high lookup
+    genuinely failed; that is a real CRITICAL backlog."""
+    now = datetime(2026, 6, 12, 12, 0, tzinfo=UTC)
+
+    alerts = _settlement_alerts("2026-06-09", now=now)
+    by_code = {alert["code"]: alert for alert in alerts}
+
+    assert "settlement-backlog" in by_code
+    assert "settlement-pending" not in by_code
+    assert by_code["settlement-backlog"]["level"] == "critical"
+    assert "3 days" in by_code["settlement-backlog"]["detail"]

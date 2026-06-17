@@ -834,20 +834,26 @@ def _signal_backtest_payload(adapter: SfoForecasterAdapter, db_path: Path) -> di
 def _is_live_candidate(row: dict[str, Any]) -> bool:
     """A candidate is "live" only if it could actually be traded right now.
 
-    A resolved market sits at ask ~ $1.00 (no tradeable edge), so counting those
-    as rejected candidates made the live snapshot read "0 of 24 approved" when
-    ~8 of the 24 were already-resolved markets that were never tradeable -- an
-    unfair denominator. Dropping them makes the approval rate honest. This is a
-    display/denominator fix only; it does not change which trades the scanner
-    takes. See docs/trading_engine_diagnosis_2026-06-16.md (Finding 4).
+    A resolved market sits at the price grid's extremes -- the winning side at
+    ask ~ $1.00, the losing side at ask ~ $0.00 -- with no tradeable edge either
+    way, so counting those as rejected candidates made the live snapshot read
+    "0 of 24 approved" when ~8 of the 24 were already-resolved markets that were
+    never tradeable: an unfair denominator. Dropping them makes the approval rate
+    honest. This is a display/denominator fix only; it does not change which
+    trades the scanner takes. See docs/trading_engine_diagnosis_2026-06-16.md
+    (Finding 4).
 
-    The ask ceiling is used instead of a wall-clock target-date cut on purpose:
-    a date comparison would wrongly empty the candidate list overnight before the
+    Both extremes are filtered (not just the $1.00 winner) so the denominator is
+    symmetric -- a resolved market where the model's selected side LOST sits at
+    ask ~ $0.00 and is just as untradeable. Live Kalshi asks live on the 1c..99c
+    grid, so the 0.001 / 0.999 bounds never catch a genuinely live market. An
+    ask ceiling is used instead of a wall-clock target-date cut on purpose: a
+    date comparison would wrongly empty the candidate list overnight before the
     day's market opens, and _latest_decision_rows already restricts to the most
-    recent target dates, so the only stale rows left are resolved ones at ~$1.00.
+    recent target dates.
     """
     ask = row.get("ask")
-    if isinstance(ask, (int, float)) and ask >= 0.999:
+    if isinstance(ask, (int, float)) and (ask >= 0.999 or ask <= 0.001):
         return False
     return True
 
@@ -2369,15 +2375,48 @@ def _strategy_alerts(
             f"{row.get('target_date')} ({int(row.get('open_orders') or 0)})"
             for row in unresolved_targets[:4]
         )
-        alerts.append(
-            _alert(
-                "critical",
-                "settlement-backlog",
-                "Settlement backlog",
-                f"Open paper positions remain for completed target dates: {target_text}.",
-                "Run paper-auto-settle or inspect CLISFO settlement lookup.",
+        # A paper position settles the MORNING AFTER its target date, once the NWS
+        # CLISFO daily climate report for that date is published (it cannot exist
+        # earlier -- the day's high is not known until the day ends). So a position
+        # whose target was yesterday is in NORMAL settlement lag, not a failure: the
+        # paper-settle timer clears it within hours. Flagging that benign, expected
+        # state as a CRITICAL "backlog" is a false alarm. Escalate to critical only
+        # when a target is >= 2 days stale, i.e. the settlement-high lookup genuinely
+        # failed to resolve it. See docs/trading_engine_diagnosis_2026-06-16.md.
+        # Use the injected clock (current_utc) so the age threshold is testable and
+        # consistent with _entry_block_reason rather than reading the wall clock.
+        today = settlement_today(current_utc)
+        ages = []
+        for row in unresolved_targets:
+            parsed = _date_from_string(row.get("target_date"))
+            if parsed is not None:
+                ages.append((today - parsed).days)
+        max_age = max(ages, default=1)
+        if max_age >= 2:
+            alerts.append(
+                _alert(
+                    "critical",
+                    "settlement-backlog",
+                    "Settlement backlog",
+                    f"Paper positions are up to {max_age} days past settlement for completed "
+                    f"target dates: {target_text}. The settlement-high lookup could not resolve "
+                    f"them from CLISFO or WeatherEdge ground truth.",
+                    "Run paper-auto-settle (it backfills older CLISFO versions) or inspect the "
+                    "settlement source for those dates.",
+                )
             )
-        )
+        else:
+            alerts.append(
+                _alert(
+                    "warning",
+                    "settlement-pending",
+                    "Settlement pending",
+                    f"Positions for {target_text} are awaiting the official CLISFO high, which "
+                    f"publishes the morning after the target date. Auto-settle resolves them on "
+                    f"its next run.",
+                    "No action needed; the paper-settle timer settles these automatically.",
+                )
+            )
 
     duplicate_groups = paper.get("duplicate_open_groups") or []
     if duplicate_groups:

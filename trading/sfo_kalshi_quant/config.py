@@ -173,6 +173,10 @@ EXPLORATORY_PROFILE_OVERRIDES = {
     # much smaller size. Structural gates (relative spread, re-entry cap,
     # target exposure) stay identical to balanced.
     **BALANCED_PROFILE_OVERRIDES,
+    # Don't inherit balanced's live-equity sizing: this paper-data profile is
+    # deliberately tiny and frozen-notional, so keep the flag explicit here
+    # rather than letting it leak in via the spread above.
+    "size_against_live_equity": False,
     "min_edge": 0.01,
     "min_edge_lcb": -0.01,
     "max_spread": 0.08,
@@ -196,6 +200,9 @@ FAST_FEEDBACK_PROFILE_OVERRIDES = {
     # while position size is capped hard enough that bad research ideas stay
     # small in the paper journal.
     **BALANCED_PROFILE_OVERRIDES,
+    # Don't inherit balanced's live-equity sizing: fast-feedback stays tiny and
+    # frozen-notional so a bad research idea can't compound; keep it explicit.
+    "size_against_live_equity": False,
     "min_edge": 0.005,
     # Frequency retune (2026-06-16, see docs/trading_engine_diagnosis_2026-06-16.md).
     # The lower-bound-edge floor was the single most-binding gate: it rejected

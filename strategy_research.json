@@ -5,27 +5,27 @@
     "counts": {
       "approved_pre_resolution_signals": 290,
       "approved_raw_signals": 290,
-      "approved_signals": 0,
+      "approved_signals": 19,
       "deduped_signals": 132,
       "excluded_post_resolution_signals": 0,
       "pre_resolution_signals": 23900,
       "raw_signals": 23900,
       "settled_signals": 120
     },
-    "dedupe_explanation": "Repeated 15-minute AWS scans are counted once per target, market, and side by default, using the latest pre-resolution row.",
+    "dedupe_explanation": "Repeated 15-minute AWS scans are counted once per target, market, and side, using the first approved (entry) snapshot so approved metrics reflect trades actually taken, not the decayed last scan.",
     "metrics": {
-      "approval_rate": 0.0,
-      "approved_capital_at_risk": 0.0,
-      "approved_hit_rate": 0.0,
-      "approved_paper_pnl": 0.0,
-      "approved_roi": 0.0,
-      "avg_edge": -0.1119,
-      "avg_edge_lcb": -0.1776,
-      "avg_probability": 0.5,
-      "avg_quality": 31.4,
-      "brier_score": 0.0372,
+      "approval_rate": 0.1439,
+      "approved_capital_at_risk": 26.97,
+      "approved_hit_rate": 0.7368,
+      "approved_paper_pnl": 4.03,
+      "approved_roi": 0.1494,
+      "avg_edge": -0.1938,
+      "avg_edge_lcb": -0.3112,
+      "avg_probability": 0.5037,
+      "avg_quality": 30.0,
+      "brier_score": 0.1025,
       "hit_rate": 0.5,
-      "log_loss": 0.1333
+      "log_loss": 0.3493
     },
     "metrics_available": true,
     "pre_resolution_only": true,
@@ -34,44 +34,44 @@
         "approved": 0.0,
         "approved_pnl": 0,
         "approved_roi": 0.0,
-        "avg_probability": 0.2754,
-        "brier_score": 0.0456,
-        "count": 44.0,
+        "avg_probability": 0.4204,
+        "brier_score": 0.1002,
+        "count": 39.0,
         "range": "0-20",
-        "win_rate": 0.2727
+        "win_rate": 0.4103
       },
       {
-        "approved": 0.0,
-        "approved_pnl": 0,
-        "approved_roi": 0.0,
-        "avg_probability": 0.3917,
-        "brier_score": 0.0356,
-        "count": 35.0,
+        "approved": 3.0,
+        "approved_pnl": 1.01,
+        "approved_roi": 0.1264,
+        "avg_probability": 0.4478,
+        "brier_score": 0.0744,
+        "count": 51.0,
         "range": "20-40",
-        "win_rate": 0.4571
+        "win_rate": 0.4902
       },
       {
-        "approved": 0.0,
-        "approved_pnl": 0,
-        "approved_roi": 0.0,
-        "avg_probability": 0.7798,
-        "brier_score": 0.039,
-        "count": 31.0,
+        "approved": 13.0,
+        "approved_pnl": 2.78,
+        "approved_roi": 0.1714,
+        "avg_probability": 0.7278,
+        "brier_score": 0.1708,
+        "count": 26.0,
         "range": "40-60",
-        "win_rate": 0.7097
+        "win_rate": 0.6538
       },
       {
-        "approved": 0.0,
-        "approved_pnl": 0,
-        "approved_roi": 0.0,
-        "avg_probability": 1.0,
-        "brier_score": 0.0,
-        "count": 10.0,
+        "approved": 3.0,
+        "approved_pnl": 0.24,
+        "approved_roi": 0.087,
+        "avg_probability": 0.5724,
+        "brier_score": 0.0394,
+        "count": 4.0,
         "range": "60-80",
-        "win_rate": 1.0
+        "win_rate": 0.5
       }
     ],
-    "sample_mode": "latest-per-market-side"
+    "sample_mode": "entry-per-market-side"
   },
   "calibration_comparison": {
     "active": {
@@ -748,6 +748,12 @@
         "wins": 3
       }
     ],
+    "exit_reasons": {
+      "closed_stop_loss": 5,
+      "closed_take_profit": 2,
+      "expired_unfilled": 1,
+      "held_to_settlement": 12
+    },
     "gate_behavior": {
       "approved": 243,
       "by_profile": [
@@ -829,7 +835,7 @@
         }
       ]
     },
-    "generated_at": "2026-06-17T11:26:35.711958+00:00",
+    "generated_at": "2026-06-17T11:27:58.169178+00:00",
     "learnings": [
       "Lower-bound edge split: edge_lcb<0 trades netted $+1.71 (8 trades) vs edge_lcb>=0 at $+0.34 (12 trades).",
       "NO side: 14/18 won, net $+2.59 this window.",
@@ -874,6 +880,26 @@
       "Mean absolute forecast error is 3.51F; review source weights and recent Google/NWS disagreement before trusting tail bins."
     ],
     "schema_version": 1,
+    "side_performance": {
+      "NO": {
+        "capital": 27.84,
+        "hit_rate": 0.8235,
+        "losses": 3,
+        "realized_pnl": 2.59,
+        "roi": 0.093,
+        "trades": 17,
+        "wins": 14
+      },
+      "YES": {
+        "capital": 0.91,
+        "hit_rate": 0.0,
+        "losses": 2,
+        "realized_pnl": -0.54,
+        "roi": -0.5934,
+        "trades": 2,
+        "wins": 0
+      }
+    },
     "starting_bankroll": 1000.0,
     "totals": {
       "capital_resolved": 33.51,
@@ -1090,7 +1116,7 @@
   },
   "default_profile": "balanced",
   "disclaimer": "Paper-trading research only. The active AWS execution calibration remains pinned to lstm; this artifact does not place live orders.",
-  "generated_at": "2026-06-17T11:26:35.974618+00:00",
+  "generated_at": "2026-06-17T11:27:58.440402+00:00",
   "live_orders_enabled": false,
   "mode": "paper_research_only",
   "paper_trading": {
@@ -4416,7 +4442,7 @@
           "rejected": 10520,
           "top_rejections": []
         },
-        "generated_at": "2026-06-17T11:26:35.711958+00:00",
+        "generated_at": "2026-06-17T11:27:58.169178+00:00",
         "learnings": [
           "balanced resolved 3 trade(s): 3W / 0L, net $+0.92.",
           "balanced has 11 current signal candidate(s) in the latest artifact."
@@ -5636,7 +5662,7 @@
           "rejected": 10317,
           "top_rejections": []
         },
-        "generated_at": "2026-06-17T11:26:35.711958+00:00",
+        "generated_at": "2026-06-17T11:27:58.169178+00:00",
         "learnings": [
           "fast-feedback resolved 16 trade(s): 11W / 5L, net $+1.13.",
           "fast-feedback has 13 current signal candidate(s) in the latest artifact.",
@@ -8931,7 +8957,7 @@
     "deduped_signal_count": 132,
     "entry_scanner_reason": null,
     "entry_scanner_status": "Entry scanner active for eligible target dates.",
-    "last_updated": "2026-06-17T11:26:35.974595+00:00",
+    "last_updated": "2026-06-17T11:27:58.440378+00:00",
     "latest_signal_targets": [
       "2026-06-15",
       "2026-06-16",

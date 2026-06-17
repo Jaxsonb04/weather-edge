@@ -2182,9 +2182,11 @@
           // How positions actually leave the book -- the headline check on the
           // reachable-exit fix (favorites no longer only ever hold to settlement).
           const ex = summary.exit_reasons || {};
-          const total = (ex.held_to_settlement || 0) + (ex.closed_take_profit || 0) + (ex.closed_stop_loss || 0) + (ex.expired_unfilled || 0);
+          const breakEven = ex.closed_break_even || 0;
+          const total = (ex.held_to_settlement || 0) + (ex.closed_take_profit || 0) + (ex.closed_stop_loss || 0) + breakEven + (ex.expired_unfilled || 0);
           if (!total) return '';
-          const detail = `${ex.held_to_settlement || 0} settle · ${ex.closed_take_profit || 0} TP · ${ex.closed_stop_loss || 0} SL · ${ex.expired_unfilled || 0} exp`;
+          const beSegment = breakEven ? ` · ${breakEven} BE` : '';
+          const detail = `${ex.held_to_settlement || 0} settle · ${ex.closed_take_profit || 0} TP · ${ex.closed_stop_loss || 0} SL${beSegment} · ${ex.expired_unfilled || 0} exp`;
           return countCard('Exit reasons', detail);
         })()
       ].join('');

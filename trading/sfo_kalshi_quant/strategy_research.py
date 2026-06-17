@@ -831,12 +831,37 @@ def _signal_backtest_payload(adapter: SfoForecasterAdapter, db_path: Path) -> di
     }
 
 
+def _is_live_candidate(row: dict[str, Any], today: Any) -> bool:
+    """A candidate is "live" only if it could actually be traded right now.
+
+    Resolved markets sit at ask ~ $1.00 (no tradeable edge) and past target
+    dates have already settled. Counting those as rejected candidates made the
+    live snapshot read "0 of 24 approved" when ~8 of the 24 were resolved
+    past-date markets that were never tradeable -- an unfair denominator. This
+    drops them so the approval rate is honest. It is a display/denominator fix
+    only; it does not change which trades the scanner takes. See
+    docs/trading_engine_diagnosis_2026-06-16.md (Finding 4).
+    """
+    target = _date_from_string(row.get("target_date"))
+    if target is not None and today is not None and target < today:
+        return False
+    ask = row.get("ask")
+    if isinstance(ask, (int, float)) and ask >= 0.999:
+        return False
+    return True
+
+
 def _signal_quality_payload(db_path: Path, trading_signal: dict[str, Any] | None) -> dict[str, Any]:
     decisions = _latest_decision_rows(db_path)
     source = "decision_snapshots"
     if not decisions:
         decisions = _decisions_from_trading_signal(trading_signal)
         source = "trading_signal.json"
+
+    today = settlement_today()
+    pre_filter_count = len(decisions)
+    decisions = [row for row in decisions if _is_live_candidate(row, today)]
+    stale_filtered = pre_filter_count - len(decisions)
 
     decisions.sort(
         key=lambda row: (
@@ -851,6 +876,7 @@ def _signal_quality_payload(db_path: Path, trading_signal: dict[str, Any] | None
     return {
         "available": bool(decisions),
         "source": source,
+        "stale_candidates_filtered": stale_filtered,
         "latest_candidates": decisions,
         "charts": {
             "probability_vs_market": _probability_market_points(decisions),
@@ -956,11 +982,25 @@ def _paper_payload(db_path: Path) -> dict[str, Any]:
         ).fetchall()
         monitor_rows = []
         if has_monitor_snapshots:
+            # Keep only the LATEST snapshot per order. The monitor writes one row
+            # per open order every ~2-minute cycle, so without this dedup a single
+            # position that HOLDs for a few cycles shows up as several identical
+            # "actions" (the repeated 0.59/0.40/0.11 @ 0.99 the owner saw). The
+            # window-function filter collapses those to one inspection mark per
+            # order. See docs/trading_engine_diagnosis_2026-06-16.md (Finding 5).
             monitor_rows = conn.execute(
                 """
                 SELECT m.*, p.label, p.risk_profile
-                FROM paper_monitor_snapshots m
+                FROM (
+                    SELECT *,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY order_id
+                               ORDER BY created_at DESC, id DESC
+                           ) AS rn
+                    FROM paper_monitor_snapshots
+                ) m
                 LEFT JOIN paper_orders p ON p.id = m.order_id
+                WHERE m.rn = 1
                 ORDER BY m.created_at DESC, m.id DESC
                 LIMIT 12
                 """
@@ -2118,9 +2158,15 @@ def _paper_monitor_snapshot_row(row: sqlite3.Row) -> dict[str, Any]:
         "exit_price": _round(row["live_bid"], 4),
         "exit_fee_per_contract": _round(row["exit_fee_per_contract"], 4),
         "settlement_high_f": None,
+        # These are an OPEN position's live mark, not a realized close: live_bid
+        # is the current sell bid and unrealized_pnl is mark-to-market. The
+        # `unrealized` flag lets the UI label them as such so a HOLD inspection
+        # does not read as a closed trade (see Finding 5 in
+        # docs/trading_engine_diagnosis_2026-06-16.md).
         "realized_pnl": _round(row["unrealized_pnl"], 2),
         "realized_roi": _round(row["unrealized_roi"], 4),
-        "note": row["reason"] or "monitor inspection",
+        "unrealized": True,
+        "note": row["reason"] or "monitor inspection (open position)",
     }
 
 

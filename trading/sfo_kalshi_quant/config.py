@@ -139,12 +139,31 @@ BALANCED_PROFILE_OVERRIDES = {
     "cheap_tail_min_edge_lcb": 0.03,
     "fractional_kelly": 0.10,
     "kelly_lcb_weight": 1.0,
-    "max_position_risk_pct": 0.005,
-    "max_event_risk_pct": 0.015,
-    "max_target_exposure_pct": 0.025,
+    # Sizing retune (2026-06-16, see docs/trading_engine_diagnosis_2026-06-16.md).
+    # The diagnosis proved the per-position dollar cap, NOT fractional_kelly, was
+    # the binding throttle: Kelly's spend budget on a typical favorite (~$44-67)
+    # is ~9x the old $5 cap, so the bot flat-bet ~1% of full Kelly and profit was
+    # bounded by stake, not edge (combined realized PnL was ~-$0.17 on $1000).
+    # Raising the cap to $20 makes the cap a tail guard rather than the throttle:
+    # effective Kelly fraction k ~= $20/$444 ~= 0.045 (under half-Kelly), which
+    # MacLean/Thorp/Ziemba (2010) put at ~9% of full-Kelly growth with
+    # P(50% drawdown) < 0.1% -- a deliberately safe fraction. Kept to the
+    # balanced (positive-ROI) profile only; fast-feedback stays tiny so a bad
+    # research idea cannot scale a loss. NOTE: validate the +15.6% with a
+    # walk-forward, after-fee backtest before treating this as real-money-ready.
+    "max_position_risk_pct": 0.02,
+    "max_event_risk_pct": 0.04,
+    "max_target_exposure_pct": 0.06,
     "max_forecast_age_hours": 12.0,
-    "max_contracts_per_market": 10.0,
+    "max_contracts_per_market": 40.0,
     "max_source_spread_f": 7.0,
+    # Size against live paper equity (bankroll + realized PnL) so sizing
+    # compounds correctly once the bigger caps let PnL accumulate -- Kelly
+    # requires sizing off current wealth (Kelly 1956; Thorp 2006). Scoped to the
+    # live-running research profiles; the conservative base stays frozen-notional
+    # so the strict test baseline remains reproducible. Effect is ~nil today
+    # (equity ~= $1000) and grows only as the book does.
+    "size_against_live_equity": True,
 }
 
 
@@ -178,7 +197,17 @@ FAST_FEEDBACK_PROFILE_OVERRIDES = {
     # small in the paper journal.
     **BALANCED_PROFILE_OVERRIDES,
     "min_edge": 0.005,
-    "min_edge_lcb": -0.03,
+    # Frequency retune (2026-06-16, see docs/trading_engine_diagnosis_2026-06-16.md).
+    # The lower-bound-edge floor was the single most-binding gate: it rejected
+    # 19/24 live candidates and was the SOLE blocker on all 4 genuine
+    # positive-point-edge candidates (their prob_lcb is haircut ~0.17 for
+    # model-vs-market disagreement, dragging edge_lcb negative while point edge
+    # stays strongly positive). Loosening -0.03 -> -0.07 recovers exactly 2
+    # positive-EV trades (approval 0% -> 8%) that are negative only under the
+    # variance buffer, never under EV. Research-profile only; downside is capped
+    # at ~$2/trade. The proven edge_lcb >= 0 floor on balanced/conservative that
+    # fenced off the documented 3/190 negative-LCB failure is left UNCHANGED.
+    "min_edge_lcb": -0.07,
     "max_spread": 0.08,
     "max_spread_fraction_of_cost": 0.50,
     "min_yes_bid": 0.01,

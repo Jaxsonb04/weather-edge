@@ -22,6 +22,7 @@
       --surface: #ffffff;
       --surface-2: #f6f9fc;
       --surface-3: rgba(21, 35, 63, 0.08);
+      --chip: rgba(21, 35, 63, 0.05);
       --line: rgba(21, 35, 63, 0.13);
       --line-2: rgba(21, 35, 63, 0.07);
       --cold: #1c63a9;
@@ -31,14 +32,48 @@
       --warm-deep: #b35e18;
       --warm-soft: #f7e6cf;
       --mint: #1c8a6c;
+      --mint-soft: rgba(28, 138, 108, 0.12);
       --danger: #bd3a2b;
+      --danger-soft: rgba(189, 58, 43, 0.12);
       --shadow: 0 26px 60px -34px rgba(11, 38, 74, 0.5);
       --shadow-soft: 0 10px 26px -18px rgba(11, 38, 74, 0.45);
+      --chart-grid: rgba(21, 35, 63, 0.08);
+      --grid-overlay: rgba(21, 35, 63, 0.05);
       --font-display: "Fraunces", Georgia, "Times New Roman", serif;
       --font-sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
       --font-mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
       --r: 16px;
     }
+    /* Graphite Observatory dark mode: a warm neutral graphite ground (zero blue
+       in the background) where blue and amber read purely as signal. Every :root
+       token gets a dark counterpart so surfaces, charts, and pills stay coherent. */
+    [data-theme="dark"] {
+      --ink: #ece9e3;
+      --ink-2: #b3b0a8;
+      --ink-3: #84817a;
+      --paper: #0d0d0f;
+      --surface: #17171b;
+      --surface-2: #1f1f25;
+      --surface-3: rgba(255, 255, 255, 0.05);
+      --chip: rgba(255, 255, 255, 0.055);
+      --line: rgba(236, 233, 227, 0.14);
+      --line-2: rgba(236, 233, 227, 0.07);
+      --cold: #5aa6ea;
+      --cold-deep: #8ec7f6;
+      --cold-soft: rgba(90, 166, 234, 0.16);
+      --warm: #eaa052;
+      --warm-deep: #f3bd78;
+      --warm-soft: rgba(234, 160, 82, 0.15);
+      --mint: #45c79a;
+      --mint-soft: rgba(69, 199, 154, 0.16);
+      --danger: #ec6555;
+      --danger-soft: rgba(236, 101, 85, 0.17);
+      --shadow: 0 26px 56px -32px rgba(0, 0, 0, 0.72);
+      --shadow-soft: 0 12px 26px -18px rgba(0, 0, 0, 0.6);
+      --chart-grid: rgba(236, 233, 227, 0.085);
+      --grid-overlay: rgba(236, 233, 227, 0.03);
+    }
+    html[data-theme="dark"] { color-scheme: dark; }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     html { scroll-behavior: smooth; }
     body {
@@ -58,12 +93,52 @@
         radial-gradient(120% 70% at 2% 4%, rgba(28, 99, 169, 0.10), transparent 42%),
         linear-gradient(180deg, #eaeef3 0%, #e7ebf1 60%, #eef1f6 100%);
     }
+    /* The atmosphere layer is a full-viewport base, so its light gradient must go
+       dark too. Keep the amber + cold radial glows but lower their alpha so they
+       read as faint signal over the graphite ground rather than washing it out. */
+    [data-theme="dark"] body::before {
+      background:
+        radial-gradient(110% 60% at 86% -10%, rgba(234, 160, 82, 0.085), transparent 46%),
+        radial-gradient(120% 70% at 2% 4%, rgba(90, 166, 234, 0.10), transparent 44%),
+        linear-gradient(180deg, #141416 0%, #0d0d0f 58%, #100f12 100%);
+    }
+    /* Theme toggle in the masthead nav (mirrors strategy-lab.html). */
+    .icon-button {
+      min-height: 2.25rem;
+      min-width: 2.25rem;
+      display: inline-grid;
+      place-items: center;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: var(--surface);
+      color: var(--ink-2);
+      cursor: pointer;
+      font-size: 0.98rem;
+      line-height: 1;
+      transition-property: background-color, border-color, color, transform;
+      transition-duration: 150ms;
+      transition-timing-function: ease;
+    }
+    .icon-button:hover { background: var(--surface-2); color: var(--ink); }
+    .icon-button:active { transform: scale(0.93); }
+    /* Smooth the light/dark flip on the main surfaces. Explicit properties only
+       (never `transition: all`); auto-disabled by the reduced-motion block. */
+    body, .subnav, .topbar {
+      transition-property: background-color, border-color, color;
+      transition-duration: 260ms;
+      transition-timing-function: ease;
+    }
     .skip-link {
       position: absolute; left: 1rem; top: -4rem; z-index: 60;
       background: var(--ink); color: #fff; padding: 0.6rem 0.9rem;
       border-radius: 10px; font: 600 0.85rem var(--font-sans); text-decoration: none;
     }
     .skip-link:focus-visible { top: 1rem; }
+    /* In dark mode --ink is a light tone, so the white text on var(--ink) fills
+       (.skip-link and the global button) would vanish — flip the text to --paper
+       to mirror the light-mode inversion. */
+    [data-theme="dark"] .skip-link,
+    [data-theme="dark"] button { color: var(--paper); }
     a:focus-visible, button:focus-visible, input:focus-visible, summary:focus-visible {
       outline: 2.5px solid var(--cold); outline-offset: 2px; border-radius: 6px;
     }
@@ -142,6 +217,12 @@
     }
     .subnav a i { font-style: normal; font: 600 0.68rem var(--font-mono); color: var(--ink-3); }
     .subnav a:hover { color: var(--cold-deep); background: rgba(28, 99, 169, 0.09); }
+    /* The sticky subnav and the masthead's frosted white chips carry their own
+       light backgrounds; give them dark frosted / surface equivalents. */
+    [data-theme="dark"] .subnav { background: rgba(16, 16, 19, 0.82); }
+    [data-theme="dark"] .mast-eyebrow { background: var(--chip); }
+    [data-theme="dark"] .back-link { background: var(--surface); }
+    [data-theme="dark"] .back-link:hover { background: var(--surface-2); }
 
     /* ---------- Sections ---------- */
     main { counter-reset: sec; }
@@ -176,6 +257,9 @@
     .forecast-tab small { font: 500 0.72rem var(--font-mono); color: var(--ink-3); }
     .forecast-tab.is-selected { background: var(--surface); color: var(--cold-deep); box-shadow: 0 6px 16px -8px rgba(11,38,74,0.5); }
     .forecast-tab.is-selected small { color: var(--cold); }
+    /* The tab track uses a navy tint that disappears on graphite; use a faint
+       light fill so the inset track reads in dark mode. */
+    [data-theme="dark"] .forecast-tabs { background: rgba(255, 255, 255, 0.05); }
     .forecast-tab:hover:not(.is-selected) { color: var(--ink); }
     .forecast-detail { display: grid; grid-template-columns: 1.05fr 0.95fr; gap: 1rem; align-items: stretch; transition: opacity 220ms cubic-bezier(.2,.7,.2,1), transform 220ms cubic-bezier(.2,.7,.2,1); }
     .forecast-detail.is-switching { opacity: 0; transform: translateY(8px) scale(0.994); }
@@ -360,6 +444,18 @@
       *, *::before, *::after { animation-duration: 0.001ms !important; transition-duration: 0.001ms !important; }
     }
   </style>
+  <script>
+    // Set the theme before first paint to avoid a flash: a saved choice wins,
+    // otherwise follow the OS preference.
+    (function () {
+      try {
+        var saved = localStorage.getItem('weatheredge-theme');
+        var dark = saved ? saved === 'dark'
+          : (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+        if (dark) document.documentElement.setAttribute('data-theme', 'dark');
+      } catch (e) { /* storage blocked: stay light */ }
+    })();
+  </script>
 </head>
 <body>
   <a class="skip-link" href="#main">Skip to content</a>
@@ -372,6 +468,7 @@
           <a href="details.html" aria-current="page">Methodology</a>
           <a href="details.html#track-record">Track record</a>
           <a href="strategy-lab.html">Strategy Lab</a>
+          <button class="icon-button" id="themeToggle" type="button" aria-label="Toggle dark mode" title="Toggle dark mode"></button>
         </nav>
       </div>
       <div class="masthead-inner">
@@ -592,6 +689,51 @@
 
   <script>
 __DATA_VARS__
+
+    // Read live design tokens so charts inherit the active (light/dark) theme.
+    // Re-read on every access, so a theme toggle + re-theme recolors every chart
+    // with no hardcoded palette to keep in sync.
+    const cssVar = (name, fallback) => {
+      const value = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+      return value || fallback;
+    };
+    // Registry of every Chart instance so the theme toggle can recolor them all.
+    const charts = [];
+    // Wrap `new Chart(...)`: build the chart, register it, and stamp axis tick /
+    // grid colors from CSS tokens so re-theming reads the active palette.
+    const themedChart = (ctx, config) => {
+      const chart = new Chart(ctx, config);
+      charts.push(chart);
+      applyChartTheme(chart);
+      return chart;
+    };
+    // Pull tick text + gridline colors from CSS vars onto a chart's scales.
+    function applyChartTheme(chart) {
+      const tick = cssVar('--ink-3', '#5c6a83');
+      const grid = cssVar('--chart-grid', 'rgba(21, 35, 63, 0.08)');
+      const scales = chart.options?.scales || {};
+      for (const key of Object.keys(scales)) {
+        const scale = scales[key];
+        if (!scale) continue;
+        scale.ticks = scale.ticks || {};
+        scale.ticks.color = tick;
+        if (scale.title) scale.title.color = tick;
+        // Respect axes that intentionally hide their grid (grid.display === false).
+        if (scale.grid && scale.grid.display !== false) scale.grid.color = grid;
+        if (scale.border) scale.border.color = grid;
+      }
+    }
+    // Re-apply token colors to every chart and repaint (used on theme toggle).
+    function retintCharts() {
+      if (window.Chart) {
+        Chart.defaults.color = cssVar('--ink-3', '#5c6a83');
+        Chart.defaults.borderColor = cssVar('--chart-grid', 'rgba(21, 35, 63, 0.08)');
+      }
+      for (const chart of charts) {
+        applyChartTheme(chart);
+        chart.update('none');
+      }
+    }
 
     function normCdf(z) {
       const t = 1 / (1 + 0.2316419 * Math.abs(z));
@@ -1748,8 +1890,8 @@ __DATA_VARS__
 
     Chart.defaults.font.family = "'IBM Plex Sans', system-ui, sans-serif";
     Chart.defaults.font.size = 12;
-    Chart.defaults.color = '#43536f';
-    Chart.defaults.borderColor = 'rgba(21, 35, 63, 0.08)';
+    Chart.defaults.color = cssVar('--ink-3', '#5c6a83');
+    Chart.defaults.borderColor = cssVar('--chart-grid', 'rgba(21, 35, 63, 0.08)');
     Chart.defaults.plugins.legend.labels.usePointStyle = true;
     Chart.defaults.plugins.legend.labels.boxWidth = 8;
     Chart.defaults.plugins.legend.labels.padding = 16;
@@ -1759,7 +1901,7 @@ __DATA_VARS__
     Chart.defaults.plugins.tooltip.titleFont = { family: "'IBM Plex Mono', monospace", weight: '600', size: 12 };
     Chart.defaults.plugins.tooltip.bodyFont = { family: "'IBM Plex Sans', sans-serif", size: 12 };
 
-    new Chart(document.getElementById('compareChart'), {
+    themedChart(document.getElementById('compareChart'), {
       type: 'bar',
       data: {
         labels: ["Tomorrow's daily high", 'Spot temp 24h ahead'],
@@ -1774,12 +1916,12 @@ __DATA_VARS__
         plugins: { legend: { position: 'top' } },
         scales: {
           x: { grid: { display: false } },
-          y: { title: { display: true, text: 'MAE (°F)' }, beginAtZero: true, grid: { color: 'rgba(21, 35, 63, 0.08)' } }
+          y: { title: { display: true, text: 'MAE (°F)' }, beginAtZero: true, grid: { color: cssVar('--chart-grid', 'rgba(21, 35, 63, 0.08)') } }
         }
       }
     });
 
-    new Chart(document.getElementById('predictionChart'), {
+    themedChart(document.getElementById('predictionChart'), {
       type: 'line',
       data: {
         labels: dailyDates,
@@ -1795,12 +1937,12 @@ __DATA_VARS__
         plugins: { legend: { position: 'top' } },
         scales: {
           x: { ticks: { maxTicksLimit: 8, maxRotation: 0 }, grid: { display: false } },
-          y: { title: { display: true, text: 'Temperature (°F)' }, grid: { color: 'rgba(21, 35, 63, 0.08)' } }
+          y: { title: { display: true, text: 'Temperature (°F)' }, grid: { color: cssVar('--chart-grid', 'rgba(21, 35, 63, 0.08)') } }
         }
       }
     });
 
-    new Chart(document.getElementById('errorChart'), {
+    themedChart(document.getElementById('errorChart'), {
       type: 'bar',
       data: {
         labels: errLabels,
@@ -1820,7 +1962,7 @@ __DATA_VARS__
         },
         scales: {
           x: { title: { display: true, text: 'Actual high (°F)' }, grid: { display: false } },
-          y: { title: { display: true, text: 'MAE (°F)' }, beginAtZero: true, grid: { color: 'rgba(21, 35, 63, 0.08)' } }
+          y: { title: { display: true, text: 'MAE (°F)' }, beginAtZero: true, grid: { color: cssVar('--chart-grid', 'rgba(21, 35, 63, 0.08)') } }
         }
       }
     });
@@ -1837,7 +1979,7 @@ __DATA_VARS__
       const canvas = document.getElementById(canvasId);
       const ctx = canvas.getContext('2d');
       ctx.clearRect(0, 0, canvas.width, canvas.height);
-      ctx.fillStyle = '#5c6a83';
+      ctx.fillStyle = cssVar('--ink-3', '#5c6a83');
       ctx.font = '14px system-ui';
       const words = String(message || '').split(/\s+/);
       const maxWidth = Math.max(120, canvas.width - 32);
@@ -1963,7 +2105,7 @@ __DATA_VARS__
       if (!data.available || !rows.some(row => row.count > 0)) {
         return missingChart('refreshErrorChart', data.reason || 'Waiting for scored snapshots across refreshes.');
       }
-      new Chart(document.getElementById('refreshErrorChart'), {
+      themedChart(document.getElementById('refreshErrorChart'), {
         type: 'line',
         data: {
           labels: rows.map(row => row.label),
@@ -2001,7 +2143,7 @@ __DATA_VARS__
           },
           scales: {
             x: { grid: { display: false } },
-            y: { beginAtZero: true, title: { display: true, text: 'MAE vs NWS high (°F)' }, grid: { color: 'rgba(21, 35, 63, 0.08)' } }
+            y: { beginAtZero: true, title: { display: true, text: 'MAE vs NWS high (°F)' }, grid: { color: cssVar('--chart-grid', 'rgba(21, 35, 63, 0.08)') } }
           }
         }
       });
@@ -2010,7 +2152,7 @@ __DATA_VARS__
     function makeLiftChart() {
       const values = chartDeltaRows();
       if (!values.length) return missingChart('liftChart', 'Run ab_test.py to create model-lift chart data.');
-      new Chart(document.getElementById('liftChart'), {
+      themedChart(document.getElementById('liftChart'), {
         type: 'bar',
         data: {
           labels: values.map((_, i) => `${i + 1}`),
@@ -2028,7 +2170,7 @@ __DATA_VARS__
           plugins: { legend: { display: false } },
           scales: {
             x: { ticks: { display: false }, grid: { display: false } },
-            y: { title: { display: true, text: 'Error difference (°F)' }, grid: { color: 'rgba(21, 35, 63, 0.08)' } }
+            y: { title: { display: true, text: 'Error difference (°F)' }, grid: { color: cssVar('--chart-grid', 'rgba(21, 35, 63, 0.08)') } }
           }
         }
       });
@@ -2039,7 +2181,7 @@ __DATA_VARS__
       const labels = hist.labels || [];
       const counts = hist.counts || [];
       if (!labels.length || !counts.length) return missingChart('bootstrapChart', 'Run ab_test.py to create bootstrap chart data.');
-      new Chart(document.getElementById('bootstrapChart'), {
+      themedChart(document.getElementById('bootstrapChart'), {
         type: 'bar',
         data: {
           labels,
@@ -2057,7 +2199,7 @@ __DATA_VARS__
           plugins: { legend: { display: false } },
           scales: {
             x: { ticks: { maxTicksLimit: 6 }, grid: { display: false }, title: { display: true, text: 'MAE gain (°F)' } },
-            y: { ticks: { maxTicksLimit: 5 }, grid: { color: 'rgba(21, 35, 63, 0.08)' } }
+            y: { ticks: { maxTicksLimit: 5 }, grid: { color: cssVar('--chart-grid', 'rgba(21, 35, 63, 0.08)') } }
           }
         }
       });
@@ -2066,7 +2208,7 @@ __DATA_VARS__
     function makeScatterChart() {
       const rows = chartRows();
       if (!rows.length) return missingChart('scatterChart', 'Run ab_test.py to create prediction scatter data.');
-      new Chart(document.getElementById('scatterChart'), {
+      themedChart(document.getElementById('scatterChart'), {
         type: 'scatter',
         data: {
           datasets: [
@@ -2090,8 +2232,8 @@ __DATA_VARS__
           animation: { duration: 900, easing: 'easeOutQuart' },
           plugins: { legend: { position: 'top' } },
           scales: {
-            x: { title: { display: true, text: 'Actual high (°F)' }, grid: { color: 'rgba(21, 35, 63, 0.08)' } },
-            y: { title: { display: true, text: 'Predicted high (°F)' }, grid: { color: 'rgba(21, 35, 63, 0.08)' } }
+            x: { title: { display: true, text: 'Actual high (°F)' }, grid: { color: cssVar('--chart-grid', 'rgba(21, 35, 63, 0.08)') } },
+            y: { title: { display: true, text: 'Predicted high (°F)' }, grid: { color: cssVar('--chart-grid', 'rgba(21, 35, 63, 0.08)') } }
           }
         }
       });
@@ -2100,7 +2242,7 @@ __DATA_VARS__
     function makeImportanceChart() {
       const rows = (CHART_DATA.dailyHighImportance || []).slice(0, 12).reverse();
       if (!rows.length) return missingChart('importanceChart', 'Run compare_models.py to create feature-importance data.');
-      new Chart(document.getElementById('importanceChart'), {
+      themedChart(document.getElementById('importanceChart'), {
         type: 'bar',
         data: {
           labels: rows.map(row => row.feature.replaceAll('_', ' ')),
@@ -2118,7 +2260,7 @@ __DATA_VARS__
           animation: { duration: 900, easing: 'easeOutQuart' },
           plugins: { legend: { display: false } },
           scales: {
-            x: { grid: { color: 'rgba(21, 35, 63, 0.08)' } },
+            x: { grid: { color: cssVar('--chart-grid', 'rgba(21, 35, 63, 0.08)') } },
             y: { grid: { display: false } }
           }
         }
@@ -2128,7 +2270,7 @@ __DATA_VARS__
     function makeDistributionChart() {
       const hist = CHART_DATA.weatherStory?.temperature_histogram || {};
       if (!hist.labels?.length) return missingChart('distributionChart', 'Run eda.py to create weather-distribution data.');
-      new Chart(document.getElementById('distributionChart'), {
+      themedChart(document.getElementById('distributionChart'), {
         type: 'bar',
         data: {
           labels: hist.labels,
@@ -2146,7 +2288,7 @@ __DATA_VARS__
           plugins: { legend: { display: false } },
           scales: {
             x: { ticks: { maxTicksLimit: 8 }, grid: { display: false }, title: { display: true, text: 'Temperature (°F)' } },
-            y: { ticks: { maxTicksLimit: 5 }, grid: { color: 'rgba(21, 35, 63, 0.08)' } }
+            y: { ticks: { maxTicksLimit: 5 }, grid: { color: cssVar('--chart-grid', 'rgba(21, 35, 63, 0.08)') } }
           }
         }
       });
@@ -2159,6 +2301,34 @@ __DATA_VARS__
     makeScatterChart();
     makeImportanceChart();
     makeDistributionChart();
+
+    function setThemeIcon() {
+      const dark = document.documentElement.getAttribute('data-theme') === 'dark';
+      const meta = document.querySelector('meta[name="theme-color"]');
+      if (meta) meta.setAttribute('content', dark ? '#0d0d0f' : '#e7ebf1');
+      const button = document.getElementById('themeToggle');
+      if (!button) return;
+      button.textContent = dark ? '☀' : '☾';
+      button.setAttribute('aria-pressed', String(dark));
+      button.title = dark ? 'Switch to light mode' : 'Switch to dark mode';
+    }
+
+    function bindThemeToggle() {
+      setThemeIcon();
+      const button = document.getElementById('themeToggle');
+      if (!button) return;
+      button.addEventListener('click', () => {
+        const dark = document.documentElement.getAttribute('data-theme') === 'dark';
+        if (dark) document.documentElement.removeAttribute('data-theme');
+        else document.documentElement.setAttribute('data-theme', 'dark');
+        try { localStorage.setItem('weatheredge-theme', dark ? 'light' : 'dark'); } catch (e) { /* ignore */ }
+        setThemeIcon();
+        // Charts read CSS tokens via cssVar, so re-tint axis text + gridlines.
+        retintCharts();
+      });
+    }
+
+    bindThemeToggle();
   </script>
 </body>
 </html>

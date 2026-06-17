@@ -186,6 +186,7 @@ def build_paper_summary(
             else None,
         },
         "profiles": window_profiles,
+        "side_performance": _side_performance(window_orders),
         "biggest_winners": [_order_brief(order) for order in ranked[:3] if order["realized_pnl"] > 0],
         "biggest_losers": [
             _order_brief(order) for order in sorted(window_orders, key=lambda order: order["realized_pnl"])[:3]
@@ -271,6 +272,45 @@ def _day_profile(day: dict[str, Any], profile: str) -> dict[str, Any]:
             "roi": None,
         },
     )
+
+
+def _side_performance(window_orders: list) -> dict[str, dict[str, Any]]:
+    """Per-side (YES vs NO) realized performance over the window.
+
+    Surfaces the structural YES-vs-NO gap directly on the dashboard (live: the
+    book is profitable on NO favorites and underwater on YES longshots). Excludes
+    never-filled expirations, and uses wins/(wins+losses) so a break-even close
+    does not distort the hit rate.
+    """
+
+    sides: dict[str, dict[str, Any]] = {
+        side: {"trades": 0, "wins": 0, "losses": 0, "realized_pnl": 0.0, "capital": 0.0}
+        for side in ("YES", "NO")
+    }
+    for order in window_orders:
+        if order["status"] == "PAPER_EXPIRED":
+            continue
+        side = str(order["side"] or "YES").upper()
+        if side not in sides:
+            continue
+        bucket = sides[side]
+        pnl = float(order["realized_pnl"])
+        bucket["trades"] += 1
+        bucket["realized_pnl"] += pnl
+        bucket["capital"] += float(order["contracts"]) * float(order["cost_per_contract"])
+        if pnl > 0:
+            bucket["wins"] += 1
+        elif pnl < 0:
+            bucket["losses"] += 1
+    for bucket in sides.values():
+        decided = bucket["wins"] + bucket["losses"]
+        bucket["hit_rate"] = round(bucket["wins"] / decided, 4) if decided else None
+        bucket["roi"] = (
+            round(bucket["realized_pnl"] / bucket["capital"], 4) if bucket["capital"] > 0 else None
+        )
+        bucket["realized_pnl"] = round(bucket["realized_pnl"], 2)
+        bucket["capital"] = round(bucket["capital"], 2)
+    return sides
 
 
 def _window_profile_totals(

@@ -72,3 +72,42 @@ def test_side_performance_splits_yes_wins_from_no_losses():
         assert split["NO"]["losses"] == 1
         assert split["NO"]["hit_rate"] == 0.0
         assert split["NO"]["realized_pnl"] < 0
+
+
+def test_exit_reason_breakdown_classifies_settlement_take_profit_and_stop_loss():
+    with TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "paper.db"
+        store = PaperStore(db_path)
+        forecaster_root = Path(tmp) / "forecaster"
+        forecaster_root.mkdir()
+
+        # Held to settlement.
+        store.record_paper_order(
+            "2026-06-03",
+            _decision("KXHIGHTSFO-TEST-B66.5", "BUY_YES", "YES", cost=0.30, floor=66.0, cap=67.0),
+        )
+        store.settle_paper_orders("2026-06-03", 67)
+        # Early close at a profit -> take-profit.
+        tp_id = store.record_paper_order(
+            "2026-06-04",
+            _decision("KXHIGHTSFO-TEST-B68.5", "BUY_YES", "YES", cost=0.20, floor=68.0, cap=69.0),
+        )
+        store.close_paper_order(tp_id, 0.50)
+        # Early close at a loss -> stop-loss.
+        sl_id = store.record_paper_order(
+            "2026-06-05",
+            _decision("KXHIGHTSFO-TEST-B70.5", "BUY_YES", "YES", cost=0.40, floor=70.0, cap=71.0),
+        )
+        store.close_paper_order(sl_id, 0.10)
+
+        payload = build_paper_summary(
+            db_path=db_path,
+            forecaster_root=forecaster_root,
+            config=StrategyConfig(paper_bankroll=1000.0),
+            days=30,
+        )
+        ex = payload["exit_reasons"]
+        assert ex["held_to_settlement"] == 1
+        assert ex["closed_take_profit"] == 1
+        assert ex["closed_stop_loss"] == 1
+        assert ex["expired_unfilled"] == 0

@@ -187,6 +187,7 @@ def build_paper_summary(
         },
         "profiles": window_profiles,
         "side_performance": _side_performance(window_orders),
+        "exit_reasons": _exit_reason_breakdown(window_orders),
         "biggest_winners": [_order_brief(order) for order in ranked[:3] if order["realized_pnl"] > 0],
         "biggest_losers": [
             _order_brief(order) for order in sorted(window_orders, key=lambda order: order["realized_pnl"])[:3]
@@ -272,6 +273,36 @@ def _day_profile(day: dict[str, Any], profile: str) -> dict[str, Any]:
             "roi": None,
         },
     )
+
+
+def _exit_reason_breakdown(window_orders: list) -> dict[str, int]:
+    """How positions left the book: held to settlement vs early take-profit vs
+    early stop-loss vs never-filled expiration.
+
+    The headline diagnostic for the exit fix -- before it, the unreachable
+    %-of-cost take-profit meant favorites only ever 'held_to_settlement'.
+    PAPER_CLOSED is split by realized PnL sign as a proxy for take-profit vs
+    stop-loss without joining the monitor snapshots.
+    """
+
+    counts = {
+        "held_to_settlement": 0,
+        "closed_take_profit": 0,
+        "closed_stop_loss": 0,
+        "expired_unfilled": 0,
+    }
+    for order in window_orders:
+        status = order["status"]
+        if status == "PAPER_EXPIRED":
+            counts["expired_unfilled"] += 1
+        elif status == "PAPER_CLOSED":
+            if float(order["realized_pnl"]) >= 0:
+                counts["closed_take_profit"] += 1
+            else:
+                counts["closed_stop_loss"] += 1
+        elif status == "PAPER_SETTLED":
+            counts["held_to_settlement"] += 1
+    return counts
 
 
 def _side_performance(window_orders: list) -> dict[str, dict[str, Any]]:

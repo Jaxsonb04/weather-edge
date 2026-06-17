@@ -868,15 +868,30 @@ def _resolve_analysis_targets(
     return clock_targets, {}
 
 
+def _clamp_sizing_equity(equity: float, starting_bankroll: float) -> float:
+    """Bound compounding to [0.5x, 2x] of the starting notional.
+
+    Kelly sizes off current wealth, so a winning book should stake more and a
+    losing one less. But on a tiny, noisy paper sample an early lucky (or unlucky)
+    run would balloon (or zero) stakes off pure variance. Clamp the equity used
+    for sizing so a drawdown cannot collapse stakes to nothing and a hot streak
+    cannot run away before the sample is meaningful.
+    """
+
+    return min(max(equity, 0.5 * starting_bankroll), 2.0 * starting_bankroll)
+
+
 def _sizing_bankroll(store: PaperStore, config: StrategyConfig, risk_profile: str | None) -> float:
     """Bankroll used for Kelly and the risk caps.
 
     Frozen notional by default (reproducible paper runs); live realized equity
-    when size_against_live_equity is set, so sizing fractions current wealth.
+    (clamped) when size_against_live_equity is set, so sizing fractions current
+    wealth without letting a noisy early sample run away with the stake.
     """
 
     if config.size_against_live_equity:
-        return store.paper_equity(config.paper_bankroll, risk_profile=risk_profile)
+        equity = store.paper_equity(config.paper_bankroll, risk_profile=risk_profile)
+        return _clamp_sizing_equity(equity, config.paper_bankroll)
     return config.paper_bankroll
 
 

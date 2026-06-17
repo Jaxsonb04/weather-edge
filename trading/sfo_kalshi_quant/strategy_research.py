@@ -788,10 +788,16 @@ def _signal_backtest_payload(adapter: SfoForecasterAdapter, db_path: Path) -> di
 
     store = PaperStore(db_path, init=False)
     settlements = adapter.load_ksfo_daily_highs()
+    # Score the FIRST approved snapshot per market-side (the actual entry), not
+    # the latest pre-close scan. The latest row has decayed to ~0 edge and is
+    # almost never the approved one, so latest-per-market-side discarded 100% of
+    # approved entries and published approved_signals=0 / approved PnL/ROI=0 -- a
+    # dedupe artifact that flatly contradicted the real paper book sitting beside
+    # it. Entry mode makes the approved metrics reflect trades actually taken.
     summary = store.signal_backtest_summary(
         settlements,
         pre_resolution_only=True,
-        sample_mode="latest-per-market-side",
+        sample_mode="entry-per-market-side",
     )
     counts = {
         "raw_signals": int(summary["raw_signals"]),
@@ -814,7 +820,8 @@ def _signal_backtest_payload(adapter: SfoForecasterAdapter, db_path: Path) -> di
         "pre_resolution_only": bool(summary["pre_resolution_only"]),
         "dedupe_explanation": (
             "Repeated 15-minute AWS scans are counted once per target, market, "
-            "and side by default, using the latest pre-resolution row."
+            "and side, using the first approved (entry) snapshot so approved "
+            "metrics reflect trades actually taken, not the decayed last scan."
         ),
         "counts": counts,
         "metrics": {

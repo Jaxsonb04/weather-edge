@@ -22,6 +22,8 @@ from sfo_kalshi_quant.strategy_research import (
 )
 from sfo_kalshi_quant.paper import PaperTrader
 
+from support import pre_resolution_event
+
 
 def _write_lstm_fixture(root: Path, n: int = 90) -> None:
     root.mkdir(parents=True, exist_ok=True)
@@ -122,7 +124,9 @@ def test_strategy_research_reads_decisions_and_open_paper_positions():
 
         store = PaperStore(db_path)
         decision = _approved_decision()
-        store.record_decisions("2026-06-03", [decision])
+        store.record_decisions(
+            "2026-06-03", [decision], event=pre_resolution_event([decision])
+        )
         store.record_paper_order("2026-06-03", decision)
 
         payload = build_strategy_research(
@@ -514,6 +518,24 @@ def test_strategy_research_builds_isolated_profile_views():
             for row in fast["signal_quality"]["latest_candidates"]
         } == {"fast-feedback"}
         assert any("fast-feedback" in note for note in fast["learnings"])
+
+        # FIX E/F: per-profile live equity and YES/NO + exit breakdowns now live
+        # on each profile's daily_summary, not just the All-profiles overview.
+        b_summary = balanced["daily_summary"]
+        f_summary = fast["daily_summary"]
+        # Equity = shared starting notional + that profile's all-time realized.
+        assert b_summary["current_equity"] == round(
+            b_summary["starting_bankroll"] + b_summary["totals"]["cumulative_realized_pnl"], 2
+        )
+        # The winner is above start, the loser below -- and the two differ,
+        # proving the value is profile-scoped, not the shared aggregate.
+        assert b_summary["current_equity"] > b_summary["starting_bankroll"]
+        assert f_summary["current_equity"] < f_summary["starting_bankroll"]
+        assert b_summary["current_equity"] != f_summary["current_equity"]
+        # Profile-scoped side split + exit reasons render on the profile tab.
+        assert b_summary["side_performance"]["YES"]["wins"] == 1
+        assert f_summary["side_performance"]["YES"]["losses"] == 1
+        assert b_summary["exit_reasons"]["held_to_settlement"] == 1
 
 
 def test_strategy_research_cli_writes_public_artifact():

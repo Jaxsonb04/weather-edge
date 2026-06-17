@@ -188,6 +188,20 @@ def build_paper_summary(
         "profiles": window_profiles,
         "side_performance": _side_performance(window_orders),
         "exit_reasons": _exit_reason_breakdown(window_orders),
+        # Per-profile views of the same two breakdowns, keyed by risk_profile, so
+        # selecting a profile tab on the dashboard shows that profile's YES/NO
+        # split and exit-reason mix instead of the aggregate-only cards going
+        # blank. Orders with no risk_profile carry the "unknown" sentinel
+        # (_load_orders) and are aggregate-only -- excluded here so the published
+        # maps never carry an "unknown" key (consistent with _profile_names).
+        "side_performance_by_profile": {
+            name: _side_performance([o for o in window_orders if o["risk_profile"] == name])
+            for name in _profile_keys(window_orders)
+        },
+        "exit_reasons_by_profile": {
+            name: _exit_reason_breakdown([o for o in window_orders if o["risk_profile"] == name])
+            for name in _profile_keys(window_orders)
+        },
         "biggest_winners": [_order_brief(order) for order in ranked[:3] if order["realized_pnl"] > 0],
         "biggest_losers": [
             _order_brief(order) for order in sorted(window_orders, key=lambda order: order["realized_pnl"])[:3]
@@ -275,6 +289,18 @@ def _day_profile(day: dict[str, Any], profile: str) -> dict[str, Any]:
     )
 
 
+def _profile_keys(window_orders: list) -> set[str]:
+    """Real risk-profile keys present in the orders, excluding the "unknown"
+    sentinel (_load_orders assigns "unknown" to profile-less orders, which are
+    aggregate-only and never surfaced as a profile tab)."""
+
+    return {
+        order["risk_profile"]
+        for order in window_orders
+        if order["risk_profile"] and order["risk_profile"] != "unknown"
+    }
+
+
 def _exit_reason_breakdown(window_orders: list) -> dict[str, int]:
     """How positions left the book: held to settlement vs early take-profit vs
     early stop-loss vs never-filled expiration.
@@ -282,13 +308,17 @@ def _exit_reason_breakdown(window_orders: list) -> dict[str, int]:
     The headline diagnostic for the exit fix -- before it, the unreachable
     %-of-cost take-profit meant favorites only ever 'held_to_settlement'.
     PAPER_CLOSED is split by realized PnL sign as a proxy for take-profit vs
-    stop-loss without joining the monitor snapshots.
+    stop-loss without joining the monitor snapshots. A break-even close
+    (realized_pnl == 0) is its own bucket rather than silently counted as a
+    take-profit, so this view agrees with the resolved_yes-based win/loss
+    classification in db.py (a break-even close is undecided, not a profit).
     """
 
     counts = {
         "held_to_settlement": 0,
         "closed_take_profit": 0,
         "closed_stop_loss": 0,
+        "closed_break_even": 0,
         "expired_unfilled": 0,
     }
     for order in window_orders:
@@ -296,10 +326,13 @@ def _exit_reason_breakdown(window_orders: list) -> dict[str, int]:
         if status == "PAPER_EXPIRED":
             counts["expired_unfilled"] += 1
         elif status == "PAPER_CLOSED":
-            if float(order["realized_pnl"]) >= 0:
+            pnl = float(order["realized_pnl"])
+            if pnl > 0:
                 counts["closed_take_profit"] += 1
-            else:
+            elif pnl < 0:
                 counts["closed_stop_loss"] += 1
+            else:
+                counts["closed_break_even"] += 1
         elif status == "PAPER_SETTLED":
             counts["held_to_settlement"] += 1
     return counts

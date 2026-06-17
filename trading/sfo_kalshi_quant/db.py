@@ -930,27 +930,28 @@ class PaperStore:
             ).fetchall()
 
     def settle_paper_orders(self, target_date: str, settlement_high_f: float) -> int:
-        rows = self._unsettled_orders(target_date)
         settled_at = _now()
-        updates = []
-        for row in rows:
-            resolved_yes = _row_resolves_yes(row, settlement_high_f)
-            side = _row_side(row)
-            position_wins = resolved_yes if side == "YES" else not resolved_yes
-            cost = float(row["cost_per_contract"])
-            contracts = float(row["contracts"])
-            realized_pnl = contracts * ((1.0 - cost) if position_wins else -cost)
-            updates.append(
-                (
-                    settled_at,
-                    settlement_high_f,
-                    1 if resolved_yes else 0,
-                    realized_pnl,
-                    row["id"],
-                )
-            )
         settled = 0
         with self.connect() as conn:
+            conn.row_factory = sqlite3.Row
+            # Reserve the writer slot BEFORE reading the unsettled rows so the
+            # snapshot and the conditional UPDATEs are one atomic transaction.
+            # The read used to run on its own connection (_unsettled_orders),
+            # closing before this writer opened — a TOCTOU window in which the
+            # monitor (every ~2 minutes) could close a position between read and
+            # write. BEGIN IMMEDIATE takes SQLite's RESERVED lock now, so a
+            # concurrent close either blocks on busy_timeout until we commit or
+            # commits first (and is then visible in our snapshot). The per-row
+            # status/closed_at guard below stays as defense-in-depth.
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM paper_orders
+                WHERE target_date = ? AND status = 'PAPER_FILLED' AND settled_at IS NULL
+                """,
+                (target_date,),
+            ).fetchall()
             # Resting limit orders that never crossed before this target
             # resolved can never fill now. Expire them (zero PnL) so they stop
             # consuming the per-target exposure cap, blocking re-entry, and
@@ -969,12 +970,17 @@ class PaperStore:
                 """,
                 (settled_at, settlement_high_f, target_date),
             )
-            for params in updates:
-                # Guard against the settle/monitor race: the monitor (every 2
-                # minutes) can close a position between this read and write. The
-                # status/closed_at guard makes settlement a no-op on a row the
-                # monitor already closed, instead of silently overwriting its
-                # realized_pnl. Count real row changes, not the read size.
+            for row in rows:
+                resolved_yes = _row_resolves_yes(row, settlement_high_f)
+                side = _row_side(row)
+                position_wins = resolved_yes if side == "YES" else not resolved_yes
+                cost = float(row["cost_per_contract"])
+                contracts = float(row["contracts"])
+                realized_pnl = contracts * ((1.0 - cost) if position_wins else -cost)
+                # The status/closed_at guard makes settlement a no-op on a row a
+                # concurrent monitor close already flipped, instead of silently
+                # overwriting its realized_pnl. Count real row changes, not the
+                # read size.
                 cursor = conn.execute(
                     """
                     UPDATE paper_orders
@@ -989,7 +995,13 @@ class PaperStore:
                       AND settled_at IS NULL
                       AND closed_at IS NULL
                     """,
-                    params,
+                    (
+                        settled_at,
+                        settlement_high_f,
+                        1 if resolved_yes else 0,
+                        realized_pnl,
+                        row["id"],
+                    ),
                 )
                 settled += cursor.rowcount
         return settled
@@ -1004,6 +1016,17 @@ class PaperStore:
         entry_cost = float(row["cost_per_contract"])
         exit_fee = quadratic_fee_average_per_contract(exit_price, contracts)
         realized_pnl = contracts * (exit_price - exit_fee - entry_cost)
+        # Persist resolved_yes on close so a closed order is classified by the
+        # same resolved_yes-driven path as a settled order (db.py settle path),
+        # not the realized_pnl > 0 fallback in _row_position_won. A break-even
+        # close (realized_pnl == 0) is recorded as resolved_yes = NULL so it is
+        # treated as undecided rather than silently bucketed as a loss.
+        side = _row_side(row)
+        if abs(realized_pnl) < 1e-9:
+            resolved_yes: int | None = None
+        else:
+            position_won = realized_pnl > 0.0
+            resolved_yes = 1 if (position_won if side == "YES" else not position_won) else 0
         closed_at = _now()
         with self.connect() as conn:
             conn.execute(
@@ -1014,10 +1037,11 @@ class PaperStore:
                     closed_at = ?,
                     exit_price = ?,
                     exit_fee_per_contract = ?,
+                    resolved_yes = ?,
                     realized_pnl = ?
                 WHERE id = ?
                 """,
-                (closed_at, exit_price, exit_fee, realized_pnl, order_id),
+                (closed_at, exit_price, exit_fee, resolved_yes, realized_pnl, order_id),
             )
         closed = self._order(order_id)
         if closed is None:
@@ -1101,16 +1125,21 @@ class PaperStore:
         contracts = sum(float(row["contracts"]) for row in realized_rows)
         capital = sum(float(row["contracts"]) * float(row["cost_per_contract"]) for row in realized_rows)
         pnl = sum(float(row["realized_pnl"]) for row in realized_rows)
-        hits = sum(1 for row in realized_rows if _row_position_won(row))
+        # A break-even close (resolved_yes NULL, realized_pnl 0) is undecided: it
+        # deployed capital (so it stays in orders/contracts/capital/pnl) but is
+        # neither a win nor a loss, so it must not drag the hit-rate denominator
+        # the way the old realized_pnl > 0 fallback did.
+        decided_rows = [row for row in realized_rows if _row_position_decided(row)]
+        hits = sum(1 for row in decided_rows if _row_position_won(row))
         return {
             "orders": float(len(realized_rows)),
             "contracts": contracts,
             "capital_at_risk": capital,
             "realized_pnl": pnl,
             "roi": pnl / capital if capital else 0.0,
-            # realized_rows is non-empty here (guarded above); a 0-for-N losing
-            # streak must report 0.0, not be masked by an `if hits` short-circuit.
-            "hit_rate": hits / len(realized_rows),
+            # decided_rows excludes undecided break-evens; a 0-for-N losing
+            # streak still reports 0.0 (hits=0 over a non-empty denominator).
+            "hit_rate": hits / len(decided_rows) if decided_rows else 0.0,
             "avg_edge": sum(float(row["edge"]) for row in realized_rows) / len(realized_rows),
             "open_orders": float(len(open_rows)),
             "open_capital_at_risk": open_capital,
@@ -1230,6 +1259,44 @@ class PaperStore:
             )
         return None
 
+    def sampled_decision_rows(
+        self,
+        *,
+        since: str | None = None,
+        until: str | None = None,
+        approved_only: bool = False,
+        pre_resolution_only: bool = True,
+        sample_mode: str = "entry-per-market-side",
+    ) -> list[sqlite3.Row]:
+        """Read, pre-resolution-filter, and dedup decision snapshots.
+
+        Shared read path for ``signal_backtest_summary`` and the config rescorer
+        (``backtest_rescore``): both want the same look-ahead-free, deduped set
+        of decision rows. The rescorer then re-decides each row under a candidate
+        ``StrategyConfig`` instead of reading the recorded approval/size. Dedup
+        runs on the persisted ``approved`` flag (the live scanner's verdict) so a
+        candidate config does not change which snapshot is selected as the entry.
+        """
+
+        if sample_mode not in {"latest-per-market-side", "entry-per-market-side", "all"}:
+            raise ValueError(
+                "sample_mode must be latest-per-market-side, entry-per-market-side, or all"
+            )
+        filters, params = _date_filters(since, until)
+        if approved_only:
+            filters.append("approved = 1")
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        with self.connect() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                f"SELECT * FROM decision_snapshots {where} ORDER BY target_date, created_at",
+                params,
+            ).fetchall()
+        pre_resolution_rows = [
+            row for row in rows if not pre_resolution_only or _is_pre_resolution_decision(row)
+        ]
+        return _sample_decision_rows(pre_resolution_rows, sample_mode)
+
     def signal_backtest_summary(
         self,
         settlements: dict[object, float],
@@ -1340,18 +1407,6 @@ class PaperStore:
             "probability_streams": _probability_stream_metrics(outcomes),
         }
 
-    def _unsettled_orders(self, target_date: str) -> list[sqlite3.Row]:
-        with self.connect() as conn:
-            conn.row_factory = sqlite3.Row
-            return conn.execute(
-                """
-                SELECT *
-                FROM paper_orders
-                WHERE target_date = ? AND status = 'PAPER_FILLED' AND settled_at IS NULL
-                """,
-                (target_date,),
-            ).fetchall()
-
     def _open_order(self, order_id: int) -> sqlite3.Row | None:
         with self.connect() as conn:
             conn.row_factory = sqlite3.Row
@@ -1458,9 +1513,18 @@ def _is_pre_resolution_decision(row: sqlite3.Row) -> bool:
 
     created_at = _parse_timestamp(_row_value(row, "created_at"))
     close_time = _parse_timestamp(_row_value(row, "market_close_time"))
-    if created_at is not None and close_time is not None and created_at >= close_time:
+    # Conservative on an unknown close time: a row we cannot prove was written
+    # before its market resolved must NOT be scored as a pre-resolution signal,
+    # or look-ahead leakage (a decision recorded after the market closed) slips
+    # past the guard whenever market_close_time is NULL. Keep only rows we can
+    # affirmatively place before close. An undateable row (no created_at, which
+    # is NOT NULL in production) keeps the prior lenient default so pathological
+    # legacy fixtures are not silently dropped.
+    if created_at is None:
+        return True
+    if close_time is None:
         return False
-    return True
+    return created_at < close_time
 
 
 def _row_value(row: sqlite3.Row, key: str, default=None):
@@ -1550,6 +1614,26 @@ def _row_position_won(row: sqlite3.Row) -> bool:
         return float(row["realized_pnl"] or 0.0) > 0.0
     side = _row_side(row)
     return bool(resolved_yes) if side == "YES" else not bool(resolved_yes)
+
+
+def _row_position_decided(row: sqlite3.Row) -> bool:
+    """Whether a realized row has a decided win/loss outcome.
+
+    A break-even early close stores ``resolved_yes = NULL`` with
+    ``realized_pnl == 0`` (see ``close_paper_order``); it is genuinely undecided
+    and must be excluded from the hit-rate denominator rather than counted as a
+    loss. Any row with a recorded ``resolved_yes`` (settled, or a decided close)
+    is decided; a NULL-``resolved_yes`` legacy row is decided iff its PnL is
+    non-zero (its win/loss can still be read from the PnL sign).
+    """
+
+    try:
+        resolved_yes = row["resolved_yes"]
+    except (IndexError, KeyError):
+        resolved_yes = None
+    if resolved_yes is not None:
+        return True
+    return abs(float(row["realized_pnl"] or 0.0)) > 1e-9
 
 
 def _decision_row_position_won(row: sqlite3.Row, settlement_high_f: float) -> bool:

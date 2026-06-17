@@ -110,4 +110,48 @@ def test_exit_reason_breakdown_classifies_settlement_take_profit_and_stop_loss()
         assert ex["held_to_settlement"] == 1
         assert ex["closed_take_profit"] == 1
         assert ex["closed_stop_loss"] == 1
+        assert ex["closed_break_even"] == 0
         assert ex["expired_unfilled"] == 0
+
+
+def test_side_and_exit_breakdowns_are_split_by_profile():
+    with TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "paper.db"
+        store = PaperStore(db_path)
+        forecaster_root = Path(tmp) / "forecaster"
+        forecaster_root.mkdir()
+
+        # balanced: a YES win held to settlement.
+        store.record_paper_order(
+            "2026-06-03",
+            _decision("KXHIGHTSFO-TEST-B66.5", "BUY_YES", "YES", cost=0.30, floor=66.0, cap=67.0),
+            risk_profile="balanced",
+        )
+        store.settle_paper_orders("2026-06-03", 67)
+        # fast-feedback: a NO loss held to settlement (same bucket resolves YES).
+        store.record_paper_order(
+            "2026-06-04",
+            _decision("KXHIGHTSFO-TEST-B66.5", "BUY_NO", "NO", cost=0.30, floor=66.0, cap=67.0),
+            risk_profile="fast-feedback",
+        )
+        store.settle_paper_orders("2026-06-04", 67)
+
+        payload = build_paper_summary(
+            db_path=db_path,
+            forecaster_root=forecaster_root,
+            config=StrategyConfig(paper_bankroll=1000.0),
+            days=30,
+        )
+
+        by_profile = payload["side_performance_by_profile"]
+        # The balanced YES win is in balanced only; the fast NO loss in fast only.
+        assert by_profile["balanced"]["YES"]["wins"] == 1
+        assert by_profile["balanced"]["NO"]["trades"] == 0
+        assert by_profile["fast-feedback"]["NO"]["losses"] == 1
+        assert by_profile["fast-feedback"]["YES"]["trades"] == 0
+
+        ex_by_profile = payload["exit_reasons_by_profile"]
+        assert ex_by_profile["balanced"]["held_to_settlement"] == 1
+        assert ex_by_profile["fast-feedback"]["held_to_settlement"] == 1
+        # Aggregate still sums both.
+        assert payload["exit_reasons"]["held_to_settlement"] == 2

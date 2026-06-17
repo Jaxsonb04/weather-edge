@@ -11,6 +11,7 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 
 from .backtest import run_walk_forward_calibration_backtest
+from .backtest_rescore import run_rescore
 from .arbitrage import ArbitrageOpportunity, build_arbitrage_opportunities
 from .colors import Color
 from .config import (
@@ -719,6 +720,44 @@ def build_parser() -> argparse.ArgumentParser:
         help="Include rows recorded after market close or official daily completion.",
     )
     signal_backtest.set_defaults(func=cmd_backtest_signals)
+
+    rescore = sub.add_parser(
+        "backtest-rescore",
+        help=(
+            "Re-score recorded decision snapshots under the current --risk-profile "
+            "config (re-runs gates + Kelly sizing from scratch) and settle vs "
+            "official highs, rolled up by independent weather day"
+        ),
+    )
+    rescore.add_argument("--since", help="Only include snapshots with target_date >= YYYY-MM-DD")
+    rescore.add_argument("--until", help="Only include snapshots with target_date <= YYYY-MM-DD")
+    rescore.add_argument(
+        "--sample-mode",
+        choices=("latest-per-market-side", "entry-per-market-side", "all"),
+        default="entry-per-market-side",
+        help=(
+            "Which snapshot represents each target/market/side. Default keeps the "
+            "entry (first approved) row, the decision that opened the position; "
+            "latest keeps the decayed last pre-close scan."
+        ),
+    )
+    rescore.add_argument(
+        "--include-post-resolution",
+        action="store_true",
+        help="Include rows recorded after market close or official daily completion.",
+    )
+    rescore.add_argument(
+        "--bootstrap-samples",
+        type=int,
+        default=2000,
+        help="Day-clustered bootstrap resamples for the ROI confidence interval.",
+    )
+    rescore.add_argument(
+        "--json",
+        dest="json_output",
+        help="Optional path to write the full rescore result as JSON.",
+    )
+    rescore.set_defaults(func=cmd_backtest_rescore)
     return parser
 
 
@@ -2304,6 +2343,110 @@ def cmd_backtest_signals(args: argparse.Namespace) -> int:
                 f"{bucket['approved_roi']:12.3f}"
             )
     return 0
+
+
+def cmd_backtest_rescore(args: argparse.Namespace) -> int:
+    color = Color.from_no_color(args.no_color)
+    config = _config(args)
+    profile = _risk_profile_name(args)
+    adapter = SfoForecasterAdapter(args.forecaster_root)
+    settlements = adapter.load_ksfo_daily_highs()
+    store = PaperStore(args.db_path)
+    rows = store.sampled_decision_rows(
+        since=args.since,
+        until=args.until,
+        pre_resolution_only=not args.include_post_resolution,
+        sample_mode=args.sample_mode,
+    )
+    result = run_rescore(
+        rows,
+        settlements,
+        config,
+        bankroll=config.paper_bankroll,
+        bootstrap_samples=args.bootstrap_samples,
+    )
+
+    if getattr(args, "json_output", None):
+        Path(args.json_output).write_text(json.dumps(result, indent=2), encoding="utf-8")
+
+    counts = result["counts"]
+    cand = result["candidate"]
+    rec = result["recorded_config_own_book"]
+
+    print(color.cyan(color.bold(f"config rescore — risk_profile={profile}")))
+    print(color.gray(f"basis: {result['config_basis']}"))
+    print(f"official_settlement_days: {len(settlements)}")
+    print(f"starting_bankroll: ${result['starting_bankroll']:.2f}")
+    print(f"sampled_snapshots: {counts['considered']}")
+    print(f"approved_under_recorded_config: {counts['approved_under_recorded_config']}")
+    print(f"approved_under_candidate_config: {counts['approved_under_candidate_config']}")
+    print(f"approved_without_settlement: {counts['approved_without_settlement']}")
+    print(f"settled_decisions: {counts['settled_decisions']}")
+    print(f"independent_days: {counts['independent_days']}")
+    print("")
+    print(color.bold("candidate config (after-fee, held-to-settlement):"))
+    print(f"  realized_pnl: ${cand['realized_pnl']:.2f}")
+    print(f"  capital_at_risk: ${cand['capital_at_risk']:.2f}")
+    print(f"  roi: {_fmt_opt(cand['roi'], '{:.3%}')}")
+    print(f"  wins/losses: {cand['wins']}/{cand['losses']}")
+    print(f"  hit_rate_per_trade: {_fmt_opt(cand['hit_rate_per_trade'], '{:.3f}')}")
+    print(f"  ending_equity: ${cand['ending_equity']:.2f}")
+    print(
+        "  log_growth_per_independent_day: "
+        f"{_fmt_opt(cand['log_growth_per_independent_day'], '{:.5f}')}"
+    )
+    print(
+        "  geometric_growth_per_independent_day: "
+        f"{_fmt_opt(cand['geometric_growth_per_independent_day'], '{:.3%}')}"
+    )
+    ci = cand["roi_ci95_day_clustered"]
+    if ci is not None:
+        print(f"  roi_ci95_day_clustered: [{ci[0]:.3%}, {ci[1]:.3%}]")
+    else:
+        print("  roi_ci95_day_clustered: n/a (need >= 2 settled days)")
+    print("")
+    print(
+        color.gray(
+            f"recorded config own book: pnl ${rec['realized_pnl']:.2f}, "
+            f"roi {_fmt_opt(rec['roi'], '{:.3%}')}, "
+            f"{rec['settled_decisions']} settled over {rec['independent_days']} days, "
+            f"hit_rate {_fmt_opt(rec['hit_rate_per_trade'], '{:.3f}')}"
+        )
+    )
+
+    by_side = result["by_side"]
+    if by_side:
+        print("")
+        print(color.gray("side  trades days  pnl       roi      hit_rate"))
+        print(color.gray("-" * 50))
+        for name in ("NO", "YES"):
+            bucket = by_side.get(name)
+            if not bucket:
+                continue
+            print(
+                f"{name:>4s} {bucket['trades']:6d} {bucket['independent_days']:4d} "
+                f"${bucket['realized_pnl']:8.2f} {_fmt_opt(bucket['roi'], '{:7.3%}')} "
+                f"{_fmt_opt(bucket['hit_rate'], '{:.3f}')}"
+            )
+
+    by_cohort = result["by_cohort"]
+    if by_cohort:
+        print("")
+        print(color.gray("cohort (by settled high)  trades days  pnl       roi      hit_rate"))
+        print(color.gray("-" * 64))
+        for name, bucket in by_cohort.items():
+            print(
+                f"{name:>24s} {bucket['trades']:6d} {bucket['independent_days']:4d} "
+                f"${bucket['realized_pnl']:8.2f} {_fmt_opt(bucket['roi'], '{:7.3%}')} "
+                f"{_fmt_opt(bucket['hit_rate'], '{:.3f}')}"
+            )
+    return 0
+
+
+def _fmt_opt(value, spec: str) -> str:
+    if value is None:
+        return "n/a"
+    return spec.format(value)
 
 
 def _format_pnl(value) -> str:

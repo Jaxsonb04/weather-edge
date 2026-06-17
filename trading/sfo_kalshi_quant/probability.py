@@ -304,9 +304,23 @@ def _condition_on_observed_high(
 def _normalize_weather_probabilities(
     probabilities: list[tuple[MarketBin, float, float, float, float | None]],
 ) -> list[tuple[MarketBin, float, float, float, float | None]]:
+    if not probabilities:
+        return probabilities
     total = sum(p for _, p, _, _, _ in probabilities)
     if total <= 0:
-        return probabilities
+        # Zero total mass means the intraday blend lost all information across
+        # the offered bins (e.g. an intraday point-mass landing entirely outside
+        # them). Returning the un-normalized list silently zeroed every bucket's
+        # probability and edge -- an invisible kill of every signal. Fall back to
+        # a uniform prior so the vector still sums to 1 and downstream model_p
+        # math stays well-defined. Uniform is the max-entropy, least-biased
+        # stand-in and, after the market blend and LCB penalties, is unlikely to
+        # clear edge_lcb, so it produces no trade rather than a corrupted one.
+        uniform = 1.0 / len(probabilities)
+        return [
+            (market, uniform, p_emp, p_norm, ensemble_p)
+            for market, _p, p_emp, p_norm, ensemble_p in probabilities
+        ]
     return [
         (market, p / total, p_emp, p_norm, ensemble_p)
         for market, p, p_emp, p_norm, ensemble_p in probabilities

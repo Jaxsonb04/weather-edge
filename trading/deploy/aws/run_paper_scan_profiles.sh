@@ -1,12 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Skip this tick if a previous scan is still running. The 5-minute timer can fire
+# before a slow scan (arbitrage + tail-basket + analyze across both profiles)
+# finishes; WAL keeps the DB consistent but does not stop two scans doing
+# duplicate logical work or both placing paper entries. flock is a no-op where
+# unavailable (local macOS dev).
+SCAN_LOCK="${SFO_PAPER_SCAN_LOCK:-${TMPDIR:-/tmp}/sfo-paper-scan.lock}"
+if command -v flock >/dev/null 2>&1; then
+  exec 9>"$SCAN_LOCK"
+  if ! flock -n 9; then
+    echo "previous paper scan still running; skipping this tick"
+    exit 0
+  fi
+fi
+
 TRADING_DIR="${SFO_TRADING_ROOT:-/opt/weatheredge/trading}"
 FORECASTER_DIR="${SFO_FORECASTER_ROOT:-/opt/weatheredge/forecaster}"
 PYTHON_BIN="${SFO_TRADING_PYTHON:-$TRADING_DIR/.venv/bin/python}"
 DB_PATH="${SFO_KALSHI_DB:-$TRADING_DIR/data/paper_trading.db}"
 BANKROLL="${PAPER_BANKROLL:-1000}"
-PROFILES_CSV="${PAPER_RISK_PROFILES:-${PAPER_RISK_PROFILE:-balanced}}"
+PROFILES_CSV="${PAPER_RISK_PROFILES:-${PAPER_RISK_PROFILE:-live}}"
 CALIBRATION_SOURCE="${SFO_TRADING_SIGNAL_CALIBRATION_SOURCE:-lstm}"
 PAPER_ENTRY_MODE="${PAPER_ENTRY_MODE:-market}"
 TARGET_DATE="${SFO_PAPER_SCAN_TARGET_DATE:-rolling}"
@@ -16,11 +30,18 @@ ARBITRAGE_MAX_SPEND="${SFO_ARBITRAGE_MAX_SPEND:-12}"
 ARBITRAGE_MIN_PROFIT="${SFO_ARBITRAGE_MIN_PROFIT:-0.01}"
 TAIL_BASKET_ENABLED="${SFO_PAPER_SCAN_TAIL_BASKET_ENABLED:-1}"
 TAIL_BASKET_DISTANCE="${SFO_TAIL_BASKET_DISTANCE:-3}"
+# Volatility retune (2026-06-18): size the far-tail NO legs off the evaluator's
+# risk budget (quarter-Kelly + comfort boost) instead of a hardcoded $5/leg --
+# the fixed $5/$1 stakes were the dominant source of the inert "$1-2" P&L. The
+# basket is still bounded by MAX_SPEND / MAX_WORST_LOSS (raised below) and still
+# held to a non-negative lower-bound edge per leg. Set SFO_TAIL_BASKET_SIZING=fixed
+# to revert to the old bounded-guardrail behavior.
+TAIL_BASKET_SIZING="${SFO_TAIL_BASKET_SIZING:-kelly}"
 TAIL_BASKET_TAIL_STAKE="${SFO_TAIL_BASKET_TAIL_STAKE:-5}"
 TAIL_BASKET_CENTER_STAKE="${SFO_TAIL_BASKET_CENTER_STAKE:-1}"
 TAIL_BASKET_MAX_TAIL_PROBABILITY="${SFO_TAIL_BASKET_MAX_TAIL_PROBABILITY:-0.20}"
-TAIL_BASKET_MAX_SPEND="${SFO_TAIL_BASKET_MAX_SPEND:-12}"
-TAIL_BASKET_MAX_WORST_LOSS="${SFO_TAIL_BASKET_MAX_WORST_LOSS:-8}"
+TAIL_BASKET_MAX_SPEND="${SFO_TAIL_BASKET_MAX_SPEND:-60}"
+TAIL_BASKET_MAX_WORST_LOSS="${SFO_TAIL_BASKET_MAX_WORST_LOSS:-50}"
 
 if [[ "$PYTHON_BIN" != */* ]]; then
   if ! PYTHON_BIN="$(command -v "$PYTHON_BIN")"; then
@@ -82,6 +103,7 @@ for raw_profile in "${profiles[@]}"; do
       --target-date "$TARGET_DATE"
       --calibration-source "$CALIBRATION_SOURCE"
       --tail-distance "$TAIL_BASKET_DISTANCE"
+      --basket-sizing "$TAIL_BASKET_SIZING"
       --tail-stake "$TAIL_BASKET_TAIL_STAKE"
       --center-stake "$TAIL_BASKET_CENTER_STAKE"
       --max-tail-probability "$TAIL_BASKET_MAX_TAIL_PROBABILITY"

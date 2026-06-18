@@ -16,7 +16,10 @@ It runs:
 - Forecaster refresh: every 30 minutes from 05:10 through 18:40 Pacific time,
   then hourly overnight at minute 40.
 - Compact dataset backfill: nightly at 02:25 Pacific time.
-- Kalshi paper scan: every 15 minutes from 07:00 through 17:45 Pacific time.
+- Kalshi paper scan: every 5 minutes, around the clock. Each run live-fetches
+  the current Kalshi order books and makes paper-trade entries on fresh market
+  data (it is not a dashboard rebuild), so a newly-listed bracket is acted on
+  within ~5 minutes.
 - Paper exit monitor: every 5 minutes from 07:00 through 17:55 Pacific time.
 
 The services are paper-only. They do not contain a live-order path.
@@ -99,8 +102,8 @@ SFO_STRATEGY_LAB_PUBLIC_MODE=1
 SFO_STRATEGY_LAB_PBKDF2_ITERATIONS=210000
 # No PAPER_DAILY_BUDGET: paper exposure is risk-gated, not budget-capped.
 PAPER_BANKROLL=1000
-PAPER_RISK_PROFILE=balanced
-PAPER_RISK_PROFILES=balanced,fast-feedback
+PAPER_RISK_PROFILE=live
+PAPER_RISK_PROFILES=live,research
 PAPER_ENTRY_MODE=limit
 PAPER_TAKE_PROFIT_PCT=40
 PAPER_STOP_LOSS_PCT=35
@@ -132,7 +135,7 @@ data.
 AWS paper scanning is pinned to LSTM calibration during this deployment stage.
 If `PAPER_RISK_PROFILES` is a comma-list, the scan service runs each profile
 back to back in the same paper DB. Orders are tagged by `risk_profile`, so the
-balanced paper book and fast-feedback paper book do not block each other.
+`live` paper book and `research` paper book do not block each other.
 Each paper scan first runs the paper-only `arbitrage` command when
 `SFO_PAPER_SCAN_ARBITRAGE_ENABLED=1`. It scans all active bins for same-bin
 YES+NO boxes and complete-ladder YES/NO portfolios, then places only grouped

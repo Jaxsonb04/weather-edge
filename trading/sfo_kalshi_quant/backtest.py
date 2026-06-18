@@ -27,6 +27,13 @@ class CalibrationCohort:
     log_loss: float
     top_bin_accuracy: float
     avg_winning_probability: float
+    # Climatological-prior Brier on the same cohort days (the baseline a useful
+    # forecaster must beat) and the Brier Skill Score 1 - model/clim. A flat
+    # absolute-Brier bar is unachievable on the interior 2F bins by ANY calibrated
+    # model and is only met by catch-all-dominated cohorts, so the readiness gate
+    # judges SKILL (model beats climatology -> skill > 0), not absolute Brier.
+    climatology_brier_score: float
+    brier_skill: float
 
 
 @dataclass(frozen=True)
@@ -37,6 +44,8 @@ class CalibrationBacktestResult:
     top_bin_accuracy: float
     avg_winning_probability: float
     avg_entropy: float
+    climatology_brier_score: float
+    brier_skill: float
     calibration_buckets: tuple[CalibrationBucket, ...]
     cohorts: tuple[CalibrationCohort, ...]
 
@@ -64,7 +73,14 @@ def run_walk_forward_calibration_backtest(
         test = outcomes[idx]
         calibrator = ResidualCalibrator(train, cfg)
         probs = calibrator.bucket_probabilities(ladder, test.predicted_high_f)
+        # Climatological prior: each bin's marginal YES-frequency over the
+        # training window, independent of the forecast. It is the no-skill
+        # baseline a useful forecaster must beat; per-bin Brier vs this prior
+        # gives a Brier Skill Score that does not penalize irreducible multi-bin
+        # spread the way a flat absolute-Brier threshold does.
+        clim_prior = _climatological_prior(ladder, train)
         brier = 0.0
+        clim_brier = 0.0
         winning_probability = 0.0
         top_ticker = max(probs.values(), key=lambda row: row.probability).ticker
         winning_ticker = None
@@ -76,6 +92,7 @@ def run_walk_forward_calibration_backtest(
             outcome = 1.0 if market.resolves_yes(math.floor(test.actual_high_f + 0.5)) else 0.0
             calibration_samples.append((probability, outcome))
             brier += (probability - outcome) ** 2
+            clim_brier += (clim_prior[market.ticker] - outcome) ** 2
             entropy -= probability * math.log(max(probability, 1e-12))
             if outcome:
                 winning_probability = probability
@@ -83,6 +100,7 @@ def run_walk_forward_calibration_backtest(
         scored.append(
             {
                 "brier": brier,
+                "clim_brier": clim_brier,
                 "log_loss": -math.log(max(winning_probability, 1e-12)),
                 "top_hit": 1.0 if top_ticker == winning_ticker else 0.0,
                 "winning_probability": winning_probability,
@@ -93,16 +111,43 @@ def run_walk_forward_calibration_backtest(
     if not scored:
         raise ValueError("Not enough outcomes for backtest")
     n = len(scored)
+    model_brier = sum(row["brier"] for row in scored) / n
+    clim_brier_overall = sum(row["clim_brier"] for row in scored) / n
     return CalibrationBacktestResult(
         n=n,
-        brier_score=sum(row["brier"] for row in scored) / n,
+        brier_score=model_brier,
         log_loss=sum(row["log_loss"] for row in scored) / n,
         top_bin_accuracy=sum(row["top_hit"] for row in scored) / n,
         avg_winning_probability=sum(row["winning_probability"] for row in scored) / n,
         avg_entropy=sum(row["entropy"] for row in scored) / n,
+        climatology_brier_score=clim_brier_overall,
+        brier_skill=_brier_skill(model_brier, clim_brier_overall),
         calibration_buckets=_calibration_buckets(calibration_samples),
         cohorts=_calibration_cohorts(scored),
     )
+
+
+def _climatological_prior(
+    ladder: list[MarketBin], train: list[ForecastOutcome]
+) -> dict[str, float]:
+    """Each bin's marginal YES-frequency over the training window (no-skill prior)."""
+
+    n = len(train)
+    if n == 0:
+        return {market.ticker: 0.0 for market in ladder}
+    settled = [math.floor(o.actual_high_f + 0.5) for o in train]
+    return {
+        market.ticker: sum(1 for high in settled if market.resolves_yes(high)) / n
+        for market in ladder
+    }
+
+
+def _brier_skill(model_brier: float, clim_brier: float) -> float:
+    """Brier Skill Score: 1 - model/clim. > 0 means the model beats climatology."""
+
+    if clim_brier <= 0.0:
+        return 0.0
+    return 1.0 - (model_brier / clim_brier)
 
 
 def _calibration_buckets(samples: list[tuple[float, float]]) -> tuple[CalibrationBucket, ...]:
@@ -148,14 +193,18 @@ def _calibration_cohorts(scored: list[dict[str, float]]) -> tuple[CalibrationCoh
         if not rows:
             continue
         count = len(rows)
+        cohort_brier = sum(row["brier"] for row in rows) / count
+        cohort_clim_brier = sum(row["clim_brier"] for row in rows) / count
         cohorts.append(
             CalibrationCohort(
                 name=name,
                 count=count,
-                brier_score=sum(row["brier"] for row in rows) / count,
+                brier_score=cohort_brier,
                 log_loss=sum(row["log_loss"] for row in rows) / count,
                 top_bin_accuracy=sum(row["top_hit"] for row in rows) / count,
                 avg_winning_probability=sum(row["winning_probability"] for row in rows) / count,
+                climatology_brier_score=cohort_clim_brier,
+                brier_skill=_brier_skill(cohort_brier, cohort_clim_brier),
             )
         )
     return tuple(cohorts)

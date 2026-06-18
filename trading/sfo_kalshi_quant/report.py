@@ -232,10 +232,22 @@ def calibration_diagnostics(
     }
 
 
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write via a temp file + os.replace so a concurrent reader/publisher never
+    observes a half-written artifact (forecaster-refresh and strategy-lab-refresh
+    build into the same shared dir; os.replace is atomic on one filesystem)."""
+
+    import os
+
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def write_report(path: Path, payload: dict[str, Any]) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    _atomic_write_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
 def forecast_to_dict(forecast: ForecastSnapshot) -> dict[str, Any]:

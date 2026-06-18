@@ -36,12 +36,15 @@ The systemd installer remains in:
 ## Timers
 
 - `sfo-forecaster-refresh.timer`
-- `sfo-strategy-lab-refresh.timer` (every five minutes; rebuilds
-  `trading_signal.json`, `strategy_research.json`, dashboard HTML, and Pages
-  without paid Google Weather refresh calls)
+- `sfo-strategy-lab-refresh.timer` (every five minutes; live-fetches Kalshi
+  top-of-book via `daily-report` and rebuilds `trading_signal.json`,
+  `strategy_research.json`, dashboard HTML, and Pages without paid Google
+  Weather refresh calls)
 - `sfo-dataset-backfill.timer`
-- `sfo-kalshi-paper-scan.timer`
-- `sfo-kalshi-paper-monitor.timer`
+- `sfo-kalshi-paper-scan.timer` (every five minutes; live-fetches the current
+  order books and places paper-trade entries on fresh market data)
+- `sfo-kalshi-paper-monitor.timer` (every two minutes; live exit prices for open
+  positions)
 - `sfo-kalshi-paper-settle.timer`
 
 Strategy Lab is temporarily public when `SFO_STRATEGY_LAB_PUBLIC_MODE=1`, so

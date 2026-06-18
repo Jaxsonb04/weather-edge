@@ -117,11 +117,12 @@ def test_two_cent_tail_is_structurally_blocked_by_relative_spread():
     assert any("stop band" in reason for reason in decision.reasons)
 
 
-def test_balanced_admits_mid_ladder_cheap_tail_that_conservative_rejects():
-    # Identical cheap tail with a moderate (12-contract) bid: conservative
-    # requires a 25-contract bid for cheap tails and refuses it; balanced now
-    # carries its own 10-contract floor and takes the trade. Only the bid-size
-    # floor differs, so this isolates the deliberate balanced loosening.
+def test_live_admits_mid_ladder_cheap_tail_that_strict_baseline_rejects():
+    # Identical cheap tail with a moderate (12-contract) bid: the strict
+    # StrategyConfig() baseline requires a 25-contract bid for cheap tails and
+    # refuses it; live now carries its own 10-contract floor and takes the
+    # trade. Only the bid-size floor differs, so this isolates the deliberate
+    # live loosening.
     market = _bin(
         "66° to 67°",
         yes_bid=0.04,
@@ -142,10 +143,10 @@ def test_balanced_admits_mid_ladder_cheap_tail_that_conservative_rejects():
         model_probability=0.10,
         market_probability=0.05,
     )
-    conservative = TradeEvaluator(strategy_config_for_profile("conservative"))
-    balanced = TradeEvaluator(strategy_config_for_profile("balanced"))
-    assert not conservative.evaluate_market(market, probability, bankroll=350).approved
-    assert balanced.evaluate_market(market, probability, bankroll=350).approved
+    strict = TradeEvaluator(StrategyConfig())
+    live = TradeEvaluator(strategy_config_for_profile("live"))
+    assert not strict.evaluate_market(market, probability, bankroll=350).approved
+    assert live.evaluate_market(market, probability, bankroll=350).approved
 
 
 def test_edge_gate_can_measure_point_edge_against_model_probability():
@@ -181,7 +182,7 @@ def test_edge_gate_can_measure_point_edge_against_model_probability():
     assert abs(d_model.edge_lcb - d_blended.edge_lcb) < 1e-9
 
 
-def test_balanced_still_rejects_negative_lower_bound_edge():
+def test_live_still_rejects_negative_lower_bound_edge():
     # The loosening must not reopen the proven failure mode: a trade whose
     # lower-confidence edge is negative is still refused under balanced.
     market = _bin(
@@ -202,7 +203,7 @@ def test_balanced_still_rejects_negative_lower_bound_edge():
         model_probability=0.45,
         market_probability=0.40,
     )
-    balanced = TradeEvaluator(strategy_config_for_profile("balanced"))
+    balanced = TradeEvaluator(strategy_config_for_profile("live"))
     decision = balanced.evaluate_market(market, probability, bankroll=350)
     assert not decision.approved
     assert any("lower-bound edge" in reason for reason in decision.reasons)
@@ -290,7 +291,7 @@ def test_buy_no_uses_complement_probability_and_no_book():
     assert decision.ask_size == 80.0
 
 
-def test_balanced_profile_rejects_negative_lcb_penny_tail():
+def test_live_profile_rejects_negative_lcb_penny_tail():
     """Jun 2026 live record: 103 sub-5c entries with avg modeled p of 8.7%
     won 1.9% of the time. Balanced must reject headline-edge-only tails."""
 
@@ -314,7 +315,7 @@ def test_balanced_profile_rejects_negative_lcb_penny_tail():
         model_probability=0.09,
         market_probability=0.04,
     )
-    decision = TradeEvaluator(strategy_config_for_profile("balanced")).evaluate_market(
+    decision = TradeEvaluator(strategy_config_for_profile("live")).evaluate_market(
         market,
         probability,
         bankroll=1000,
@@ -323,7 +324,7 @@ def test_balanced_profile_rejects_negative_lcb_penny_tail():
     assert any("lower-bound edge" in reason for reason in decision.reasons)
 
 
-def test_balanced_profile_approves_structurally_sound_value_trade():
+def test_live_profile_approves_structurally_sound_value_trade():
     market = _bin(
         "68° to 69°",
         yes_bid=0.55,
@@ -344,7 +345,7 @@ def test_balanced_profile_approves_structurally_sound_value_trade():
         model_probability=0.72,
         market_probability=0.57,
     )
-    decision = TradeEvaluator(strategy_config_for_profile("balanced")).evaluate_market(
+    decision = TradeEvaluator(strategy_config_for_profile("live")).evaluate_market(
         market,
         probability,
         bankroll=1000,
@@ -359,7 +360,7 @@ def test_default_profile_is_balanced_for_paper_research():
     previous = os.environ.pop("PAPER_RISK_PROFILE", None)
     try:
         default = strategy_config_for_profile()
-        balanced = strategy_config_for_profile("balanced")
+        balanced = strategy_config_for_profile("live")
     finally:
         if previous is not None:
             os.environ["PAPER_RISK_PROFILE"] = previous
@@ -369,7 +370,7 @@ def test_default_profile_is_balanced_for_paper_research():
     assert default.cheap_tail_min_edge_lcb == balanced.cheap_tail_min_edge_lcb
 
 
-def test_no_profile_allows_wide_relative_spread_penny_tail():
+def test_strict_and_live_reject_wide_relative_spread_penny_tail():
     market = _bin(
         "66° to 67°",
         yes_bid=0.01,
@@ -391,40 +392,44 @@ def test_no_profile_allows_wide_relative_spread_penny_tail():
         market_probability=0.02,
     )
 
-    for profile in ("conservative", "balanced", "exploratory"):
-        decision = TradeEvaluator(strategy_config_for_profile(profile)).evaluate_market(
-            market,
-            probability,
-            bankroll=1000,
+    # The strict baseline and live both reject a 1-2c tail whose 50%-of-cost
+    # spread leaves no exit support. The research collector intentionally runs a
+    # looser spread-fraction gate (0.50) to gather these, so it is excluded here.
+    strict = TradeEvaluator(StrategyConfig()).evaluate_market(market, probability, bankroll=1000)
+    live = TradeEvaluator(strategy_config_for_profile("live")).evaluate_market(
+        market, probability, bankroll=1000
+    )
+    assert not strict.approved
+    assert not live.approved
+
+
+def test_research_profile_is_more_active_but_smaller_sized_than_live():
+    # The single merged collector: loosest gates so it approves the widest set,
+    # smallest size so a bad idea stays tiny. All the legacy collector aliases
+    # resolve to this one config.
+    live = strategy_config_for_profile("live")
+    research = strategy_config_for_profile("research")
+
+    # Looser gates than live.
+    assert research.min_edge < live.min_edge
+    assert research.min_edge_lcb < live.min_edge_lcb
+    assert research.max_source_spread_f == 10.0
+    assert research.comfort_edge_enabled is False  # collects center bins too
+    # Smaller size than live.
+    assert research.max_contracts_per_market < live.max_contracts_per_market
+    assert research.max_position_risk_pct < live.max_position_risk_pct
+    assert research.kelly_lcb_weight == 0.5
+
+    # Every legacy collector alias maps onto the same research config.
+    for alias in ("exploratory", "fast-feedback", "fast"):
+        assert strategy_config_for_profile(alias).min_edge == research.min_edge
+        assert (
+            strategy_config_for_profile(alias).max_contracts_per_market
+            == research.max_contracts_per_market
         )
-        assert not decision.approved, profile
 
 
-def test_exploratory_profile_is_more_active_but_smaller_sized():
-    balanced = strategy_config_for_profile("balanced")
-    exploratory = strategy_config_for_profile("exploratory")
-
-    assert exploratory.min_edge < balanced.min_edge
-    assert exploratory.min_edge_lcb < balanced.min_edge_lcb
-    assert exploratory.max_contracts_per_market < balanced.max_contracts_per_market
-    assert exploratory.max_position_risk_pct < balanced.max_position_risk_pct
-
-
-def test_fast_feedback_profile_is_more_active_than_exploratory_but_tiny_sized():
-    exploratory = strategy_config_for_profile("exploratory")
-    fast = strategy_config_for_profile("fast-feedback")
-    fast_alias = strategy_config_for_profile("fast")
-
-    assert fast.min_edge < exploratory.min_edge
-    assert fast.min_edge_lcb < exploratory.min_edge_lcb
-    assert fast.kelly_lcb_weight == 0.5
-    assert fast.max_contracts_per_market < exploratory.max_contracts_per_market
-    assert fast.max_position_risk_pct < exploratory.max_position_risk_pct
-    assert fast_alias.min_edge == fast.min_edge
-    assert fast.max_source_spread_f == 10.0
-
-
-def test_fast_feedback_can_collect_raw_edge_trade_rejected_by_balanced_lcb():
+def test_research_can_collect_raw_edge_trade_rejected_by_live_lcb():
     market = _bin(
         "68° to 69°",
         yes_bid=0.29,
@@ -446,12 +451,12 @@ def test_fast_feedback_can_collect_raw_edge_trade_rejected_by_balanced_lcb():
         market_probability=0.30,
     )
 
-    balanced = TradeEvaluator(strategy_config_for_profile("balanced")).evaluate_market(
+    balanced = TradeEvaluator(strategy_config_for_profile("live")).evaluate_market(
         market,
         probability,
         bankroll=1000,
     )
-    fast = TradeEvaluator(strategy_config_for_profile("fast-feedback")).evaluate_market(
+    fast = TradeEvaluator(strategy_config_for_profile("research")).evaluate_market(
         market,
         probability,
         bankroll=1000,
@@ -466,7 +471,7 @@ def test_fast_feedback_can_collect_raw_edge_trade_rejected_by_balanced_lcb():
     assert 1.0 <= fast.recommended_contracts <= 25.0
 
 
-def test_fast_feedback_collects_tiny_trade_on_moderate_source_disagreement():
+def test_research_collects_tiny_trade_on_moderate_source_disagreement():
     market = _bin(
         "74° or above",
         yes_bid=0.47,
@@ -490,7 +495,7 @@ def test_fast_feedback_collects_tiny_trade_on_moderate_source_disagreement():
         market_probability=0.4460,
     )
 
-    decision = TradeEvaluator(strategy_config_for_profile("fast-feedback")).evaluate_market(
+    decision = TradeEvaluator(strategy_config_for_profile("research")).evaluate_market(
         market,
         probability,
         bankroll=1000,
@@ -504,7 +509,7 @@ def test_fast_feedback_collects_tiny_trade_on_moderate_source_disagreement():
     assert decision.recommended_contracts <= 25.0
 
 
-def test_fast_feedback_blocks_deep_negative_lcb_research_trade():
+def test_research_blocks_deep_negative_lcb_research_trade():
     market = _bin(
         "74° or above",
         yes_bid=0.47,
@@ -528,7 +533,7 @@ def test_fast_feedback_blocks_deep_negative_lcb_research_trade():
         market_probability=0.4460,
     )
 
-    decision = TradeEvaluator(strategy_config_for_profile("fast-feedback")).evaluate_market(
+    decision = TradeEvaluator(strategy_config_for_profile("research")).evaluate_market(
         market,
         probability,
         bankroll=1000,
@@ -540,7 +545,7 @@ def test_fast_feedback_blocks_deep_negative_lcb_research_trade():
     assert any("lower-bound edge" in reason for reason in decision.reasons)
 
 
-def test_fast_feedback_still_blocks_extreme_source_disagreement():
+def test_research_still_blocks_extreme_source_disagreement():
     market = _bin(
         "74° or above",
         yes_bid=0.47,
@@ -564,7 +569,7 @@ def test_fast_feedback_still_blocks_extreme_source_disagreement():
         market_probability=0.4460,
     )
 
-    decision = TradeEvaluator(strategy_config_for_profile("fast-feedback")).evaluate_market(
+    decision = TradeEvaluator(strategy_config_for_profile("research")).evaluate_market(
         market,
         probability,
         bankroll=1000,
@@ -576,7 +581,7 @@ def test_fast_feedback_still_blocks_extreme_source_disagreement():
     assert any("source spread" in reason for reason in decision.reasons)
 
 
-def test_fast_feedback_cheap_tail_requires_positive_lcb_after_tightening():
+def test_research_cheap_tail_requires_positive_lcb_after_tightening():
     market = _bin(
         "66° to 67°",
         yes_bid=0.03,
@@ -598,7 +603,7 @@ def test_fast_feedback_cheap_tail_requires_positive_lcb_after_tightening():
         market_probability=0.04,
     )
 
-    decision = TradeEvaluator(strategy_config_for_profile("fast-feedback")).evaluate_market(
+    decision = TradeEvaluator(strategy_config_for_profile("research")).evaluate_market(
         market,
         probability,
         bankroll=1000,
@@ -657,7 +662,7 @@ def test_event_risk_cap_scales_total_approved_exposure():
     assert spend > 9.99
 
 
-def test_balanced_blocks_trade_when_forecast_sources_disagree():
+def test_live_blocks_trade_when_forecast_sources_disagree():
     market = _bin(
         "72° to 73°",
         yes_bid=0.49,
@@ -676,7 +681,7 @@ def test_balanced_blocks_trade_when_forecast_sources_disagree():
         model_probability=0.62,
         market_probability=0.55,
     )
-    config = strategy_config_for_profile("balanced")
+    config = strategy_config_for_profile("live")
     evaluator = TradeEvaluator(config)
 
     calm = evaluator.evaluate_market(market, probability, bankroll=1000, source_spread_f=5.0)
@@ -689,32 +694,30 @@ def test_balanced_blocks_trade_when_forecast_sources_disagree():
     assert not stormy.approved
     assert any("source spread" in reason for reason in stormy.reasons)
 
-    fast = TradeEvaluator(strategy_config_for_profile("fast-feedback"))
+    fast = TradeEvaluator(strategy_config_for_profile("research"))
     research = fast.evaluate_market(market, probability, bankroll=1000, source_spread_f=9.6)
     assert research.approved, research.reasons
     extreme = fast.evaluate_market(market, probability, bankroll=1000, source_spread_f=10.1)
     assert not extreme.approved
 
 
-def test_explorer_profiles_allow_reentry_while_balanced_is_one_and_done():
-    # Frequency retune (2026-06-17): the explorer profiles allow re-entry after a
-    # close (lifetime cap 3) to raise paper-trade turnover; the real-money-intent
-    # profiles stay one-and-done so a closed position is never re-bought.
-    assert strategy_config_for_profile("balanced").max_entries_per_market_side == 1
-    assert strategy_config_for_profile("conservative").max_entries_per_market_side == 1
-    assert strategy_config_for_profile("fast-feedback").max_entries_per_market_side == 3
-    assert strategy_config_for_profile("exploratory").max_entries_per_market_side == 3
+def test_research_allows_reentry_while_live_is_one_and_done():
+    # The research collector allows re-entry after a close (lifetime cap 3) to
+    # raise paper-trade turnover; the real-money-intent live profile stays
+    # one-and-done so a closed position is never re-bought.
+    assert strategy_config_for_profile("live").max_entries_per_market_side == 1
+    assert strategy_config_for_profile("research").max_entries_per_market_side == 3
 
 
-def test_balanced_regime_gate_and_strict_floors_unchanged_by_frequency_retune():
+def test_live_regime_gate_and_strict_floors_unchanged_by_frequency_retune():
     # The frequency work must not touch the real-money-intent profile.
-    balanced = strategy_config_for_profile("balanced")
+    balanced = strategy_config_for_profile("live")
     assert balanced.blocked_forecast_cohorts  # warm/hot still blocked
     assert balanced.min_edge_lcb == 0.0  # proven LCB floor intact
     assert balanced.max_spread == 0.07
 
 
-def test_balanced_deploys_meaningful_stake_not_pocket_change():
+def test_live_deploys_meaningful_stake_not_pocket_change():
     # Meaningful-stake retune (2026-06-17): on a $1000 paper book the engine must
     # deploy a real Kelly-sized fraction per favorite (~5%/position), not the
     # ~$2-20 pocket change that left the equity inert. Locks the retune against a
@@ -741,7 +744,7 @@ def test_balanced_deploys_meaningful_stake_not_pocket_change():
         model_probability=0.06,
         market_probability=0.12,
     )
-    cfg = strategy_config_for_profile("balanced")
+    cfg = strategy_config_for_profile("live")
     decision = TradeEvaluator(cfg).evaluate_market(
         market, probability, bankroll=1000.0, side="NO"
     )

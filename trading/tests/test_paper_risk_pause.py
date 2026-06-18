@@ -34,7 +34,7 @@ def _decision(ticker: str = "KXHIGHTSFO-TEST-B70.5") -> TradeDecision:
     )
 
 
-def test_fast_feedback_pauses_after_five_bad_resolved_trades():
+def test_research_pauses_after_five_bad_resolved_trades():
     with TemporaryDirectory() as tmp:
         db_path = Path(tmp) / "paper.db"
         store = PaperStore(db_path)
@@ -42,28 +42,28 @@ def test_fast_feedback_pauses_after_five_bad_resolved_trades():
             order_id = store.record_paper_order(
                 "2026-06-12",
                 _decision(f"KXHIGHTSFO-TEST-B{70 + idx}.5"),
-                risk_profile="fast-feedback",
+                risk_profile="research",
             )
             store.close_paper_order(order_id, 0.01)
 
         reason = store.paper_entry_pause_reason(
-            "fast-feedback",
+            "research",
             bankroll=1000.0,
             target_date="2026-06-13",
         )
 
         assert reason is not None
-        assert "fast-feedback paused" in reason
+        assert "research paused" in reason
         assert "resolved ROI" in reason
         trader = PaperTrader(
             store,
-            strategy_config_for_profile("fast-feedback"),
-            risk_profile="fast-feedback",
+            strategy_config_for_profile("research"),
+            risk_profile="research",
         )
         assert trader.place_approved("2026-06-13", [_decision()], bankroll=1000.0) == []
 
 
-def test_balanced_does_not_pause_from_fast_feedback_losses():
+def test_live_does_not_pause_from_research_losses():
     with TemporaryDirectory() as tmp:
         db_path = Path(tmp) / "paper.db"
         store = PaperStore(db_path)
@@ -71,20 +71,20 @@ def test_balanced_does_not_pause_from_fast_feedback_losses():
             order_id = store.record_paper_order(
                 "2026-06-12",
                 _decision(f"KXHIGHTSFO-TEST-B{70 + idx}.5"),
-                risk_profile="fast-feedback",
+                risk_profile="research",
             )
             store.close_paper_order(order_id, 0.01)
 
         assert store.paper_entry_pause_reason(
-            "balanced",
+            "live",
             bankroll=1000.0,
             target_date="2026-06-13",
         ) is None
 
 
-def test_balanced_pauses_on_its_own_bad_resolved_cohort():
+def test_live_pauses_on_its_own_bad_resolved_cohort():
     # The trading-intent profile now has its own (looser) breaker: 10 resolved
-    # balanced losers trip it on resolved ROI.
+    # live losers trip it on resolved ROI.
     with TemporaryDirectory() as tmp:
         db_path = Path(tmp) / "paper.db"
         store = PaperStore(db_path)
@@ -92,15 +92,15 @@ def test_balanced_pauses_on_its_own_bad_resolved_cohort():
             order_id = store.record_paper_order(
                 "2026-06-12",
                 _decision(f"KXHIGHTSFO-TEST-B{70 + idx}.5"),
-                risk_profile="balanced",
+                risk_profile="live",
             )
             store.close_paper_order(order_id, 0.01)
 
         reason = store.paper_entry_pause_reason(
-            "balanced", bankroll=1000.0, target_date="2026-06-13"
+            "live", bankroll=1000.0, target_date="2026-06-13"
         )
         assert reason is not None
-        assert "balanced paused" in reason
+        assert "live paused" in reason
 
 
 def test_resolved_pause_clears_after_the_window_ages_out():
@@ -113,34 +113,34 @@ def test_resolved_pause_clears_after_the_window_ages_out():
             order_id = store.record_paper_order(
                 "2026-06-12",
                 _decision(f"KXHIGHTSFO-TEST-B{70 + idx}.5"),
-                risk_profile="balanced",
+                risk_profile="live",
             )
             store.close_paper_order(order_id, 0.01)
 
         # Paused now...
         assert store.paper_entry_pause_reason(
-            "balanced", bankroll=1000.0, target_date="2026-06-13"
+            "live", bankroll=1000.0, target_date="2026-06-13"
         ) is not None
         # ...but recovered once the cohort is older than the lookback window.
         later = datetime.now(UTC) + timedelta(days=60)
         assert store.paper_entry_pause_reason(
-            "balanced", bankroll=1000.0, target_date="2026-08-13", now=later
+            "live", bankroll=1000.0, target_date="2026-08-13", now=later
         ) is None
 
 
-def test_fast_feedback_pauses_after_daily_loss_limit():
+def test_research_pauses_after_daily_loss_limit():
     with TemporaryDirectory() as tmp:
         db_path = Path(tmp) / "paper.db"
         store = PaperStore(db_path)
         order_id = store.record_paper_order(
             "2026-06-12",
             _decision(),
-            risk_profile="fast-feedback",
+            risk_profile="research",
         )
         store.close_paper_order(order_id, 0.01)
 
         reason = store.paper_entry_pause_reason(
-            "fast-feedback",
+            "research",
             bankroll=1000.0,
             target_date="2026-06-12",
         )

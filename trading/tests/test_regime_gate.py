@@ -50,9 +50,9 @@ def test_temperature_cohort_boundaries():
     assert temperature_cohort(80.0) == HOT_COHORT
 
 
-def test_balanced_blocks_warm_and_hot_forecast_cohorts():
+def test_live_blocks_warm_and_hot_forecast_cohorts():
     market, probability = _no_favorite()
-    evaluator = TradeEvaluator(strategy_config_for_profile("balanced"))
+    evaluator = TradeEvaluator(strategy_config_for_profile("live"))
     warm = evaluator.evaluate_market(market, probability, bankroll=1000, side="NO", forecast_high_f=75.0)
     hot = evaluator.evaluate_market(market, probability, bankroll=1000, side="NO", forecast_high_f=85.0)
     assert not warm.approved
@@ -60,24 +60,30 @@ def test_balanced_blocks_warm_and_hot_forecast_cohorts():
     assert not hot.approved
 
 
-def test_balanced_trades_cold_and_normal_forecast_cohorts():
+def test_live_does_not_regime_block_cold_and_normal_cohorts():
+    # Isolate the cohort gate: live must NOT raise the regime reason on
+    # cold/normal forecasts. (Full approval also depends on the comfort-edge
+    # gate -- forecasting 65F and betting NO on the 66-67 bin is a 0.5F
+    # coin-flip live now correctly blocks -- so this asserts the regime reason
+    # specifically, not approval.)
     market, probability = _no_favorite()
-    evaluator = TradeEvaluator(strategy_config_for_profile("balanced"))
-    normal = evaluator.evaluate_market(market, probability, bankroll=1000, side="NO", forecast_high_f=65.0)
-    cold = evaluator.evaluate_market(market, probability, bankroll=1000, side="NO", forecast_high_f=55.0)
-    assert normal.approved
-    assert cold.approved
+    evaluator = TradeEvaluator(strategy_config_for_profile("live"))
+    for high in (65.0, 55.0):
+        decision = evaluator.evaluate_market(
+            market, probability, bankroll=1000, side="NO", forecast_high_f=high
+        )
+        assert not any("regime" in r for r in decision.reasons), high
 
 
-def test_fast_feedback_still_explores_warm_days_to_collect_calibration_data():
+def test_research_still_explores_warm_days_to_collect_calibration_data():
     market, probability = _no_favorite()
-    evaluator = TradeEvaluator(strategy_config_for_profile("fast-feedback"))
+    evaluator = TradeEvaluator(strategy_config_for_profile("research"))
     warm = evaluator.evaluate_market(market, probability, bankroll=1000, side="NO", forecast_high_f=75.0)
     assert warm.approved
 
 
 def test_regime_gate_is_inert_without_a_forecast_high():
     market, probability = _no_favorite()
-    evaluator = TradeEvaluator(strategy_config_for_profile("balanced"))
+    evaluator = TradeEvaluator(strategy_config_for_profile("live"))
     decision = evaluator.evaluate_market(market, probability, bankroll=1000, side="NO")
     assert decision.approved

@@ -130,12 +130,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bankroll", type=float, default=None)
     parser.add_argument(
         "--risk-profile",
-        choices=("conservative", "balanced", "exploratory", "fast", "fast-feedback"),
+        # type normalizes legacy aliases (balanced/conservative -> live;
+        # exploratory/fast-feedback/fast -> research) before the choices check,
+        # so old env CSVs and muscle memory keep working while only the two
+        # canonical names are advertised.
+        type=normalize_risk_profile_name,
+        choices=("live", "research"),
         default=None,
+        metavar="{live,research}",
         help=(
-            "Risk gate profile. Defaults to PAPER_RISK_PROFILE or balanced. "
-            "Conservative under-trades; balanced is looser; exploratory collects paper data; "
-            "fast-feedback is the smallest-size, fastest paper-data mode."
+            "Risk gate profile. Defaults to PAPER_RISK_PROFILE or live. "
+            "'live' is the real-money-intent exploiter (paper-only until the "
+            "readiness gate passes); 'research' is the loose, tiny-size data "
+            "collector. Legacy names (balanced/exploratory/fast-feedback) are "
+            "accepted and map onto these two."
         ),
     )
     parser.add_argument("--no-color", action="store_true", help="Disable colored command output")
@@ -255,6 +263,20 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=1.0,
         help="Paper dollars to spend on the approved center YES leg. Use 0 to disable. Default: 1.",
+    )
+    basket.add_argument(
+        "--basket-sizing",
+        choices=("fixed", "kelly"),
+        default="fixed",
+        help=(
+            "How to size approved far-tail NO legs. 'fixed' spends --tail-stake "
+            "dollars per leg (the small bounded guardrail). 'kelly' instead sizes "
+            "each leg off the evaluator's risk budget (quarter-Kelly + comfort "
+            "boost, capped by max_position/event_risk_pct) so the basket deploys "
+            "meaningful capital and swings -- still bounded by --max-basket-spend "
+            "and --max-worst-case-loss, and still held to a non-negative "
+            "lower-bound edge. Default: fixed."
+        ),
     )
     basket.add_argument(
         "--max-tail-probability",
@@ -1030,6 +1052,11 @@ def _analyze_one_target(
         sides=_analysis_sides(args.side),
         source_spread_f=forecast.source_spread_f,
         forecast_high_f=forecast.predicted_high_f,
+        # The day's source disagreement is the comfort-edge uncertainty proxy:
+        # on a calm (low-spread) day the band floors to ~3F block / ~6F full;
+        # on a disagreement day it widens, so near-forecast NO is blocked further
+        # out. Floored inside the assessment so it never collapses.
+        forecast_sigma_f=forecast.source_spread_f,
     )
     entry_allowed = True
     entry_block_reason = None
@@ -1270,7 +1297,9 @@ def _tail_basket_one_target(
         evaluator=evaluator,
         bankroll=paper_bankroll,
         tail_distance_f=args.tail_distance,
-        tail_stake=args.tail_stake,
+        # In 'kelly' mode pass no fixed stake so each leg keeps the evaluator's
+        # risk-budget (Kelly + comfort) size instead of a hardcoded few dollars.
+        tail_stake=None if args.basket_sizing == "kelly" else args.tail_stake,
         center_stake=args.center_stake,
         max_tail_yes_probability=args.max_tail_probability,
         max_basket_spend=args.max_basket_spend,

@@ -373,8 +373,8 @@ def test_strategy_research_does_not_alert_on_same_market_across_profiles():
 
         store = PaperStore(db_path)
         decision = _approved_decision()
-        store.record_paper_order("2026-06-03", decision, risk_profile="balanced")
-        store.record_paper_order("2026-06-03", decision, risk_profile="fast-feedback")
+        store.record_paper_order("2026-06-03", decision, risk_profile="live")
+        store.record_paper_order("2026-06-03", decision, risk_profile="research")
 
         payload = build_strategy_research(
             forecaster_root=root,
@@ -397,9 +397,9 @@ def test_strategy_research_scopes_duplicate_alerts_to_profile_views():
         store = PaperStore(db_path)
         balanced = replace(_approved_decision(), ticker="KXHIGHTSFO-TEST-B65.5")
         fast = _approved_decision()
-        store.record_paper_order(target, balanced, risk_profile="balanced")
-        store.record_paper_order(target, fast, risk_profile="fast-feedback")
-        store.record_paper_order(target, fast, risk_profile="fast-feedback")
+        store.record_paper_order(target, balanced, risk_profile="live")
+        store.record_paper_order(target, fast, risk_profile="research")
+        store.record_paper_order(target, fast, risk_profile="research")
 
         payload = build_strategy_research(
             forecaster_root=root,
@@ -409,10 +409,10 @@ def test_strategy_research_scopes_duplicate_alerts_to_profile_views():
 
         profiles = {row["risk_profile"]: row for row in payload["profiles"]}
         balanced_alerts = {
-            alert["code"] for alert in profiles["balanced"]["status"]["alerts"]
+            alert["code"] for alert in profiles["live"]["status"]["alerts"]
         }
         fast_alerts = {
-            alert["code"] for alert in profiles["fast-feedback"]["status"]["alerts"]
+            alert["code"] for alert in profiles["research"]["status"]["alerts"]
         }
 
         assert "duplicate-open-markets" in {
@@ -420,7 +420,7 @@ def test_strategy_research_scopes_duplicate_alerts_to_profile_views():
         }
         assert "duplicate-open-markets" not in balanced_alerts
         assert "duplicate-open-markets" in fast_alerts
-        assert profiles["fast-feedback"]["paper_trading"]["summary"]["duplicate_open_groups"] == 1
+        assert profiles["research"]["paper_trading"]["summary"]["duplicate_open_groups"] == 1
 
 
 def test_strategy_research_builds_isolated_profile_views():
@@ -450,15 +450,15 @@ def test_strategy_research_builds_isolated_profile_views():
             cap_strike=66.0,
         )
 
-        store.record_decisions(today, [balanced_win], risk_profile="balanced")
-        store.record_decisions(tomorrow, [fast_open], risk_profile="fast-feedback")
-        store.record_paper_order(today, balanced_win, risk_profile="balanced")
-        store.record_paper_order(today, fast_loss, risk_profile="fast-feedback")
+        store.record_decisions(today, [balanced_win], risk_profile="live")
+        store.record_decisions(tomorrow, [fast_open], risk_profile="research")
+        store.record_paper_order(today, balanced_win, risk_profile="live")
+        store.record_paper_order(today, fast_loss, risk_profile="research")
         store.settle_paper_orders(today, 67.0)
         open_order_id = store.record_paper_order(
             tomorrow,
             fast_open,
-            risk_profile="fast-feedback",
+            risk_profile="research",
         )
         open_order = store.open_paper_order(open_order_id)
         assert open_order is not None
@@ -481,12 +481,12 @@ def test_strategy_research_builds_isolated_profile_views():
             calibration_min_train=40,
         )
 
-        assert payload["default_profile"] == "balanced"
+        assert payload["default_profile"] == "live"
         profiles = {row["risk_profile"]: row for row in payload["profiles"]}
-        assert set(profiles) == {"balanced", "fast-feedback"}
+        assert set(profiles) == {"live", "research"}
 
-        balanced = profiles["balanced"]
-        fast = profiles["fast-feedback"]
+        balanced = profiles["live"]
+        fast = profiles["research"]
         assert balanced["profile_type"] == "primary"
         assert fast["profile_type"] == "experimental"
 
@@ -496,11 +496,11 @@ def test_strategy_research_builds_isolated_profile_views():
         assert {
             row["risk_profile"]
             for row in balanced["paper_trading"]["recent_monitor_actions"]
-        } == {"balanced"}
+        } == {"live"}
         assert {
             row["risk_profile"]
             for row in balanced["signal_quality"]["latest_candidates"]
-        } == {"balanced"}
+        } == {"live"}
 
         assert fast["daily_summary"]["totals"]["realized_pnl"] < 0
         assert fast["daily_summary"]["totals"]["wins"] == 0
@@ -508,7 +508,7 @@ def test_strategy_research_builds_isolated_profile_views():
         assert {
             row["risk_profile"]
             for row in fast["paper_trading"]["recent_monitor_actions"]
-        } == {"fast-feedback"}
+        } == {"research"}
         assert {
             row["status"]
             for row in fast["paper_trading"]["recent_monitor_actions"]
@@ -516,8 +516,8 @@ def test_strategy_research_builds_isolated_profile_views():
         assert {
             row["risk_profile"]
             for row in fast["signal_quality"]["latest_candidates"]
-        } == {"fast-feedback"}
-        assert any("fast-feedback" in note for note in fast["learnings"])
+        } == {"research"}
+        assert any("research" in note for note in fast["learnings"])
 
         # FIX E/F: per-profile live equity and YES/NO + exit breakdowns now live
         # on each profile's daily_summary, not just the All-profiles overview.
@@ -559,11 +559,20 @@ def test_strategy_research_includes_config_rescore():
 
         rescore = payload["config_rescore"]
         assert rescore["available"] is True, rescore.get("reason")
-        assert set(rescore["by_profile"]) == {"balanced", "fast-feedback", "exploratory"}
+        assert set(rescore["by_profile"]) == {"live", "research"}
         for result in rescore["by_profile"].values():
             assert {"counts", "candidate", "recorded_config_own_book"} <= set(result)
             # per_day is trimmed from the published artifact to keep it lean.
             assert "per_day" not in result
+
+        # The real-money readiness gauge is derived for the LIVE profile only and
+        # exposes a percentage + per-check breakdown for the dashboard.
+        readiness = payload["real_money_readiness"]
+        assert readiness["available"] is True, readiness.get("reason")
+        assert readiness["profile"] == "live"
+        assert 0.0 <= readiness["readiness_pct"] <= 100.0
+        assert readiness["ready"] is False  # a one-day fixture cannot be ready
+        assert readiness["checks"] and all("progress" in c for c in readiness["checks"])
 
 
 def test_strategy_research_cli_writes_public_artifact():

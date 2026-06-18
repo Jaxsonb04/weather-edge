@@ -55,6 +55,18 @@ if [[ "${#present_artifacts[@]}" -eq 0 ]]; then
   exit 0
 fi
 
+# Serialize publishers on the box so the hourly forecaster-refresh and the
+# 5-minute strategy-lab-refresh cannot race the same gh-pages ref (the
+# documented intermittent "publish failed" was a non-fast-forward push from two
+# overlapping runs). flock is the primary on-box serializer; it is a no-op where
+# unavailable (e.g. local macOS dev), and the fetch+retry loop below is the
+# portable backstop that also survives any out-of-band pusher.
+PAGES_LOCK="${SFO_PAGES_LOCK:-${TMPDIR:-/tmp}/sfo-weather-pages.lock}"
+if command -v flock >/dev/null 2>&1; then
+  exec 9>"$PAGES_LOCK"
+  flock 9
+fi
+
 publish_dir="$(mktemp -d "${TMPDIR:-/tmp}/sfo-weather-pages.XXXXXX")"
 trap 'rm -rf "$publish_dir"' EXIT
 
@@ -64,25 +76,47 @@ git remote add origin "$REMOTE_URL"
 git config user.name "${SFO_PAGES_GIT_AUTHOR_NAME:-JaxsonB04}"
 git config user.email "${SFO_PAGES_GIT_AUTHOR_EMAIL:-JaxsonB04@users.noreply.github.com}"
 
-if git fetch origin "$PAGES_BRANCH" >/dev/null 2>&1; then
-  git checkout -B "$PAGES_BRANCH" "origin/$PAGES_BRANCH" >/dev/null
-else
-  git checkout --orphan "$PAGES_BRANCH" >/dev/null
-fi
+# Re-fetch the remote tip, re-apply artifacts onto it, commit and push -- and on
+# a non-fast-forward rejection (another publisher pushed between our fetch and
+# push) start over from the fresh tip. "Lost the race" is success, not failure:
+# the other run published the same artifacts. Bounded so a genuinely broken
+# remote still surfaces an error instead of looping forever.
+attempts="${SFO_PAGES_PUSH_ATTEMPTS:-4}"
+attempt=1
+while true; do
+  if git fetch origin "$PAGES_BRANCH" >/dev/null 2>&1; then
+    git checkout -B "$PAGES_BRANCH" "origin/$PAGES_BRANCH" >/dev/null
+  else
+    git checkout --orphan "$PAGES_BRANCH" >/dev/null 2>&1 \
+      || git checkout -B "$PAGES_BRANCH" >/dev/null
+  fi
 
-find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+  find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
 
-for artifact_path in "${present_artifacts[@]}"; do
-  cp "$artifact_path" "./$(basename "$artifact_path")"
+  for artifact_path in "${present_artifacts[@]}"; do
+    cp "$artifact_path" "./$(basename "$artifact_path")"
+  done
+  touch .nojekyll
+
+  git add -A
+
+  if git diff --cached --quiet; then
+    echo "GitHub Pages artifacts unchanged"
+    exit 0
+  fi
+
+  git commit -m "Update SFO weather dashboard" >/dev/null
+
+  if git push origin "HEAD:$PAGES_BRANCH"; then
+    echo "Published SFO weather dashboard to $PAGES_BRANCH"
+    exit 0
+  fi
+
+  if (( attempt >= attempts )); then
+    echo "gh-pages push failed after $attempt attempts" >&2
+    exit 1
+  fi
+  echo "gh-pages push rejected (attempt $attempt/$attempts); re-fetching fresh tip and retrying" >&2
+  attempt=$((attempt + 1))
+  sleep "$attempt"
 done
-touch .nojekyll
-
-git add -A
-
-if git diff --cached --quiet; then
-  echo "GitHub Pages artifacts unchanged"
-  exit 0
-fi
-
-git commit -m "Update SFO weather dashboard"
-git push origin "HEAD:$PAGES_BRANCH"

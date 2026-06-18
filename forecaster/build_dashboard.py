@@ -18,6 +18,18 @@ from dashboard_payload import prepare_dashboard_context
 
 TEMPLATES = Path(__file__).parent / "templates"
 STRATEGY_RESEARCH_JSON = Path("strategy_research.json")
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write via temp + os.replace so the every-5-minute strategy-lab refresh and
+    the hourly forecaster refresh -- which build these same artifacts into the
+    shared dir that the publisher then copies -- can never expose a half-written
+    HTML/JSON file. os.replace is atomic within one filesystem."""
+
+    path = Path(path)
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)
 PROTECTED_STRATEGY_RESEARCH_JSON = Path("strategy_research.protected.json")
 STRATEGY_LAB_PUBLIC_MODE_ENV = "SFO_STRATEGY_LAB_PUBLIC_MODE"
 STRATEGY_LAB_PASSWORD_ENV = "SFO_STRATEGY_LAB_PASSWORD"
@@ -147,8 +159,9 @@ def protect_strategy_research(source_path, target_path):
 
     iterations = strategy_lab_iterations()
     payload = encrypt_strategy_lab_bytes(source_path.read_bytes(), password, iterations)
-    target_path.write_text(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+    _atomic_write_text(
+        target_path,
+        json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
     )
     return {
         "enabled": True,
@@ -192,7 +205,7 @@ def write_strategy_research_placeholder(path):
     payload = {
         "schema_version": 1,
         "available": False,
-        "default_profile": "balanced",
+        "default_profile": "live",
         "local_runtime_placeholder": True,
         "mode": "paper_research_only",
         "live_orders_enabled": False,
@@ -318,7 +331,7 @@ def write_strategy_research_placeholder(path):
         ],
         "disclaimer": "Paper-trading research only. AWS execution remains pinned to lstm.",
     }
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    _atomic_write_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
 def main():
@@ -350,9 +363,9 @@ def main():
         }
     )
 
-    Path("index.html").write_text(render("landing.html", replacements))
-    Path("details.html").write_text(render("details.html", replacements))
-    Path("strategy-lab.html").write_text(render("strategy-lab.html", replacements))
+    _atomic_write_text(Path("index.html"), render("landing.html", replacements))
+    _atomic_write_text(Path("details.html"), render("details.html", replacements))
+    _atomic_write_text(Path("strategy-lab.html"), render("strategy-lab.html", replacements))
     if strategy_lab_protection["enabled"]:
         print("wrote index.html, details.html, strategy-lab.html, and strategy_research.protected.json")
     else:

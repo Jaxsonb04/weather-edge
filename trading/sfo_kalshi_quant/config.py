@@ -155,10 +155,45 @@ class StrategyConfig:
     # from temperature_cohort(). The explorer profiles keep these empty so they
     # collect the cohort data recalibration needs.
     blocked_forecast_cohorts: tuple[str, ...] = ()
+    # --- Comfortable far-tail NO entry (the "edge" idea) ---------------------
+    # When True, NO bets are gated and sized by how far the market bin sits from
+    # the point forecast. Bins comfortably out in the tail -- where a forecast
+    # miss of a few F cannot reach -- are the high-confidence NO favorites; bins
+    # near the forecast are coin-flips and the documented live loss source (the
+    # 06-14/06-17 B72.5/B74.5/B76.5 NO bets all settled in-bin against a ~2.46F
+    # mean forecast error). With this on, near-forecast NO bets are blocked and
+    # far-tail NO bets are sized up -- but every existing gate AND the positive
+    # after-fee edge_lcb floor still bind, so it never creates a negative-EV
+    # bet. Off on the strict baseline and the research collector (which collects
+    # the full opportunity set, center bins included); on for the live profile.
+    comfort_edge_enabled: bool = False
+    # Comfort distances are uncertainty-scaled: a multiple of the day's forecast
+    # sigma, floored so a calm-day band cannot collapse below the irreducible
+    # single-model error. The floor is set to ~p75 of the REALIZED |forecast
+    # error| (not the mean 2.46F and not source agreement, which understate a
+    # calm day's true miss): realized error is mean 3.2F, p90 ~6.4F, so a 3.0F
+    # floor puts the block band at ~3.75F (covers ~p75 of misses) and full size
+    # at ~7.5F (~p93) -- i.e. a bin is only "comfortably far" once a typical miss
+    # cannot reach it. Source spread still widens the band above the floor on
+    # disagreement days; the floor applies when no per-day sigma is threaded.
+    comfort_edge_sigma_floor_f: float = 3.0
+    # NO bets whose bin sits within block_mult * sigma of the forecast are
+    # rejected as coin-flips (the loss source). 1.25 * 3.0 = 3.75F.
+    comfort_edge_block_sigma_mult: float = 1.25
+    # NO bets at/beyond full_mult * sigma get the full size boost; the boost
+    # tapers linearly from the block band up to here. 2.5 * 3.0 = 7.5F (~p93 of
+    # realized forecast error, so full confidence means a typical miss can't reach it).
+    comfort_edge_full_sigma_mult: float = 2.5
+    # Max Kelly size multiplier applied to a NO bet at/beyond the full distance
+    # (1.0 = no boost). The boost still passes every gate and the positive
+    # after-fee edge_lcb floor, so it only leans harder into far tails that
+    # already clear the gates -- it never manufactures a bet that was not there.
+    comfort_edge_max_size_boost: float = 2.0
 
 
-BALANCED_PROFILE_OVERRIDES = {
-    # Paper-trading default. The first live month (Jun 2026) proved that
+LIVE_PROFILE_OVERRIDES = {
+    # The real-money-INTENT profile (paper-only until the readiness gate in
+    # backtest_rescore.py passes). The first live month (Jun 2026) proved that
     # negative lower-bound edge collects only noise: 190 approved trades with
     # edge_lcb < 0 produced a 3/190 win rate, while sub-5c tails won 1.9%
     # against a modeled 8.7%. Balanced now keeps the conservative statistical
@@ -197,7 +232,11 @@ BALANCED_PROFILE_OVERRIDES = {
     # cap, the book deployed pocket change on a $1000 bankroll. Quarter-Kelly
     # (MacLean/Thorp/Ziemba 2010: ~half-Kelly's growth at far lower drawdown) lets
     # size actually track edge. Conservative base stays at the strict 0.15/1.0.
-    "fractional_kelly": 0.25,
+    # Volatility retune (2026-06-18): nudged 0.25 -> 0.30 (between quarter- and
+    # third-Kelly, still well below half-Kelly) so thin-edge trades whose Kelly
+    # budget sits below the per-position cap also deploy more -- more swing on the
+    # days the position cap is NOT the binding lever. PENDING walk-forward validation.
+    "fractional_kelly": 0.30,
     # Size off a less-pessimistic blend of the point estimate and its lower
     # bound rather than the pure LCB. kelly_lcb_weight=1.0 sized off the LCB
     # alone, which on a typical favorite (point ~0.94 vs LCB ~0.89) cut the Kelly
@@ -220,9 +259,18 @@ BALANCED_PROFILE_OVERRIDES = {
     # Paper-realism only; the real-money gate (walk-forward, after-fee, per-cohort
     # validation over >=30 independent days) is UNCHANGED. Conservative base stays
     # frozen-notional and strict as the reproducible control.
-    "max_position_risk_pct": 0.05,
-    "max_event_risk_pct": 0.08,
-    "max_target_exposure_pct": 0.12,
+    #
+    # VOLATILITY RETUNE (2026-06-18): the old 5%/8%/12% caps left the equity inert
+    # ($1-2 swings) because the $50 per-position cap bound below quarter-Kelly's
+    # $87-128 want on a real edge. Raised to 8%/12%/18% so Kelly's chosen size
+    # actually flows and the book visibly moves -- worst-case single-day loss is
+    # bounded to ~18% of equity (~$180 on $1000), which is the owner's stated
+    # paper appetite. The positive after-fee edge_lcb>=0 floor is UNCHANGED, so a
+    # bigger size is still a positive-EV bet, never a manufactured negative-EV one.
+    # PENDING walk-forward validation before any real-money use.
+    "max_position_risk_pct": 0.08,
+    "max_event_risk_pct": 0.12,
+    "max_target_exposure_pct": 0.18,
     "max_forecast_age_hours": 12.0,
     "max_contracts_per_market": 100.0,
     "max_source_spread_f": 7.0,
@@ -233,106 +281,75 @@ BALANCED_PROFILE_OVERRIDES = {
     # so the strict test baseline remains reproducible. Effect is ~nil today
     # (equity ~= $1000) and grows only as the book does.
     "size_against_live_equity": True,
+    # Comfortable far-tail NO entry (see StrategyConfig.comfort_edge_*). Live
+    # blocks near-forecast coin-flip NO bets (the documented loss source) and
+    # sizes up genuine far tails, keeping the positive after-fee edge_lcb floor.
+    # The research collector leaves this OFF so it still records the center bins
+    # the readiness rescore needs to prove the rule actually helps.
+    "comfort_edge_enabled": True,
 }
 
 
-EXPLORATORY_PROFILE_OVERRIDES = {
-    # Paper-data collection mode for sparse markets. This should never be used
-    # as a live-money profile; it trades a looser statistical bar for much
-    # smaller size. Tuned (2026-06-17) to be a genuine SECOND high-volume
-    # collector alongside fast-feedback: same tiny size, but its own paper book
-    # (orders are risk_profile-scoped, so it holds positions independently),
-    # which roughly doubles paper-trade throughput on the same opportunity set.
-    **BALANCED_PROFILE_OVERRIDES,
-    # Size off live equity so this book compounds and fluctuates like the others;
-    # its per-day risk budget below keeps it well under balanced.
-    "size_against_live_equity": True,
-    # The explorer collects raw/marginal YES to learn whether YES can work; the
-    # strict YES gates belong on balanced (the exploiter), not here.
-    "yes_estimation_shrink": False,
-    # The explorer trades the warm/hot regime to collect the very calibration
-    # data recalibration needs; the regime block is balanced-only.
-    "blocked_forecast_cohorts": (),
-    # Frequency retune (2026-06-17): loosen the POINT-edge gates so exploratory
-    # approves more distinct market/sides than before (0.01 -> 0.008 min_edge,
-    # 0.08 -> 0.06 posterior), while staying a notch stricter than fast-feedback
-    # (which remains the most-active profile). The lower-bound-edge floor stays
-    # bounded (-0.05, tighter than fast-feedback's -0.07) -- the LCB floor is the
-    # EV guardrail, so it is loosened far less than the point gates.
-    "min_edge": 0.008,
-    "min_edge_lcb": -0.05,
-    "max_spread": 0.10,
-    "max_model_market_gap": 0.20,
-    "min_posterior_probability": 0.06,
-    # Meaningful-stake retune (2026-06-17): a real (~quarter-Kelly) research book,
-    # ~$20/position and ~6%/day on a $1000 equity -- no longer pocket change, but
-    # held below balanced so an unproven explorer idea cannot scale a large loss.
-    "fractional_kelly": 0.15,
-    "max_position_risk_pct": 0.02,
-    "max_event_risk_pct": 0.04,
-    "max_target_exposure_pct": 0.06,
-    "max_contracts_per_market": 30.0,
-    # Allow re-entry after a close (lifetime cap 3) instead of one-and-done per
-    # market/side. has_active_paper_entry still blocks concurrent double-holding,
-    # so this only lets a closed position be re-entered when the edge returns --
-    # more turnover, not more simultaneous risk. Explorer-only; balanced stays 1.
-    "max_entries_per_market_side": 3,
-    "max_source_spread_f": 8.0,
-    "cheap_tail_min_probability_lcb": 0.10,
-    "cheap_tail_min_edge_lcb": 0.04,
-    "edge_gate_uses_model_probability": True,
-}
-
-
-FAST_FEEDBACK_PROFILE_OVERRIDES = {
-    # Paper-only acceleration mode. This is intentionally easier to trigger
-    # than exploratory so the project can collect enough entries to learn from,
-    # while position size is capped hard enough that bad research ideas stay
-    # small in the paper journal.
-    **BALANCED_PROFILE_OVERRIDES,
+# The single data-collection profile (merged from the former `exploratory` and
+# `fast-feedback` books). It takes the loosest gates so it approves the widest
+# opportunity set, at the smallest size so a bad research idea stays tiny in the
+# paper journal -- "collect as much data as possible, risk almost nothing." It
+# is paper-only and is never a real-money candidate; only `live` is judged by
+# the real-money readiness gate. Legacy `exploratory`/`fast-feedback`/`fast`
+# names normalize to this profile so historical paper books roll into it.
+RESEARCH_PROFILE_OVERRIDES = {
+    # Starts from the live gates, then takes the LOOSEST bar of the two former
+    # collectors (so it approves the widest opportunity set) at the SMALLEST
+    # size of the two (so a bad research idea stays tiny). Reconciled from the
+    # old exploratory + fast-feedback dicts: loosest of {min_edge 0.008/0.005,
+    # min_edge_lcb -0.05/-0.07, posterior 0.06/0.05, gap 0.20/0.25, source
+    # spread 8/10}, smallest of {kelly 0.15/0.12, pos_risk 0.02/0.015, event
+    # 0.04/0.03, target 0.06/0.05, contracts 30/25}. Effectively the old
+    # fast-feedback envelope, which was already the loosest + smallest.
+    **LIVE_PROFILE_OVERRIDES,
     # Size off live equity so this book compounds and fluctuates; the small
     # per-day risk budget below keeps a bad research idea bounded.
     "size_against_live_equity": True,
-    # Explorer collects raw/marginal YES; the strict YES gates are balanced-only.
+    # The collector records raw/marginal YES to learn whether YES can work; the
+    # strict YES gates belong on live (the exploiter), not here.
     "yes_estimation_shrink": False,
-    # Explorer trades the warm/hot regime to collect calibration data.
+    # The collector trades the warm/hot regime to collect the calibration data
+    # recalibration needs; the regime block is live-only.
     "blocked_forecast_cohorts": (),
+    # The collector records the FULL opportunity set (center bins included) so
+    # the readiness rescore can prove the comfort-edge rule helps before live
+    # adopts it; comfort gating/sizing is therefore off here.
+    "comfort_edge_enabled": False,
+    # The loosest collector must record the widest forecast-age window: it would
+    # otherwise silently inherit live's tightened 12h freshness gate via the
+    # **LIVE_PROFILE_OVERRIDES spread, which is STRICTER than the base 30h and
+    # discards exactly the 12-30h-old snapshots the collector exists to gather.
+    "max_forecast_age_hours": 30.0,
+    # Loosest point gates of the two former collectors.
     "min_edge": 0.005,
-    # Frequency retune (2026-06-16, see docs/trading_engine_diagnosis_2026-06-16.md).
-    # The lower-bound-edge floor was the single most-binding gate: it rejected
-    # 19/24 live candidates and was the SOLE blocker on all 4 genuine
-    # positive-point-edge candidates (their prob_lcb is haircut ~0.17 for
-    # model-vs-market disagreement, dragging edge_lcb negative while point edge
-    # stays strongly positive). Loosening -0.03 -> -0.07 recovers exactly 2
-    # positive-EV trades (approval 0% -> 8%) that are negative only under the
-    # variance buffer, never under EV. Research-profile only; downside is capped
-    # at ~$2/trade. The proven edge_lcb >= 0 floor on balanced/conservative that
-    # fenced off the documented 3/190 negative-LCB failure is left UNCHANGED.
+    # The lower-bound-edge floor is the EV guardrail, so it is loosened far less
+    # than the point gates; -0.07 was the loosest the two collectors used. The
+    # proven edge_lcb >= 0 floor on the LIVE profile is left UNCHANGED.
     "min_edge_lcb": -0.07,
-    # Frequency retune (2026-06-17): widen the spread ceiling a touch so a few
-    # more wider-book markets clear at tiny size, and allow re-entry after a
-    # close (lifetime cap 3, guarded by has_active_paper_entry against concurrent
-    # holding) so a closed position can be re-bought when the edge returns. The
-    # proven edge_lcb >= 0 floor on balanced/conservative is left UNCHANGED.
     "max_spread": 0.10,
     "max_spread_fraction_of_cost": 0.50,
-    "max_entries_per_market_side": 3,
-    "min_yes_bid": 0.01,
-    "min_yes_bid_size": 1.0,
     "max_model_market_gap": 0.25,
     "min_posterior_probability": 0.05,
-    # Meaningful-stake retune (2026-06-17): the most-active research book, lifted
-    # from ~$2/position pocket change to ~$15/position and ~5%/day on a $1000
-    # equity. Stays the smallest live profile (< exploratory < balanced) so the
-    # loosest gates never scale a large loss; downside per trade is now ~$15, not
-    # ~$2, which is the point -- the book has to move to teach us anything.
+    "min_yes_bid": 0.01,
+    "min_yes_bid_size": 1.0,
+    # Smallest size of the two former collectors -- tiny on purpose.
     "fractional_kelly": 0.12,
     "kelly_lcb_weight": 0.5,
     "max_position_risk_pct": 0.015,
     "max_event_risk_pct": 0.03,
     "max_target_exposure_pct": 0.05,
     "max_contracts_per_market": 25.0,
-    # Paper feedback can tolerate moderate source disagreement, but not the
+    # Allow re-entry after a close (lifetime cap 3) instead of one-and-done per
+    # market/side. has_active_paper_entry still blocks concurrent double-holding,
+    # so this only lets a closed position be re-entered when the edge returns --
+    # more turnover, not more simultaneous risk. Collector-only; live stays 1.
+    "max_entries_per_market_side": 3,
+    # Tolerates moderate source disagreement to collect more, but not the
     # 2026-06-10/12 regime where models were separated by double-digit F.
     "max_source_spread_f": 10.0,
     "cheap_tail_min_yes_bid": 0.01,
@@ -345,32 +362,44 @@ FAST_FEEDBACK_PROFILE_OVERRIDES = {
 }
 
 
+# Two profiles only: `live` (the real-money-INTENT exploiter, paper-only until
+# the readiness gate passes) and `research` (the data collector). Legacy names
+# are accepted as aliases and fold into the survivor so historical paper books
+# and stored `risk_profile` strings keep rolling up correctly:
+#   balanced, conservative   -> live
+#   exploratory, fast-feedback, fast, collector, explore -> research
+# This is also the read-side half of the rename: any legacy string read out of
+# the DB normalizes to the new profile; db.init() additionally rewrites the
+# stored strings once so raw SQL filters stay correct.
+_LIVE_ALIASES = {"", "live", "balanced", "conservative", "real"}
+_RESEARCH_ALIASES = {
+    "research",
+    "exploratory",
+    "fast-feedback",
+    "fast",
+    "collector",
+    "explore",
+}
+
+
 def normalize_risk_profile_name(profile: str | None = None) -> str:
-    normalized = (profile or os.getenv("PAPER_RISK_PROFILE", "balanced")).strip().lower()
+    normalized = (profile or os.getenv("PAPER_RISK_PROFILE", "live")).strip().lower()
     normalized = normalized.replace("_", "-")
-    if normalized in ("", "conservative"):
-        return "conservative"
-    if normalized == "balanced":
-        return "balanced"
-    if normalized == "exploratory":
-        return "exploratory"
-    if normalized in ("fast", "fast-feedback"):
-        return "fast-feedback"
-    raise ValueError("risk profile must be conservative, balanced, exploratory, or fast-feedback")
+    if normalized in _LIVE_ALIASES:
+        return "live"
+    if normalized in _RESEARCH_ALIASES:
+        return "research"
+    raise ValueError("risk profile must be 'live' or 'research'")
 
 
 def strategy_config_for_profile(profile: str | None = None) -> StrategyConfig:
     normalized = normalize_risk_profile_name(profile)
     base = StrategyConfig()
-    if normalized == "conservative":
-        return base
-    if normalized == "balanced":
-        return StrategyConfig(**{**base.__dict__, **BALANCED_PROFILE_OVERRIDES})
-    if normalized == "exploratory":
-        return StrategyConfig(**{**base.__dict__, **EXPLORATORY_PROFILE_OVERRIDES})
-    if normalized == "fast-feedback":
-        return StrategyConfig(**{**base.__dict__, **FAST_FEEDBACK_PROFILE_OVERRIDES})
-    raise ValueError("risk profile must be conservative, balanced, exploratory, or fast-feedback")
+    if normalized == "live":
+        return StrategyConfig(**{**base.__dict__, **LIVE_PROFILE_OVERRIDES})
+    if normalized == "research":
+        return StrategyConfig(**{**base.__dict__, **RESEARCH_PROFILE_OVERRIDES})
+    raise ValueError("risk profile must be 'live' or 'research'")
 
 
 def project_path(*parts: str) -> Path:

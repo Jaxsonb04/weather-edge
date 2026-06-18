@@ -57,21 +57,20 @@ Without installing first:
 bash scripts/paper_analyze.sh
 ```
 
-Paper analysis defaults to the balanced paper-research profile. Use
-`--risk-profile conservative` when you want the stricter baseline, or
-`--risk-profile exploratory` when you want smaller-size paper data collection.
-Use `--risk-profile fast-feedback` when you want the loosest paper-only gates
-with very small entries so the journal fills faster:
+Paper analysis defaults to the `live` paper-research profile (the stricter,
+real-trading-candidate book, paper-only until a readiness gate passes). Use
+`--risk-profile research` when you want the loosest paper-only gates at the
+smallest size so the journal fills faster with the full opportunity set:
 
 ```bash
-python -m sfo_kalshi_quant.cli --no-color --risk-profile conservative analyze --target-date both
-python -m sfo_kalshi_quant.cli --no-color --risk-profile fast-feedback analyze --target-date rolling --side both --place-paper --paper-stake 5
+python -m sfo_kalshi_quant.cli --no-color --risk-profile live analyze --target-date both
+python -m sfo_kalshi_quant.cli --no-color --risk-profile research analyze --target-date rolling --side both --place-paper --paper-stake 5
 ```
 
-To run balanced and fast-feedback side by side in one paper DB, set:
+To run live and research side by side in one paper DB, set:
 
 ```bash
-PAPER_RISK_PROFILES=balanced,fast-feedback bash scripts/paper_analyze.sh --target-date rolling --place-paper
+PAPER_RISK_PROFILES=live,research bash scripts/paper_analyze.sh --target-date rolling --place-paper
 ```
 
 Record paper trades only when the CLI says `TRADE`:
@@ -122,8 +121,8 @@ python -m sfo_kalshi_quant.cli paper-settle --target-date YYYY-MM-DD --settlemen
 `daily-report` is read-only dashboard input; it does not record DB snapshots or
 place paper orders.
 
-Strategy Lab defaults to the balanced profile view, so experimental
-fast-feedback results do not contaminate the balanced headline P&L, hit rate,
+Strategy Lab defaults to the `live` profile view, so the wider-net
+`research` results do not contaminate the `live` headline P&L, hit rate,
 open risk, daily rows, signals, actions, or learnings. The AWS
 `sfo-strategy-lab-refresh.timer` republishes those trading results every five
 minutes without calling the paid Google Weather refresh path.

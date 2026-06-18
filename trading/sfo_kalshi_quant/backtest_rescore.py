@@ -48,6 +48,31 @@ from .risk import TradeEvaluator
 _RETURN_FLOOR = 1e-9
 
 
+@dataclass(frozen=True)
+class ReadinessThresholds:
+    """The codified real-money go-live bar.
+
+    Defaults are the project's own documented gate (docs/trade_engine_overhaul_
+    plan_2026-06-17.md:91, docs/trading_retune_validation_2026-06-17.md:97):
+    positive after-fee day-clustered ROI lower CI AND positive log-growth per
+    independent day -- per side and per traded cohort -- over >=30 independent
+    settlement days, with every traded cohort showing forecast SKILL (Brier Skill
+    Score > 0, i.e. the model beats the climatological prior). A flat absolute
+    Brier bar (the old max_cohort_brier=0.25) was unachievable on the interior
+    2F bins by any calibrated model and is retained only for display context.
+    """
+
+    min_independent_days: int = 30
+    min_settled_decisions: int = 30
+    min_cohort_independent_days: int = 10
+    min_side_independent_days: int = 10
+    # The forecaster must BEAT climatology (skill > 0) on every traded cohort.
+    # Strictly positive: skill == 0 means no edge over the no-skill prior.
+    min_cohort_brier_skill: float = 0.0
+    max_cohort_brier: float = 0.25  # retained for display/detail only
+    max_calibration_gap: float = 0.10
+
+
 def _opt_float(row: sqlite3.Row, key: str) -> float | None:
     try:
         value = row[key]
@@ -221,7 +246,13 @@ class _Scored:
     target_date: str
     side: str
     settlement_high_f: float
+    # cohort = settled-high regime (for calibration/diagnostics). forecast_cohort
+    # = the regime the live block actually gated on at entry time (it only knows
+    # the forecast, not the settled high). Readiness must scope "traded cohort" by
+    # forecast_cohort so a forecast-normal day that settles warm does not become a
+    # "traded warm cohort" demanding a warm skill the block was meant to avoid.
     cohort: str
+    forecast_cohort: str
     contracts: float
     cost: float
     capital: float
@@ -364,6 +395,9 @@ def run_rescore(
             side=side,
             source_spread_f=_opt_float(row, "forecast_source_spread_f"),
             forecast_high_f=_opt_float(row, "forecast_predicted_high_f"),
+            # Same comfort-edge uncertainty proxy as the live analyze path, so the
+            # rescore evaluates the exact band the engine would have used.
+            forecast_sigma_f=_opt_float(row, "forecast_source_spread_f"),
         )
         candidate_approved = decision.approved and decision.recommended_contracts > 0
         if candidate_approved:
@@ -389,12 +423,21 @@ def run_rescore(
             cost = float(decision.cost_per_contract)
             capital = contracts * cost
             pnl = contracts * ((1.0 - cost) if won else -cost)
+            forecast_high = _opt_float(row, "forecast_predicted_high_f")
             scored.append(
                 _Scored(
                     target_date=target_date,
                     side=side,
                     settlement_high_f=settlement_high,
                     cohort=temperature_cohort(settlement_high),
+                    # The regime the live block gated on. Fall back to the settled
+                    # cohort only when the row carries no forecast high (legacy
+                    # rows); fail-closed keeps such a row in its settled cohort.
+                    forecast_cohort=(
+                        temperature_cohort(forecast_high)
+                        if forecast_high is not None
+                        else temperature_cohort(settlement_high)
+                    ),
                     contracts=contracts,
                     cost=cost,
                     capital=capital,
@@ -480,6 +523,9 @@ def _summarize(
     cohorts: dict[str, list[_Scored]] = {}
     for r in settled:
         cohorts.setdefault(r.cohort, []).append(r)
+    forecast_cohorts: dict[str, list[_Scored]] = {}
+    for r in settled:
+        forecast_cohorts.setdefault(r.forecast_cohort, []).append(r)
     sides: dict[str, list[_Scored]] = {}
     for r in settled:
         sides.setdefault(r.side, []).append(r)
@@ -530,6 +576,11 @@ def _summarize(
             ),
         },
         "by_cohort": {name: _bucket(rows) for name, rows in sorted(cohorts.items())},
+        # Keyed by the forecast-time regime the live block actually gated on, so
+        # readiness scopes "traded cohort" to what the engine chose to trade.
+        "by_forecast_cohort": {
+            name: _bucket(rows) for name, rows in sorted(forecast_cohorts.items())
+        },
         "by_side": {name: _bucket(rows) for name, rows in sorted(sides.items())},
         "per_day": [
             {
@@ -546,4 +597,225 @@ def _summarize(
             }
             for day in independent_days
         ],
+    }
+
+
+def _readiness_check(
+    name: str,
+    label: str,
+    passed: bool,
+    detail: str,
+    progress: float | None = None,
+) -> dict[str, object]:
+    # progress (0..1) is how far this check is toward passing -- count-based
+    # checks supply a ratio so the overall gauge climbs as data accumulates;
+    # boolean checks fall back to 0/1. Passing always means full progress.
+    if progress is None:
+        progress = 1.0 if passed else 0.0
+    if passed:
+        progress = 1.0
+    return {
+        "name": name,
+        "label": label,
+        "passed": bool(passed),
+        "progress": round(max(0.0, min(1.0, progress)), 4),
+        "detail": detail,
+    }
+
+
+def compute_real_money_readiness(
+    rescore: dict[str, object],
+    *,
+    calibration_cohort_brier: dict[str, float] | None = None,
+    calibration_cohort_brier_skill: dict[str, float] | None = None,
+    max_abs_calibration_gap: float | None = None,
+    thresholds: ReadinessThresholds | None = None,
+) -> dict[str, object]:
+    """Collapse the LIVE-profile rescore (+ calibration) into a go/no-go verdict.
+
+    Pure: consumes the ``run_rescore`` output for the live profile plus the
+    walk-forward per-cohort Brier Skill Score and the worst calibration-bucket
+    gap. Every check is blocking and fails CLOSED -- a missing input cannot read
+    as a pass, so the verdict only flips to READY when every documented
+    precondition is simultaneously satisfied on real settled data. Per-cohort and
+    per-side checks are scoped to the FORECAST cohort (what the engine chose to
+    trade), so blocked regimes are never demanded.
+    """
+
+    thresholds = thresholds or ReadinessThresholds()
+    counts = rescore.get("counts") or {}
+    candidate = rescore.get("candidate") or {}
+    # Scope per-cohort checks to the forecast-time regime the live block gated on;
+    # fall back to the settled-high rollup only if the rescore predates the split.
+    by_cohort = rescore.get("by_forecast_cohort") or rescore.get("by_cohort") or {}
+    by_settled_cohort = rescore.get("by_cohort") or {}
+    by_side = rescore.get("by_side") or {}
+
+    checks: list[dict[str, object]] = []
+
+    independent_days = int(counts.get("independent_days") or 0)
+    checks.append(
+        _readiness_check(
+            "independent_days",
+            "Independent settlement days",
+            independent_days >= thresholds.min_independent_days,
+            f"{independent_days}/{thresholds.min_independent_days} independent weather days",
+            progress=independent_days / thresholds.min_independent_days
+            if thresholds.min_independent_days
+            else 1.0,
+        )
+    )
+
+    settled = int(counts.get("settled_decisions") or 0)
+    checks.append(
+        _readiness_check(
+            "settled_decisions",
+            "Settled decisions",
+            settled >= thresholds.min_settled_decisions,
+            f"{settled}/{thresholds.min_settled_decisions} settled decisions",
+            progress=settled / thresholds.min_settled_decisions
+            if thresholds.min_settled_decisions
+            else 1.0,
+        )
+    )
+
+    ci = candidate.get("roi_ci95_day_clustered")
+    ci_lo = ci[0] if isinstance(ci, (list, tuple)) and len(ci) == 2 and ci[0] is not None else None
+    checks.append(
+        _readiness_check(
+            "after_fee_roi_lower_ci_positive",
+            "After-fee ROI lower CI > 0",
+            ci_lo is not None and ci_lo > 0,
+            f"day-clustered 95% ROI lower bound {ci_lo:+.2%}" if ci_lo is not None
+            else "no day-clustered ROI CI (too few independent days)",
+        )
+    )
+
+    log_growth = candidate.get("log_growth_per_independent_day")
+    checks.append(
+        _readiness_check(
+            "positive_log_growth_per_day",
+            "Positive after-fee log-growth/day",
+            log_growth is not None and log_growth > 0,
+            f"log-growth {log_growth:+.4f}/day" if log_growth is not None
+            else "no settled days to measure growth",
+        )
+    )
+
+    # Per-traded-cohort calibration: the forecaster must show SKILL (beat the
+    # climatological prior, Brier Skill Score > 0) on every regime the live book
+    # actually trades. Skill -- not absolute Brier -- is the honest bar: a flat
+    # Brier threshold penalizes irreducible multi-bin spread and is unreachable
+    # on the interior 2F bins by any calibrated model.
+    traded_cohorts = [name for name, b in by_cohort.items() if int(b.get("trades") or 0) > 0]
+    if not traded_cohorts:
+        checks.append(
+            _readiness_check(
+                "cohort_skill", "Traded-cohort forecast skill",
+                False, "no traded cohorts yet",
+            )
+        )
+    for cohort in sorted(traded_cohorts):
+        skill = (calibration_cohort_brier_skill or {}).get(cohort)
+        brier = (calibration_cohort_brier or {}).get(cohort)
+        brier_note = f" (Brier {brier:.3f})" if brier is not None else ""
+        checks.append(
+            _readiness_check(
+                f"cohort_skill:{cohort}",
+                f"Forecast skill > {thresholds.min_cohort_brier_skill:g} ({cohort})",
+                skill is not None and skill > thresholds.min_cohort_brier_skill,
+                f"Brier Skill Score {skill:+.3f}{brier_note}" if skill is not None
+                else "walk-forward cohort skill unavailable",
+            )
+        )
+
+    # No single regime or side may carry the verdict: every traded cohort and
+    # side needs breadth AND its OWN positive after-fee ROI (not just the
+    # portfolio aggregate, which can hide a quietly losing regime/side).
+    for cohort in sorted(traded_cohorts):
+        bucket = by_cohort.get(cohort) or {}
+        days = int(bucket.get("independent_days") or 0)
+        floor = thresholds.min_cohort_independent_days
+        checks.append(
+            _readiness_check(
+                f"cohort_days:{cohort}",
+                f"Cohort breadth ({cohort})",
+                days >= floor,
+                f"{days}/{floor} independent days",
+                progress=days / floor if floor else 1.0,
+            )
+        )
+        roi = bucket.get("roi")
+        checks.append(
+            _readiness_check(
+                f"cohort_roi:{cohort}",
+                f"Cohort after-fee ROI > 0 ({cohort})",
+                roi is not None and roi > 0,
+                f"ROI {roi:+.2%}" if roi is not None else "no settled ROI",
+            )
+        )
+    for side in sorted(name for name, b in by_side.items() if int(b.get("trades") or 0) > 0):
+        bucket = by_side.get(side) or {}
+        days = int(bucket.get("independent_days") or 0)
+        floor = thresholds.min_side_independent_days
+        checks.append(
+            _readiness_check(
+                f"side_days:{side}",
+                f"Side breadth ({side})",
+                days >= floor,
+                f"{days}/{floor} independent days",
+                progress=days / floor if floor else 1.0,
+            )
+        )
+        roi = bucket.get("roi")
+        checks.append(
+            _readiness_check(
+                f"side_roi:{side}",
+                f"Side after-fee ROI > 0 ({side})",
+                roi is not None and roi > 0,
+                f"ROI {roi:+.2%}" if roi is not None else "no settled ROI",
+            )
+        )
+
+    checks.append(
+        _readiness_check(
+            "calibration_gap",
+            f"Calibration gap < {thresholds.max_calibration_gap:g}",
+            max_abs_calibration_gap is not None
+            and max_abs_calibration_gap < thresholds.max_calibration_gap,
+            f"max bucket gap {max_abs_calibration_gap:.3f}"
+            if max_abs_calibration_gap is not None
+            else "calibration gap unavailable",
+        )
+    )
+
+    passed = sum(1 for c in checks if c["passed"])
+    ready = passed == len(checks)
+    # "How ready" gauge: the mean per-check progress, so it climbs smoothly as
+    # data accumulates instead of stepping only when a check flips. It can only
+    # reach 100% when every check actually passes (ready == True).
+    readiness_pct = round(100.0 * sum(c["progress"] for c in checks) / len(checks), 1) if checks else 0.0
+    if readiness_pct >= 100.0 and not ready:
+        readiness_pct = 99.0
+    return {
+        "ready": ready,
+        "verdict": "READY" if ready else "NOT READY",
+        "readiness_pct": readiness_pct,
+        "checks_passed": passed,
+        "checks_total": len(checks),
+        "summary": (
+            f"{readiness_pct:.0f}% ready for real money -- "
+            f"{passed}/{len(checks)} go-live checks pass"
+        ),
+        "checks": checks,
+        "thresholds": {
+            "min_independent_days": thresholds.min_independent_days,
+            "min_settled_decisions": thresholds.min_settled_decisions,
+            "min_cohort_independent_days": thresholds.min_cohort_independent_days,
+            "min_side_independent_days": thresholds.min_side_independent_days,
+            "min_cohort_brier_skill": thresholds.min_cohort_brier_skill,
+            "max_cohort_brier": thresholds.max_cohort_brier,
+            "max_calibration_gap": thresholds.max_calibration_gap,
+        },
+        "config_basis": rescore.get("config_basis"),
     }

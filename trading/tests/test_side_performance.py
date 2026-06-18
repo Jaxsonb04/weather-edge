@@ -125,14 +125,14 @@ def test_side_and_exit_breakdowns_are_split_by_profile():
         store.record_paper_order(
             "2026-06-03",
             _decision("KXHIGHTSFO-TEST-B66.5", "BUY_YES", "YES", cost=0.30, floor=66.0, cap=67.0),
-            risk_profile="balanced",
+            risk_profile="live",
         )
         store.settle_paper_orders("2026-06-03", 67)
         # fast-feedback: a NO loss held to settlement (same bucket resolves YES).
         store.record_paper_order(
             "2026-06-04",
             _decision("KXHIGHTSFO-TEST-B66.5", "BUY_NO", "NO", cost=0.30, floor=66.0, cap=67.0),
-            risk_profile="fast-feedback",
+            risk_profile="research",
         )
         store.settle_paper_orders("2026-06-04", 67)
 
@@ -145,13 +145,13 @@ def test_side_and_exit_breakdowns_are_split_by_profile():
 
         by_profile = payload["side_performance_by_profile"]
         # The balanced YES win is in balanced only; the fast NO loss in fast only.
-        assert by_profile["balanced"]["YES"]["wins"] == 1
-        assert by_profile["balanced"]["NO"]["trades"] == 0
-        assert by_profile["fast-feedback"]["NO"]["losses"] == 1
-        assert by_profile["fast-feedback"]["YES"]["trades"] == 0
+        assert by_profile["live"]["YES"]["wins"] == 1
+        assert by_profile["live"]["NO"]["trades"] == 0
+        assert by_profile["research"]["NO"]["losses"] == 1
+        assert by_profile["research"]["YES"]["trades"] == 0
 
         ex_by_profile = payload["exit_reasons_by_profile"]
-        assert ex_by_profile["balanced"]["held_to_settlement"] == 1
-        assert ex_by_profile["fast-feedback"]["held_to_settlement"] == 1
+        assert ex_by_profile["live"]["held_to_settlement"] == 1
+        assert ex_by_profile["research"]["held_to_settlement"] == 1
         # Aggregate still sums both.
         assert payload["exit_reasons"]["held_to_settlement"] == 2

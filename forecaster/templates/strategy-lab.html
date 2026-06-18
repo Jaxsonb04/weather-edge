@@ -1552,6 +1552,10 @@
         </div>
       </div>
 
+      <h3 id="readinessTitle" style="margin-top:1.5rem;">Real-money readiness <span class="sub" style="font-weight:400;">— live profile</span></h3>
+      <p class="sub" id="readinessNote">How close the live (real-money-candidate) profile is to the documented go-live bar: positive after-fee day-clustered ROI and per-side/per-cohort ROI over &ge;30 independent settlement days, with every traded cohort beating its climatological baseline (Brier Skill Score &gt; 0). The research collector is never promoted to real money.</p>
+      <div class="panel" id="readinessCard"></div>
+
       <h3 id="rescoreTitle" style="margin-top:1.5rem;">Config rescore <span class="sub" id="rescoreProfileLabel" style="font-weight:400;"></span></h3>
       <p class="sub" id="rescoreNote">Re-scores recorded decisions under each profile's current gates and Kelly sizing, then settles vs the official highs. Unlike the signal replay above, this re-decides from scratch, so it answers: how would today's config have performed on real history?</p>
       <div class="count-strip" id="rescoreCounts"></div>
@@ -2220,16 +2224,14 @@
 
     function profileDisplayName(name) {
       const key = String(name || 'unknown').toLowerCase();
-      if (key === 'balanced') return 'Balanced';
-      if (key === 'fast-feedback') return 'Fast feedback (experimental)';
-      if (key === 'exploratory') return 'Exploratory (experimental)';
-      if (key === 'conservative') return 'Conservative';
+      if (key === 'live' || key === 'balanced' || key === 'conservative') return 'Live (real-money candidate)';
+      if (key === 'research' || key === 'fast-feedback' || key === 'exploratory') return 'Research (experimental)';
       return key;
     }
 
     function profileIsExperimental(name) {
       const key = String(name || '').toLowerCase();
-      return key === 'fast-feedback' || key === 'exploratory';
+      return key === 'research' || key === 'fast-feedback' || key === 'exploratory';
     }
 
     function profilePill(name) {
@@ -2394,13 +2396,56 @@
       $('dedupeNote').textContent = backtest.dedupe_explanation || 'Repeated 15-minute AWS scans are deduped by default.';
     }
 
+    function renderReadiness(data) {
+      const r = data.real_money_readiness || {};
+      const card = $('readinessCard');
+      if (!card) return;
+      if (!r.available) {
+        card.innerHTML = `<p class="empty">${htmlEscape(r.reason || 'Readiness not published yet.')}</p>`;
+        return;
+      }
+      const pctVal = Math.max(0, Math.min(100, Number(r.readiness_pct) || 0));
+      const ready = !!r.ready;
+      const tone = ready ? 'var(--mint)' : (pctVal >= 60 ? 'var(--warm-deep)' : 'var(--danger)');
+      const track = 'var(--surface-3)';
+      const checks = Array.isArray(r.checks) ? r.checks : [];
+      const checkRows = checks.map((c) => {
+        const cp = Math.round(Math.max(0, Math.min(1, Number(c.progress) || 0)) * 100);
+        const mark = c.passed ? '✓' : '○';
+        const markColor = c.passed ? 'var(--mint)' : 'var(--ink-3)';
+        const fillColor = c.passed ? 'var(--mint)' : 'var(--ink-3)';
+        return `<li style="display:flex;align-items:center;gap:.6rem;padding:.35rem 0;border-top:1px solid var(--surface-3);">
+          <span style="color:${markColor};font-weight:700;width:1rem;text-align:center;">${mark}</span>
+          <span style="flex:0 0 15rem;">${htmlEscape(c.label)}</span>
+          <span style="flex:1;min-width:5rem;height:.5rem;background:${track};border-radius:999px;overflow:hidden;">
+            <span style="display:block;height:100%;width:${cp}%;background:${fillColor};"></span>
+          </span>
+          <span class="sub" style="flex:0 0 12rem;text-align:right;">${htmlEscape(c.detail)}</span>
+        </li>`;
+      }).join('');
+      card.innerHTML = `
+        <div style="display:flex;align-items:center;gap:1.5rem;flex-wrap:wrap;">
+          <div style="min-width:8rem;">
+            <div style="font-size:2.8rem;font-weight:800;line-height:1;color:${tone};font-variant-numeric:tabular-nums;">${pctVal.toFixed(0)}%</div>
+            <div class="pill ${ready ? 'profile-balanced' : 'profile-experimental'}" style="margin-top:.4rem;">${ready ? 'READY' : 'NOT READY'}</div>
+          </div>
+          <div style="flex:1;min-width:14rem;">
+            <div style="height:.85rem;background:${track};border-radius:999px;overflow:hidden;">
+              <span style="display:block;height:100%;width:${pctVal}%;background:${tone};transition:width .4s ease;"></span>
+            </div>
+            <p class="sub" style="margin-top:.5rem;">${htmlEscape(r.summary || '')}</p>
+          </div>
+        </div>
+        <ul style="list-style:none;padding:0;margin:1rem 0 0;">${checkRows}</ul>`;
+    }
+
     function renderRescore(data) {
       const rescore = data.config_rescore || {};
       const byProfile = rescore.by_profile || {};
       // Show the active profile tab's rescore; the overview falls back to the
-      // balanced (real-money-intent) book.
-      const profileKey = (data.active_profile && data.active_profile.risk_profile) || 'balanced';
-      const result = byProfile[profileKey] || byProfile.balanced || {};
+      // live (real-money-intent) book.
+      const profileKey = (data.active_profile && data.active_profile.risk_profile) || 'live';
+      const result = byProfile[profileKey] || byProfile.live || {};
       $('rescoreProfileLabel').textContent =
         rescore.available ? `— ${profileKey} · ${result.counts ? result.counts.independent_days : 0} independent days, ${rescore.settlement_days || 0} settled` : '';
 
@@ -3061,6 +3106,7 @@
       renderCalibration(data);
       renderCohorts(data);
       renderBacktest(data);
+      renderReadiness(data);
       renderRescore(data);
       renderNotes(data);
     }

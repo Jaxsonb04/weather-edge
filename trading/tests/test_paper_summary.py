@@ -179,12 +179,12 @@ def test_paper_summary_splits_results_by_risk_profile():
 
         today = _now_local().date().isoformat()
         store.record_paper_order(
-            today, _decision("KXHIGHTSFO-TEST-B66.5"), risk_profile="balanced"
+            today, _decision("KXHIGHTSFO-TEST-B66.5"), risk_profile="live"
         )
         store.record_paper_order(
             today,
             _decision("KXHIGHTSFO-TEST-B68.5", floor_strike=68.0, cap_strike=69.0),
-            risk_profile="fast-feedback",
+            risk_profile="research",
         )
         store.settle_paper_orders(today, 67.0)  # balanced wins, fast-feedback loses
 
@@ -196,13 +196,13 @@ def test_paper_summary_splits_results_by_risk_profile():
         )
 
         profiles = {row["risk_profile"]: row for row in payload["profiles"]}
-        assert set(profiles) == {"balanced", "fast-feedback"}
-        assert profiles["balanced"]["wins"] == 1
-        assert profiles["balanced"]["realized_pnl"] > 0
-        assert profiles["fast-feedback"]["losses"] == 1
-        assert profiles["fast-feedback"]["realized_pnl"] < 0
+        assert set(profiles) == {"live", "research"}
+        assert profiles["live"]["wins"] == 1
+        assert profiles["live"]["realized_pnl"] > 0
+        assert profiles["research"]["losses"] == 1
+        assert profiles["research"]["realized_pnl"] < 0
         day_profiles = next(
             day["profiles"] for day in payload["days"] if day["date"] == today.split("T")[0]
         )
-        assert day_profiles["balanced"]["realized_pnl"] > 0
-        assert day_profiles["fast-feedback"]["realized_pnl"] < 0
+        assert day_profiles["live"]["realized_pnl"] > 0
+        assert day_profiles["research"]["realized_pnl"] < 0

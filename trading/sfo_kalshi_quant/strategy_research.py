@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .backtest import run_walk_forward_calibration_backtest
-from .backtest_rescore import run_rescore
+from .backtest_rescore import compute_real_money_readiness, run_rescore
 from .config import DEFAULT_DB_PATH, DEFAULT_FORECASTER_ROOT, SFO_TZ, StrategyConfig, strategy_config_for_profile
 from .db import PaperStore
 from .dataset_research import (
@@ -39,8 +39,8 @@ MIN_CLEAN_WINNER_SAMPLE = 60
 # shared with the live monitor); imported above.
 DEFAULT_MODEL_VETO_MAX_LOSS_PCT = 60.0
 DEFAULT_MODEL_VETO_BUFFER = 0.08
-PRIMARY_PROFILE = "balanced"
-EXPERIMENTAL_PROFILES = {"exploratory", "fast-feedback"}
+PRIMARY_PROFILE = "live"
+EXPERIMENTAL_PROFILES = {"research"}
 
 
 def build_strategy_research(
@@ -85,6 +85,7 @@ def build_strategy_research(
     prediction_replay = _prediction_replay_payload(forecaster_root, cfg)
     backtest = _signal_backtest_payload(adapter, db_path)
     config_rescore = _config_rescore_payload(adapter, db_path)
+    real_money_readiness = _real_money_readiness_payload(config_rescore, active_calibration)
     signal_quality = _signal_quality_payload(db_path, trading_signal)
     paper = _paper_payload(db_path)
     daily_summary = _daily_summary_payload(
@@ -125,6 +126,7 @@ def build_strategy_research(
         "signal_quality": signal_quality,
         "backtest_summary": backtest,
         "config_rescore": config_rescore,
+        "real_money_readiness": real_money_readiness,
         "paper_trading": paper,
         "profiles": profiles,
         "dataset_research": _dataset_research_summary(dataset_research),
@@ -157,7 +159,15 @@ def _daily_summary_payload(
 def write_strategy_research(path: Path, payload: dict[str, Any]) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    # Atomic write (temp + os.replace): the strategy-lab-refresh and
+    # forecaster-refresh timers build into the same dir, and the publisher copies
+    # this file, so a plain truncate-write could be read half-written.
+    import os
+
+    text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def _load_or_build_dataset_research(*, forecaster_root: Path, db_path: Path) -> dict[str, Any] | None:
@@ -595,24 +605,18 @@ def _profile_key(value: object) -> str:
 
 def _profile_sort_key(name: str) -> tuple[int, str]:
     order = {
-        "balanced": 0,
-        "conservative": 1,
-        "exploratory": 2,
-        "fast-feedback": 3,
+        "live": 0,
+        "research": 1,
         "unknown": 9,
     }
     return order.get(name, 8), name
 
 
 def _profile_label(name: str) -> str:
-    if name == "balanced":
-        return "Balanced"
-    if name == "fast-feedback":
-        return "Fast feedback (experimental)"
-    if name == "exploratory":
-        return "Exploratory (experimental)"
-    if name == "conservative":
-        return "Conservative"
+    if name == "live":
+        return "Live (real-money candidate)"
+    if name == "research":
+        return "Research (experimental)"
     return name
 
 
@@ -682,6 +686,8 @@ def _calibration_payload(
         "sample_size": result.n,
         "minimum_train_rows": min_train,
         "brier_score": _round(result.brier_score, 4),
+        "climatology_brier_score": _round(result.climatology_brier_score, 4),
+        "brier_skill": _round(result.brier_skill, 4),
         "log_loss": _round(result.log_loss, 4),
         "top_bin_accuracy": _round(result.top_bin_accuracy, 4),
         "avg_winning_probability": _round(result.avg_winning_probability, 4),
@@ -805,7 +811,7 @@ def _config_rescore_payload(adapter: SfoForecasterAdapter, db_path: Path) -> dic
         store = PaperStore(db_path, init=False)
         rows = store.sampled_decision_rows(sample_mode="entry-per-market-side")
         by_profile: dict[str, Any] = {}
-        for name in ("balanced", "fast-feedback", "exploratory"):
+        for name in ("live", "research"):
             cfg = strategy_config_for_profile(name)
             result = run_rescore(
                 rows,
@@ -827,6 +833,57 @@ def _config_rescore_payload(adapter: SfoForecasterAdapter, db_path: Path) -> dic
         }
     except Exception as exc:  # diagnostics artifact must not fail the refresh
         return {**empty, "reason": f"{type(exc).__name__}: {exc}"}
+
+
+def _real_money_readiness_payload(
+    config_rescore: dict[str, Any],
+    active_calibration: dict[str, Any],
+) -> dict[str, Any]:
+    """Single go/no-go gauge for promoting the LIVE profile to real money.
+
+    Collapses the live walk-forward rescore plus the walk-forward per-cohort
+    Brier and worst calibration-bucket gap into a readiness percentage and a
+    per-check breakdown. Judges ONLY the live (real-money-intent) profile; the
+    research collector is never promoted. Diagnostic only.
+    """
+
+    if not config_rescore.get("available"):
+        return {
+            "available": False,
+            "reason": config_rescore.get("reason", "config rescore unavailable"),
+        }
+    live_rescore = (config_rescore.get("by_profile") or {}).get("live")
+    if not live_rescore:
+        return {"available": False, "reason": "no live-profile rescore available"}
+
+    cohort_brier = {
+        row.get("name"): row.get("brier_score")
+        for row in (active_calibration.get("cohorts") or [])
+        if row.get("name") and row.get("brier_score") is not None
+    }
+    # Brier Skill Score per cohort (model vs climatology). The readiness gate
+    # judges SKILL (> 0 = beats the no-skill prior), not absolute Brier, because
+    # a flat absolute bar is unachievable on interior 2F bins by any calibrated
+    # model and would refuse real money for the wrong reason.
+    cohort_brier_skill = {
+        row.get("name"): row.get("brier_skill")
+        for row in (active_calibration.get("cohorts") or [])
+        if row.get("name") and row.get("brier_skill") is not None
+    }
+    gaps = [
+        abs(bucket["calibration_gap"])
+        for bucket in (active_calibration.get("buckets") or [])
+        if bucket.get("calibration_gap") is not None
+    ]
+    max_gap = max(gaps) if gaps else None
+
+    readiness = compute_real_money_readiness(
+        live_rescore,
+        calibration_cohort_brier=cohort_brier or None,
+        calibration_cohort_brier_skill=cohort_brier_skill or None,
+        max_abs_calibration_gap=max_gap,
+    )
+    return {"available": True, "profile": "live", **readiness}
 
 
 def _signal_backtest_payload(adapter: SfoForecasterAdapter, db_path: Path) -> dict[str, Any]:
@@ -1092,7 +1149,7 @@ def _paper_payload(db_path: Path) -> dict[str, Any]:
         duplicate_rows = conn.execute(
             """
             SELECT target_date,
-                   COALESCE(risk_profile, 'balanced') AS risk_profile,
+                   COALESCE(risk_profile, 'live') AS risk_profile,
                    market_ticker,
                    UPPER(COALESCE(side, 'YES')) AS side,
                    COUNT(*) AS open_orders
@@ -1101,7 +1158,7 @@ def _paper_payload(db_path: Path) -> dict[str, Any]:
               AND settled_at IS NULL
               AND closed_at IS NULL
             GROUP BY target_date,
-                     COALESCE(risk_profile, 'balanced'),
+                     COALESCE(risk_profile, 'live'),
                      market_ticker,
                      UPPER(COALESCE(side, 'YES'))
             HAVING COUNT(*) > 1
@@ -2271,6 +2328,8 @@ def _cohort_rows(cohorts) -> list[dict[str, Any]]:
             "label": _cohort_label(cohort.name),
             "count": cohort.count,
             "brier_score": _round(cohort.brier_score, 4),
+            "climatology_brier_score": _round(cohort.climatology_brier_score, 4),
+            "brier_skill": _round(cohort.brier_skill, 4),
             "log_loss": _round(cohort.log_loss, 4),
             "top_bin_accuracy": _round(cohort.top_bin_accuracy, 4),
             "avg_winning_probability": _round(cohort.avg_winning_probability, 4),
@@ -2296,6 +2355,8 @@ def _empty_cohort(name: str) -> dict[str, Any]:
         "label": _cohort_label(name),
         "count": 0,
         "brier_score": None,
+        "climatology_brier_score": None,
+        "brier_skill": None,
         "log_loss": None,
         "top_bin_accuracy": None,
         "avg_winning_probability": None,

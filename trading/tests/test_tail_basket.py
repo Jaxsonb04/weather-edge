@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from sfo_kalshi_quant.config import StrategyConfig
+from sfo_kalshi_quant.config import StrategyConfig, strategy_config_for_profile
 from sfo_kalshi_quant.models import BucketProbability, MarketBin
 from sfo_kalshi_quant.risk import TradeEvaluator
 from sfo_kalshi_quant.tail_basket import build_tail_basket
@@ -228,3 +228,56 @@ def test_tail_basket_rejects_when_worst_case_loss_exceeds_guardrail() -> None:
 
     assert not basket.approved
     assert any("worst-case loss" in reason for reason in basket.reasons)
+
+
+def test_tail_basket_regime_block_binds_under_live_on_hot_day() -> None:
+    # The live profile blocks the warm/hot regime. Now that build_tail_basket
+    # threads forecast_high_f into the evaluator, a hot-day basket (forecast 85F)
+    # places NO approved legs -- previously the regime block silently no-opped
+    # because forecast_high_f was never forwarded to evaluate_market.
+    markets = _screenshot_ladder()
+    basket = build_tail_basket(
+        markets,
+        _probabilities(markets),
+        predicted_high_f=85.0,  # HOT cohort -> blocked on live
+        evaluator=TradeEvaluator(strategy_config_for_profile("live")),
+        bankroll=1000.0,
+        tail_distance_f=3.0,
+        tail_stake=5.0,
+        center_stake=1.0,
+        max_tail_yes_probability=0.12,
+        max_basket_spend=12.0,
+        max_worst_case_loss=8.0,
+    )
+    assert not basket.approved
+    assert all(not leg.decision.approved for leg in basket.legs)
+    assert any(
+        "regime" in reason
+        for leg in basket.legs
+        for reason in leg.decision.reasons
+    )
+
+
+def test_basket_kelly_sizing_deploys_more_than_fixed_stake() -> None:
+    # tail_stake=None (the CLI's --basket-sizing kelly) lets each leg keep the
+    # evaluator's risk-budget size instead of a hardcoded $5, so the basket
+    # deploys materially more capital -- the fix for the inert "$1-2" P&L.
+    markets = _screenshot_ladder()
+    probs = _probabilities(markets)
+    evaluator = TradeEvaluator(_config())
+    common = dict(
+        predicted_high_f=85.0,
+        evaluator=evaluator,
+        bankroll=200.0,
+        tail_distance_f=3.0,
+        center_stake=1.0,
+        max_tail_yes_probability=0.12,
+        max_basket_spend=200.0,
+        max_worst_case_loss=200.0,
+    )
+    fixed = build_tail_basket(markets, probs, tail_stake=5.0, **common)
+    kelly = build_tail_basket(markets, probs, tail_stake=None, **common)
+
+    fixed_tail = sum(leg.spend for leg in fixed.legs if leg.kind == "TAIL_NO")
+    kelly_tail = sum(leg.spend for leg in kelly.legs if leg.kind == "TAIL_NO")
+    assert kelly_tail > fixed_tail

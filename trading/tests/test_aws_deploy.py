@@ -73,7 +73,7 @@ def test_paper_scan_pins_calibration_source():
     assert 'TAIL_BASKET_ENABLED="${SFO_PAPER_SCAN_TAIL_BASKET_ENABLED:-1}"' in runner
     assert "tail-basket" in runner
     assert "--max-worst-case-loss" in runner
-    assert "PAPER_RISK_PROFILES=balanced,fast-feedback" in example_env
+    assert "PAPER_RISK_PROFILES=live,research" in example_env
     # The deployment example uses market entry (2026-06-17) so approved scans
     # fill immediately at the ask instead of resting as limit orders that expire
     # unfilled; the runner also defaults to market when unset (asserted above).
@@ -89,7 +89,7 @@ def test_paper_trading_timers_run_around_the_clock_and_auto_settle():
     settle = _read(AWS_DIR / "systemd" / "sfo-kalshi-paper-settle.timer")
     installer = _read(AWS_DIR / "install_systemd.sh")
 
-    assert "OnCalendar=*-*-* *:00,15,30,45" in scan
+    assert "OnCalendar=*-*-* *:00,05,10,15,20,25,30,35,40,45,50,55" in scan
     assert "OnCalendar=*-*-* *:01,03,05,07,09,11,13,15,17,19,21,23,25,27,29,31,33,35,37,39,41,43,45,47,49,51,53,55,57,59" in monitor
     assert "OnCalendar=*-*-* *:10,40" in settle
     assert "sfo-kalshi-paper-settle.service.in" in installer
@@ -178,6 +178,38 @@ def test_pages_deploy_key_path_matches_lightsail_setup_docs():
     assert expected in syncer
     assert expected in readme
     assert "weatheredge_pages_deploy" not in example_env + publisher + syncer + readme
+
+
+def test_pages_publish_is_race_safe():
+    # Two timers (hourly forecaster-refresh + 5-minute strategy-lab-refresh) run
+    # the same publish script, so it must serialize (flock) AND survive a
+    # non-fast-forward rejection with a bounded re-fetch/retry loop.
+    publisher = _read(AWS_DIR / "publish_forecaster_pages.sh")
+    assert "flock" in publisher
+    assert "SFO_PAGES_PUSH_ATTEMPTS" in publisher
+    assert "re-fetching" in publisher  # the retry path re-fetches the fresh tip
+
+
+def test_paper_scan_is_overlap_guarded_and_kelly_sized():
+    runner = _read(AWS_DIR / "run_paper_scan_profiles.sh")
+    example_env = _read(AWS_DIR / "sfo-weather.env.example")
+
+    # Overlap guard: a slow scan must not be double-run by the 5-minute timer.
+    assert "SFO_PAPER_SCAN_LOCK" in runner
+    assert "flock -n" in runner
+    # Kelly-sized tail-basket legs (the fix for the inert "$1-2" P&L).
+    assert 'TAIL_BASKET_SIZING="${SFO_TAIL_BASKET_SIZING:-kelly}"' in runner
+    assert '--basket-sizing "$TAIL_BASKET_SIZING"' in runner
+    assert "SFO_TAIL_BASKET_SIZING=kelly" in example_env
+
+
+def test_pull_paper_db_script_exists_for_offline_rescore():
+    # The readiness rescore needs the live journal locally; sync_to_lightsail.sh
+    # only pushes OUT and excludes the DB, so a dedicated inbound pull must exist.
+    puller = _read(AWS_DIR / "pull_paper_db.sh")
+    assert "paper_trading.db" in puller
+    assert "rsync" in puller
+    assert "backtest-rescore" in puller  # documents the next step
 
 
 def test_initial_lightsail_sync_does_not_copy_local_runtime_state():

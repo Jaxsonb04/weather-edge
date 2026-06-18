@@ -46,13 +46,70 @@ Current gates:
   model/market agreement, and ensemble support when available
 - size is capped by fractional Kelly, bankroll risk, market depth, and max contracts
 
-The CLI defaults to the `balanced` paper-research profile so the journal can
-collect more examples. `--risk-profile conservative` keeps the stricter baseline
-for comparisons. `--risk-profile exploratory` is a paper-only data-collection
-mode with smaller size caps and looser gates. Balanced and exploratory still
-reject no-bid tails, but they are less strict on small 1-cent or 2-cent markets
-when bid support, lower-bound edge, model/market agreement, and ensemble
-evidence are all present.
+## Two profiles: `live` and `research`
+
+There are exactly two risk profiles, and the CLI defaults to `live`.
+
+- `--risk-profile live` is the real-money-INTENT exploiter. It is the stricter,
+  real-trading-candidate book — but it stays PAPER-ONLY until the readiness gate
+  below passes. It keeps the proven `edge_lcb >= 0` floor, blocks the warm/hot
+  cohorts the forecaster is anti-calibrated on, and runs the comfortable
+  far-tail NO rule (next section).
+- `--risk-profile research` is the single data COLLECTOR (the former
+  `exploratory` and `fast-feedback` books, merged). It takes the loosest gates
+  so it approves the widest opportunity set, at the smallest size so a bad
+  research idea stays tiny. It deliberately records the FULL opportunity set,
+  center bins included (comfort-edge OFF), so the readiness rescore can judge
+  the live config against everything that was available. It is never promoted to
+  real money.
+
+The strict `StrategyConfig()` baseline still exists internally as the
+reproducible test control, but it is no longer a selectable profile. Legacy
+names are accepted as aliases: `balanced`/`conservative` map to `live`;
+`exploratory`/`fast-feedback`/`fast` map to `research` (and stored paper books
+under the old names are migrated on read so history rolls up correctly).
+
+Both profiles still reject no-bid tails, but they are less strict on small
+1-cent or 2-cent markets when bid support, lower-bound edge, model/market
+agreement, and ensemble evidence are all present.
+
+## Comfortable far-tail NO entry (the "edge" rule)
+
+When the point forecast sits comfortably between a market's tail bins — predict
+75F and the day lists a "65 or below" or "85 or above" bin — those far edges are
+the high-confidence NO favorites: a forecast miss of a couple degrees cannot
+reach them. Bins sitting *near* the forecast are the opposite: a ~2.5F mean
+forecast error makes a NO bet on the in-forecast bin a coin flip, and those
+near-forecast NO bets were the dominant live loss source.
+
+On the `live` profile, `analyze` therefore shapes NO bets by their distance from
+the point forecast:
+
+- NO bins within the **block band** of the forecast are rejected as coin flips.
+- NO bins at or beyond the **full band** get the full size boost; the boost
+  tapers in between.
+
+The band is uncertainty-scaled: it is a multiple of the day's forecast
+uncertainty (the source-spread proxy), floored so a calm day blocks within ~3F
+and reaches full size ~6F out, and widens when the forecast sources disagree.
+The size boost only scales a bet that already cleared every gate and the
+positive after-fee `edge_lcb` floor — it never creates or enlarges a negative-EV
+bet, so "invest comfortably" never means "buy an over-priced favorite." The
+`research` collector leaves this off so it still records the center bins the
+readiness rescore needs.
+
+## Knowing when `live` is ready for real money
+
+The Strategy Lab publishes a **real-money readiness** gauge: a single percentage
+plus a per-check breakdown for the `live` profile only. It collapses the
+walk-forward, after-fee config rescore and the walk-forward per-cohort
+calibration into the project's codified go-live bar — positive after-fee
+day-clustered ROI lower bound and log-growth per independent day, per side and
+per traded cohort, over >=30 independent settlement days, with traded-cohort
+Brier < 0.25 and a tight calibration gap. Every check fails closed, so the
+verdict only flips to READY when all of them pass simultaneously; until then the
+gauge shows how far along the live book is. The `research` collector is never
+judged by this gate.
 
 A cheap ask is not enough. If there is no bid, no depth, no lower-bound edge, or
 the model is wildly disagreeing with the market, the correct quant action is

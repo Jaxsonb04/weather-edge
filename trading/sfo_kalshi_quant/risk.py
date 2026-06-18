@@ -25,6 +25,7 @@ class TradeEvaluator:
         side: str = "YES",
         source_spread_f: float | None = None,
         forecast_high_f: float | None = None,
+        forecast_sigma_f: float | None = None,
     ) -> TradeDecision:
         side = _normalize_side(side)
         reasons: list[str] = []
@@ -149,6 +150,20 @@ class TradeEvaluator:
             )
         )
 
+        # Comfortable far-tail NO entry: block coin-flip NO bets sitting near the
+        # forecast (the documented loss source) and size up genuine far tails.
+        # Pure gate+sizing -- the positive after-fee edge_lcb floor above still
+        # binds, so this never admits a negative-EV bet.
+        comfort_block_reason, comfort_size_multiplier = _comfort_edge_assessment(
+            side=side,
+            market=market,
+            forecast_high_f=forecast_high_f,
+            forecast_sigma_f=forecast_sigma_f,
+            config=self.config,
+        )
+        if comfort_block_reason is not None:
+            reasons.append(comfort_block_reason)
+
         trade_quality_score = _trade_quality_score(
             market,
             probability=side_probability,
@@ -178,6 +193,21 @@ class TradeEvaluator:
             spend_budget, budget_label = kelly_budget, "kelly_budget"
         else:
             spend_budget, budget_label = risk_budget, "position_risk_cap"
+        # Lean harder into far-tail NO favorites: scale the chosen per-position
+        # budget by the comfort multiplier (>= 1.0; exactly 1.0 for every other
+        # bet). Applied to the spend budget rather than Kelly so it lifts size
+        # whether Kelly or the position-risk cap was the binding constraint.
+        # NOTE: this is DELIBERATELY allowed to exceed the nominal per-position
+        # risk cap by up to comfort_edge_max_size_boost x -- the per-position cap
+        # is the BASE the boost scales, not a ceiling on the result. The true
+        # ceilings that still bind are the per-event cap (_apply_event_risk_cap),
+        # max_contracts_per_market, and displayed ask_size. The positive
+        # after-fee edge_lcb gate already passed, so a larger size is still a
+        # positive-EV bet, never a manufactured negative-EV one.
+        if comfort_size_multiplier != 1.0:
+            spend_budget *= comfort_size_multiplier
+            if budget_label == "position_risk_cap":
+                budget_label = "comfort_far_tail_boost"
         if self.config.yes_estimation_shrink and side == "YES":
             # Size YES off the conservative lower bound, shrunk for estimation
             # error and scaled by payout, then hard-capped at the tighter YES cap.
@@ -273,6 +303,7 @@ class TradeEvaluator:
         sides: tuple[str, ...] = ("YES",),
         source_spread_f: float | None = None,
         forecast_high_f: float | None = None,
+        forecast_sigma_f: float | None = None,
     ) -> list[TradeDecision]:
         normalized_sides = tuple(_normalize_side(side) for side in sides)
         decisions = []
@@ -288,6 +319,7 @@ class TradeEvaluator:
                         side=side,
                         source_spread_f=source_spread_f,
                         forecast_high_f=forecast_high_f,
+                        forecast_sigma_f=forecast_sigma_f,
                     )
                 )
         decisions.sort(
@@ -442,6 +474,76 @@ def _trade_quality_score(
     score += 3.0 * _time_to_close_quality(market)
     score += 2.0 if observed_high_f is not None else 0.0
     return round(_unit(score / 100.0) * 100.0, 1)
+
+
+def _interval_gap_f(value: float, interval: tuple[float, float]) -> float:
+    """Degrees F between a point forecast and a market bin's interval.
+
+    0 when the forecast sits inside the bin, growing as the bin moves into a
+    tail. For an unbounded tail bin the forecast is always on the finite side,
+    so the gap is the distance to that finite edge.
+    """
+
+    lo, hi = interval
+    if lo <= value < hi:
+        return 0.0
+    if value < lo:
+        return lo - value
+    return value - hi
+
+
+def _comfort_edge_assessment(
+    *,
+    side: str,
+    market: MarketBin,
+    forecast_high_f: float | None,
+    forecast_sigma_f: float | None,
+    config: StrategyConfig,
+) -> tuple[str | None, float]:
+    """(block_reason, size_multiplier) for the comfortable-edge coin-flip rule.
+
+    Both sides are shaped by distance from the point forecast, scaled by the
+    day's uncertainty (a multiple of forecast sigma, floored so a calm day cannot
+    collapse the band below the irreducible single-model error):
+      - NO: a bin comfortably out in the tail -- where a forecast miss of a few F
+        cannot reach -- is the high-confidence favorite and is SIZE-BOOSTED;
+        a bin near the forecast is a coin-flip and is BLOCKED (the documented
+        loss source).
+      - YES: a YES bet on the bin at/near the forecast is the diffuse-favorite
+        coin-flip (the forecaster puts only ~46% on its own predicted bin and is
+        overconfident in the mid-range), so it is BLOCKED inside the same band;
+        a far-from-forecast YES is a longshot the normal YES gates already
+        handle, so YES is never size-boosted, only coin-flip-blocked.
+    Returns (None, 1.0) when the rule is off or inapplicable.
+    """
+
+    if not config.comfort_edge_enabled or forecast_high_f is None or side not in ("NO", "YES"):
+        return None, 1.0
+    sigma = max(config.comfort_edge_sigma_floor_f, forecast_sigma_f or 0.0)
+    block_distance = config.comfort_edge_block_sigma_mult * sigma
+    distance = _interval_gap_f(forecast_high_f, market.continuous_interval())
+
+    if side == "YES":
+        if distance < block_distance:
+            return (
+                f"comfort-edge: YES bin sits {distance:.1f}F from the {forecast_high_f:.1f}F "
+                f"forecast, inside the {block_distance:.1f}F coin-flip band (far longshots only)"
+            ), 1.0
+        return None, 1.0
+
+    full_distance = config.comfort_edge_full_sigma_mult * sigma
+    if distance < block_distance:
+        return (
+            f"comfort-edge: NO bin sits {distance:.1f}F from the {forecast_high_f:.1f}F "
+            f"forecast, inside the {block_distance:.1f}F coin-flip band (far-tail NO only)"
+        ), 1.0
+    if full_distance <= block_distance:
+        fraction = 1.0
+    else:
+        fraction = (distance - block_distance) / (full_distance - block_distance)
+    fraction = _unit(fraction)
+    multiplier = 1.0 + fraction * (config.comfort_edge_max_size_boost - 1.0)
+    return None, multiplier
 
 
 def _normalize_side(side: str) -> str:

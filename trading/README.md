@@ -39,7 +39,7 @@ python3 -m sfo_kalshi_quant.cli backtest-calibration --source clean-blend
 python3 -m sfo_kalshi_quant.cli analyze --target-date both
 python3 -m sfo_kalshi_quant.cli analyze --target-date both --side both
 python3 -m sfo_kalshi_quant.cli tail-basket --target-date rolling
-python3 -m sfo_kalshi_quant.cli --risk-profile conservative analyze --target-date both --side both
+python3 -m sfo_kalshi_quant.cli --risk-profile live analyze --target-date both --side both
 python3 -m sfo_kalshi_quant.cli analyze --target-date today --observed-high 67
 python3 -m sfo_kalshi_quant.cli analyze --target-date today
 python3 -m sfo_kalshi_quant.cli analyze --target-date tomorrow
@@ -129,9 +129,9 @@ python3 -m sfo_kalshi_quant.cli analyze --target-date today
 python3 -m sfo_kalshi_quant.cli analyze --target-date today --observed-high 67
 python3 -m sfo_kalshi_quant.cli tail-basket --target-date rolling
 python3 -m sfo_kalshi_quant.cli tail-basket --target-date rolling --place-paper
-python3 -m sfo_kalshi_quant.cli --risk-profile exploratory analyze --target-date both
-python3 -m sfo_kalshi_quant.cli --risk-profile fast-feedback analyze --target-date rolling --side both --place-paper --paper-stake 5
-PAPER_RISK_PROFILES=balanced,fast-feedback bash scripts/paper_analyze.sh --target-date rolling --place-paper
+python3 -m sfo_kalshi_quant.cli --risk-profile research analyze --target-date both
+python3 -m sfo_kalshi_quant.cli --risk-profile research analyze --target-date rolling --side both --place-paper --paper-stake 5
+PAPER_RISK_PROFILES=live,research bash scripts/paper_analyze.sh --target-date rolling --place-paper
 ```
 
 The `tail-basket` command is the early-market version of the edge idea:
@@ -150,22 +150,27 @@ when `SFO_PAPER_SCAN_TAIL_BASKET_ENABLED=1`.
 
 Risk profiles:
 
-- `balanced`: default paper-trading research mode. Keeps no-bid and 1c/2c tail
-  gates, but allows more liquid positive-edge rows and sizes from a blend of
-  posterior probability and lower-confidence probability.
-- `exploratory`: paper-only data collection mode. It is more permissive than
-  balanced, but uses smaller per-position and per-event risk caps.
-- `fast-feedback`: paper-only acceleration mode. It lets small positive raw-edge
-  trades through even when the lower-confidence edge is negative and forecast
-  sources are moderately wide, but caps size harder so you can quickly collect
-  examples without treating them as validated live-money signals. It still
-  blocks extreme source conflict.
-- `conservative`: strict baseline. Sizes from the lower-confidence probability
-  and intentionally under-trades.
+- `live` (default): the real-money-intent exploiter. It is the stricter,
+  real-trading-candidate book, but stays paper-only until a readiness gate
+  passes. It blocks the warm/hot anti-calibrated cohorts, keeps the proven
+  `edge_lcb >= 0` floor, and runs the comfortable far-tail NO rule: it blocks
+  near-forecast coin-flip NO bets and sizes up genuine far-tail NO bets (bins
+  comfortably far from the point forecast), always keeping the positive
+  after-fee `edge_lcb` floor.
+- `research`: the single data collector. Loosest gates (so it approves the
+  widest opportunity set) at the smallest size (so a bad idea stays tiny). It
+  records the full opportunity set including center bins (comfort-edge off) so
+  the readiness rescore can validate the `live` config. Paper-only; never a
+  real-money candidate.
+
+The strict `StrategyConfig()` baseline still exists internally for tests, but is
+not a selectable CLI/env profile. Legacy names map onto the two profiles as
+aliases on the CLI and in stored data: `balanced`/`conservative` -> `live`;
+`exploratory`/`fast-feedback`/`fast` -> `research`.
 
 When `PAPER_RISK_PROFILES` contains multiple profiles, the scheduled scanner
 runs them back to back in the same SQLite DB. Paper orders are tagged by
-`risk_profile`, so balanced and fast-feedback can both enter the same market
+`risk_profile`, so `live` and `research` can both enter the same market
 without blocking each other's journal.
 
 For today's market, the program automatically reads the forecaster database

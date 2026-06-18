@@ -714,8 +714,8 @@ def test_place_arbitrage_blocks_when_market_already_has_open_position():
 def test_place_approved_keeps_profiles_in_separate_paper_books():
     with TemporaryDirectory() as tmp:
         store = PaperStore(Path(tmp) / "paper.db")
-        balanced = PaperTrader(store, risk_profile="balanced")
-        fast = PaperTrader(store, risk_profile="fast-feedback")
+        balanced = PaperTrader(store, risk_profile="live")
+        fast = PaperTrader(store, risk_profile="research")
         decision = TradeDecision(
             ticker="KXHIGHTSFO-TEST-B68.5",
             label="68° to 69°",
@@ -741,7 +741,7 @@ def test_place_approved_keeps_profiles_in_separate_paper_books():
         assert len(fast.place_approved("2026-06-03", [decision])) == 1
 
         rows = store.paper_orders(10)
-        assert {row["risk_profile"] for row in rows} == {"balanced", "fast-feedback"}
+        assert {row["risk_profile"] for row in rows} == {"live", "research"}
         assert len(store.open_paper_orders(10)) == 2
 
 

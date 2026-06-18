@@ -7,9 +7,11 @@ trade data, and fewer hidden look-ahead or execution assumptions.
 ## Best Immediate Changes
 
 1. Make the paper scanner collect more examples with small risk, not bigger
-   risk. The CLI now defaults to the `balanced` profile,
-   `--risk-profile exploratory` is available for smaller-size paper data
-   collection, and `--risk-profile conservative` remains the strict baseline.
+   risk. The CLI now defaults to the `live` profile (the stricter,
+   real-trading-candidate book, paper-only until a readiness gate passes), and
+   `--risk-profile research` is the single loosest-gate, smallest-size data
+   collector that records the full opportunity set. The strict
+   `StrategyConfig()` baseline remains internal for tests only.
 2. Keep rejecting no-bid tails. Large systematic desks do not treat cheap as
    the same thing as liquid. The active paper profile only loosens small 1c/2c
    markets when there is visible bid support, model/market agreement, and
@@ -24,7 +26,7 @@ trade data, and fewer hidden look-ahead or execution assumptions.
 
 - Use `backtest-signals` for the first point-in-time market signal backtest. It
   scores every recorded decision row, including rejected rows, against official
-  settled highs. Repeated 15-minute scans are correlated, so the default sample
+  settled highs. Repeated 5-minute scans are correlated, so the default sample
   is the latest pre-resolution row per market side, not every raw row. The
   current `backtest-calibration --source clean-blend` remains the right
   probability-only backtest for archived blend forecasts.
@@ -81,8 +83,9 @@ trade data, and fewer hidden look-ahead or execution assumptions.
   still appropriate because the largest risk is probability miscalibration, not
   arithmetic EV.
 - Keep a paper-trading exploration layer separate from any future live layer.
-  A live-money profile would need stricter gates than `balanced`, plus an
-  audited market PnL backtest and manual deployment review.
+  The `live` profile is the real-money-intent candidate book, but it stays
+  paper-only until a readiness gate passes, plus an audited market PnL backtest
+  and manual deployment review.
 
 ## Sources
 

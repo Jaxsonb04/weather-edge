@@ -221,14 +221,14 @@ SETTLEMENT_TZ = timezone(timedelta(hours=-8))
 PAUSE_LOOKBACK_DAYS = 21
 
 # Per-profile entry circuit breaker: (min_resolved_trades, max_resolved_roi,
-# daily_loss_pct of bankroll). fast-feedback keeps its original aggressive trip;
-# the trading-intent profiles get a looser breaker so the real-money-candidate
-# profile is no longer the only one without downside protection.
+# daily_loss_pct of bankroll). Keyed by the NORMALIZED profile name, so a key
+# missing here silently disables the breaker -- both surviving profiles must be
+# present. `research` keeps the tighter, earlier-tripping breaker of the two
+# former collectors (fast-feedback's), since it is the tiny, loosest-gated book;
+# `live` keeps the trading-intent breaker (the old balanced thresholds).
 PAUSE_THRESHOLDS = {
-    "fast-feedback": (5, -0.25, 0.005),
-    "exploratory": (8, -0.40, 0.010),
-    "balanced": (10, -0.35, 0.010),
-    "conservative": (10, -0.35, 0.010),
+    "live": (10, -0.35, 0.010),
+    "research": (5, -0.25, 0.005),
 }
 
 PROBABILITY_AUDIT_COLUMNS = {
@@ -312,6 +312,7 @@ class PaperStore:
             for column, column_type in DECISION_AUDIT_COLUMNS.items():
                 if column not in existing_decision:
                     conn.execute(f"ALTER TABLE decision_snapshots ADD COLUMN {column} {column_type}")
+            _migrate_legacy_profile_names(conn)
             conn.executescript(INDEXES)
 
     def record_forecast(self, forecast: ForecastSnapshot) -> int:
@@ -781,7 +782,7 @@ class PaperStore:
             filters.append("UPPER(side) = ?")
             params.append(side.upper())
         if risk_profile is not None:
-            filters.append("COALESCE(risk_profile, 'balanced') = ?")
+            filters.append("COALESCE(risk_profile, 'live') = ?")
             params.append(normalize_risk_profile_name(risk_profile))
         with self.connect() as conn:
             row = conn.execute(
@@ -811,7 +812,7 @@ class PaperStore:
         ]
         params: list[object] = [target_date, market_ticker]
         if risk_profile is not None:
-            filters.append("COALESCE(risk_profile, 'balanced') = ?")
+            filters.append("COALESCE(risk_profile, 'live') = ?")
             params.append(normalize_risk_profile_name(risk_profile))
         with self.connect() as conn:
             row = conn.execute(
@@ -843,7 +844,7 @@ class PaperStore:
         ]
         params: list[object] = [target_date, market_ticker, side.upper()]
         if risk_profile is not None:
-            filters.append("COALESCE(risk_profile, 'balanced') = ?")
+            filters.append("COALESCE(risk_profile, 'live') = ?")
             params.append(normalize_risk_profile_name(risk_profile))
         with self.connect() as conn:
             conn.row_factory = sqlite3.Row
@@ -1221,7 +1222,7 @@ class PaperStore:
                 WHERE realized_pnl IS NOT NULL
                   AND status != 'REJECTED'
                   AND status != 'PAPER_EXPIRED'
-                  AND COALESCE(risk_profile, 'balanced') = ?
+                  AND COALESCE(risk_profile, 'live') = ?
                   AND COALESCE(closed_at, settled_at) >= ?
                 """,
                 (profile, window_start),
@@ -1233,7 +1234,7 @@ class PaperStore:
                 WHERE realized_pnl IS NOT NULL
                   AND status != 'REJECTED'
                   AND status != 'PAPER_EXPIRED'
-                  AND COALESCE(risk_profile, 'balanced') = ?
+                  AND COALESCE(risk_profile, 'live') = ?
                   AND COALESCE(closed_at, settled_at) >= ?
                 """,
                 (profile, day_start),
@@ -1757,6 +1758,52 @@ def _paper_profile_filter(risk_profile: str | None) -> tuple[str, tuple[str, ...
     if risk_profile is None:
         return "", ()
     return (
-        "AND COALESCE(risk_profile, 'balanced') = ?",
+        "AND COALESCE(risk_profile, 'live') = ?",
         (normalize_risk_profile_name(risk_profile),),
     )
+
+
+# One-time rename of stored risk_profile strings written before the 4->2 profile
+# collapse, so raw-SQL filters (which compare against the literal new names)
+# still match historical AWS paper books. normalize_risk_profile_name() handles
+# the read side for any row this misses; this keeps the stored column canonical.
+#   balanced, conservative          -> live
+#   exploratory, fast-feedback,fast -> research
+_LEGACY_PROFILE_RENAMES = {
+    "live": ("balanced", "conservative"),
+    "research": ("exploratory", "fast-feedback", "fast"),
+}
+_PROFILE_TABLES = ("paper_orders", "decision_snapshots")
+
+
+def _migrate_legacy_profile_names(conn: sqlite3.Connection) -> None:
+    all_legacy = tuple(
+        name for names in _LEGACY_PROFILE_RENAMES.values() for name in names
+    )
+    legacy_placeholders = ",".join("?" for _ in all_legacy)
+    for table in _PROFILE_TABLES:
+        has_column = any(
+            row[1] == "risk_profile"
+            for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        )
+        if not has_column:
+            continue
+        # Skip the writes entirely once the table is already migrated -- init()
+        # runs on every PaperStore construction (every scan, every 5 min), so the
+        # common case must not touch the WAL.
+        already_clean = (
+            conn.execute(
+                f"SELECT 1 FROM {table} WHERE risk_profile IN ({legacy_placeholders}) LIMIT 1",
+                all_legacy,
+            ).fetchone()
+            is None
+        )
+        if already_clean:
+            continue
+        for new_name, legacy_names in _LEGACY_PROFILE_RENAMES.items():
+            placeholders = ",".join("?" for _ in legacy_names)
+            conn.execute(
+                f"UPDATE {table} SET risk_profile = ? "
+                f"WHERE risk_profile IN ({placeholders})",
+                (new_name, *legacy_names),
+            )

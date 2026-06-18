@@ -121,6 +121,12 @@ def build_tail_basket(
             bankroll=bankroll,
             side="NO",
             source_spread_f=source_spread_f,
+            # Thread the forecast so the live profile's warm/hot regime block and
+            # comfort-edge bind on basket legs too -- otherwise a forecast_high_f
+            # of None silently disables both gates and the basket can place NO
+            # legs on exactly the anti-calibrated days live is configured to skip.
+            forecast_high_f=predicted_high_f,
+            forecast_sigma_f=source_spread_f,
         )
         decision = _with_budget_stake(decision, tail_stake, evaluator.config)
         legs.append(TailBasketLeg(kind="TAIL_NO", market=market, decision=decision))
@@ -136,6 +142,11 @@ def build_tail_basket(
                 bankroll=bankroll,
                 side="YES",
                 source_spread_f=source_spread_f,
+                # Same forecast threading as the tail legs: the center YES sits at
+                # the forecast, so the regime block (and the new YES coin-flip
+                # guard) must see forecast_high_f or they silently no-op.
+                forecast_high_f=predicted_high_f,
+                forecast_sigma_f=source_spread_f,
             )
             decision = _with_budget_stake(decision, center_stake, evaluator.config)
             legs.append(TailBasketLeg(kind="CENTER_YES", market=center, decision=decision))

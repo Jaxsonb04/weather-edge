@@ -79,6 +79,7 @@
       "avg_entropy": 1.1137,
       "avg_winning_probability": 0.4619,
       "brier_score": 0.5539,
+      "brier_skill": 0.2686,
       "buckets": [
         {
           "avg_probability": 0.0317,
@@ -181,10 +182,13 @@
           "upper": 1.0
         }
       ],
+      "climatology_brier_score": 0.7572,
       "cohorts": [
         {
           "avg_winning_probability": 0.9384,
           "brier_score": 0.0157,
+          "brier_skill": 0.9298,
+          "climatology_brier_score": 0.2231,
           "count": 55,
           "label": "Cold",
           "log_loss": 0.0704,
@@ -194,6 +198,8 @@
         {
           "avg_winning_probability": 0.4557,
           "brier_score": 0.541,
+          "brier_skill": 0.1761,
+          "climatology_brier_score": 0.6566,
           "count": 156,
           "label": "Normal",
           "log_loss": 1.1057,
@@ -203,6 +209,8 @@
         {
           "avg_winning_probability": 0.1638,
           "brier_score": 0.9294,
+          "brier_skill": 0.2841,
+          "climatology_brier_score": 1.2981,
           "count": 75,
           "label": "Warm",
           "log_loss": 2.0556,
@@ -212,6 +220,8 @@
         {
           "avg_winning_probability": 0.1412,
           "brier_score": 0.9361,
+          "brier_skill": 0.2552,
+          "climatology_brier_score": 1.2568,
           "count": 9,
           "label": "Hot",
           "log_loss": 2.0663,
@@ -234,6 +244,8 @@
         {
           "avg_winning_probability": null,
           "brier_score": null,
+          "brier_skill": null,
+          "climatology_brier_score": null,
           "count": 0,
           "label": "Cold",
           "log_loss": null,
@@ -243,6 +255,8 @@
         {
           "avg_winning_probability": null,
           "brier_score": null,
+          "brier_skill": null,
+          "climatology_brier_score": null,
           "count": 0,
           "label": "Normal",
           "log_loss": null,
@@ -252,6 +266,8 @@
         {
           "avg_winning_probability": null,
           "brier_score": null,
+          "brier_skill": null,
+          "climatology_brier_score": null,
           "count": 0,
           "label": "Warm",
           "log_loss": null,
@@ -261,6 +277,8 @@
         {
           "avg_winning_probability": null,
           "brier_score": null,
+          "brier_skill": null,
+          "climatology_brier_score": null,
           "count": 0,
           "label": "Hot",
           "log_loss": null,
@@ -284,51 +302,30 @@
   "config_rescore": {
     "available": true,
     "by_profile": {
-      "balanced": {
-        "by_cohort": {
-          "warm_70_79f": {
-            "capital_at_risk": 8.7,
-            "hit_rate": 1.0,
-            "independent_days": 1,
-            "losses": 0,
-            "realized_pnl": 1.3,
-            "roi": 0.149425,
-            "trades": 1,
-            "wins": 1
-          }
-        },
-        "by_side": {
-          "NO": {
-            "capital_at_risk": 8.7,
-            "hit_rate": 1.0,
-            "independent_days": 1,
-            "losses": 0,
-            "realized_pnl": 1.3,
-            "roi": 0.149425,
-            "trades": 1,
-            "wins": 1
-          }
-        },
+      "live": {
+        "by_cohort": {},
+        "by_forecast_cohort": {},
+        "by_side": {},
         "candidate": {
-          "capital_at_risk": 8.7,
-          "ending_equity": 1001.3,
-          "geometric_growth_per_independent_day": 0.149425,
-          "hit_rate_per_trade": 1.0,
-          "log_growth_per_independent_day": 0.139262,
+          "capital_at_risk": 0,
+          "ending_equity": 1000.0,
+          "geometric_growth_per_independent_day": null,
+          "hit_rate_per_trade": null,
+          "log_growth_per_independent_day": null,
           "losses": 0,
-          "realized_pnl": 1.3,
-          "roi": 0.149425,
+          "realized_pnl": 0,
+          "roi": null,
           "roi_ci95_day_clustered": null,
-          "wins": 1
+          "wins": 0
         },
         "config_basis": "paper-realism, not real-money validated",
         "counts": {
-          "approved_under_candidate_config": 1,
+          "approved_under_candidate_config": 0,
           "approved_under_recorded_config": 26,
           "approved_without_settlement": 0,
           "considered": 132,
-          "independent_days": 1,
-          "settled_decisions": 1
+          "independent_days": 0,
+          "settled_decisions": 0
         },
         "recorded_config_own_book": {
           "capital_at_risk": 30.52,
@@ -341,77 +338,7 @@
         },
         "starting_bankroll": 1000.0
       },
-      "exploratory": {
-        "by_cohort": {
-          "normal_60_69f": {
-            "capital_at_risk": 2.41,
-            "hit_rate": 1.0,
-            "independent_days": 1,
-            "losses": 0,
-            "realized_pnl": 0.59,
-            "roi": 0.244813,
-            "trades": 2,
-            "wins": 2
-          },
-          "warm_70_79f": {
-            "capital_at_risk": 10.3,
-            "hit_rate": 1.0,
-            "independent_days": 2,
-            "losses": 0,
-            "realized_pnl": 1.7,
-            "roi": 0.165049,
-            "trades": 2,
-            "wins": 2
-          }
-        },
-        "by_side": {
-          "NO": {
-            "capital_at_risk": 12.71,
-            "hit_rate": 1.0,
-            "independent_days": 3,
-            "losses": 0,
-            "realized_pnl": 2.29,
-            "roi": 0.180173,
-            "trades": 4,
-            "wins": 4
-          }
-        },
-        "candidate": {
-          "capital_at_risk": 12.71,
-          "ending_equity": 1002.29,
-          "geometric_growth_per_independent_day": 0.21385,
-          "hit_rate_per_trade": 1.0,
-          "log_growth_per_independent_day": 0.193797,
-          "losses": 0,
-          "realized_pnl": 2.29,
-          "roi": 0.180173,
-          "roi_ci95_day_clustered": [
-            0.149425,
-            0.247772
-          ],
-          "wins": 4
-        },
-        "config_basis": "paper-realism, not real-money validated",
-        "counts": {
-          "approved_under_candidate_config": 6,
-          "approved_under_recorded_config": 26,
-          "approved_without_settlement": 2,
-          "considered": 132,
-          "independent_days": 3,
-          "settled_decisions": 4
-        },
-        "recorded_config_own_book": {
-          "capital_at_risk": 30.52,
-          "hit_rate_per_trade": 0.6667,
-          "independent_days": 7,
-          "realized_pnl": 0.48,
-          "roi": 0.015727,
-          "settled_decisions": 21,
-          "wins": 14
-        },
-        "starting_bankroll": 1000.0
-      },
-      "fast-feedback": {
+      "research": {
         "by_cohort": {
           "normal_60_69f": {
             "capital_at_risk": 7.12,
@@ -431,6 +358,28 @@
             "realized_pnl": -4.08,
             "roi": -0.150665,
             "trades": 8,
+            "wins": 5
+          }
+        },
+        "by_forecast_cohort": {
+          "normal_60_69f": {
+            "capital_at_risk": 19.54,
+            "hit_rate": 0.6667,
+            "independent_days": 3,
+            "losses": 2,
+            "realized_pnl": -1.54,
+            "roi": -0.078813,
+            "trades": 6,
+            "wins": 4
+          },
+          "warm_70_79f": {
+            "capital_at_risk": 14.66,
+            "hit_rate": 0.8333,
+            "independent_days": 2,
+            "losses": 1,
+            "realized_pnl": -0.66,
+            "roi": -0.04502,
+            "trades": 6,
             "wins": 5
           }
         },
@@ -1098,7 +1047,7 @@
         }
       ]
     },
-    "generated_at": "2026-06-18T20:39:26.999100+00:00",
+    "generated_at": "2026-06-18T20:40:47.833499+00:00",
     "learnings": [
       "Lower-bound edge split: edge_lcb<0 trades netted $+1.81 (10 trades) vs edge_lcb>=0 at $-3.51 (17 trades).",
       "NO side: 15/27 won, net $-1.70 this window.",
@@ -1451,7 +1400,7 @@
   },
   "default_profile": "balanced",
   "disclaimer": "Paper-trading research only. The active AWS execution calibration remains pinned to lstm; this artifact does not place live orders.",
-  "generated_at": "2026-06-18T20:39:27.344571+00:00",
+  "generated_at": "2026-06-18T20:40:48.177141+00:00",
   "live_orders_enabled": false,
   "mode": "paper_research_only",
   "paper_trading": {
@@ -5763,7 +5712,7 @@
           "rejected": 12142,
           "top_rejections": []
         },
-        "generated_at": "2026-06-18T20:39:26.999100+00:00",
+        "generated_at": "2026-06-18T20:40:47.833499+00:00",
         "learnings": [
           "balanced resolved 5 trade(s): 3W / 2L, net $-0.96.",
           "balanced currently has $0.86 of paper open risk."
@@ -5832,7 +5781,7 @@
         "window_end": "2026-06-18",
         "window_start": "2026-06-12"
       },
-      "label": "Balanced",
+      "label": "balanced",
       "learnings": [
         "balanced resolved 5 trade(s): 3W / 2L, net $-0.96.",
         "balanced currently has $0.86 of paper open risk."
@@ -6440,7 +6389,7 @@
         "open_risk": 0.86,
         "paper_trading_status": "1 open balanced paper position(s)",
         "pending_limit_risk": 0.0,
-        "profile_label": "Balanced",
+        "profile_label": "balanced",
         "profile_type": "primary",
         "realized_pnl": -0.96,
         "risk_profile": "balanced"
@@ -6622,12 +6571,11 @@
           "rejected": 2174,
           "top_rejections": []
         },
-        "generated_at": "2026-06-18T20:39:26.999100+00:00",
+        "generated_at": "2026-06-18T20:40:47.833499+00:00",
         "learnings": [
           "exploratory resolved 2 trade(s): 0W / 2L, net $-0.98.",
           "exploratory currently has $26.09 of paper open risk.",
-          "exploratory has 24 current signal candidate(s) in the latest artifact.",
-          "exploratory is experimental paper-data collection; its P&L is isolated from the balanced headline."
+          "exploratory has 24 current signal candidate(s) in the latest artifact."
         ],
         "model_vs_market": {
           "max_abs_gap": 0.7295,
@@ -6693,12 +6641,11 @@
         "window_end": "2026-06-18",
         "window_start": "2026-06-12"
       },
-      "label": "Exploratory (experimental)",
+      "label": "exploratory",
       "learnings": [
         "exploratory resolved 2 trade(s): 0W / 2L, net $-0.98.",
         "exploratory currently has $26.09 of paper open risk.",
-        "exploratory has 24 current signal candidate(s) in the latest artifact.",
-        "exploratory is experimental paper-data collection; its P&L is isolated from the balanced headline."
+        "exploratory has 24 current signal candidate(s) in the latest artifact."
       ],
       "paper_trading": {
         "available": true,
@@ -7180,7 +7127,7 @@
           "win_count": 0
         }
       },
-      "profile_type": "experimental",
+      "profile_type": "primary",
       "recommended_changes": [
         "exploratory has only 2 resolved trade(s); wait for at least 15 before changing gates."
       ],
@@ -8249,8 +8196,8 @@
         "open_risk": 26.09,
         "paper_trading_status": "3 open exploratory paper position(s)",
         "pending_limit_risk": 0.0,
-        "profile_label": "Exploratory (experimental)",
-        "profile_type": "experimental",
+        "profile_label": "exploratory",
+        "profile_type": "primary",
         "realized_pnl": -0.98,
         "risk_profile": "exploratory"
       }
@@ -8485,11 +8432,10 @@
           "rejected": 11901,
           "top_rejections": []
         },
-        "generated_at": "2026-06-18T20:39:26.999100+00:00",
+        "generated_at": "2026-06-18T20:40:47.833499+00:00",
         "learnings": [
           "fast-feedback resolved 19 trade(s): 12W / 7L, net $+0.24.",
-          "fast-feedback currently has $37.80 of paper open risk.",
-          "fast-feedback is experimental paper-data collection; its P&L is isolated from the balanced headline."
+          "fast-feedback currently has $37.80 of paper open risk."
         ],
         "model_vs_market": {
           "max_abs_gap": 0.7295,
@@ -8555,11 +8501,10 @@
         "window_end": "2026-06-18",
         "window_start": "2026-06-12"
       },
-      "label": "Fast feedback (experimental)",
+      "label": "fast-feedback",
       "learnings": [
         "fast-feedback resolved 19 trade(s): 12W / 7L, net $+0.24.",
-        "fast-feedback currently has $37.80 of paper open risk.",
-        "fast-feedback is experimental paper-data collection; its P&L is isolated from the balanced headline."
+        "fast-feedback currently has $37.80 of paper open risk."
       ],
       "paper_trading": {
         "available": true,
@@ -10385,7 +10330,7 @@
           "win_count": 12
         }
       },
-      "profile_type": "experimental",
+      "profile_type": "primary",
       "recommended_changes": [
         "No rule-based fast-feedback gate change is indicated by this window."
       ],
@@ -10464,13 +10409,77 @@
         "open_risk": 37.8,
         "paper_trading_status": "4 open fast-feedback paper position(s)",
         "pending_limit_risk": 0.0,
-        "profile_label": "Fast feedback (experimental)",
-        "profile_type": "experimental",
+        "profile_label": "fast-feedback",
+        "profile_type": "primary",
         "realized_pnl": 0.24,
         "risk_profile": "fast-feedback"
       }
     }
   ],
+  "real_money_readiness": {
+    "available": true,
+    "checks": [
+      {
+        "detail": "0/30 independent weather days",
+        "label": "Independent settlement days",
+        "name": "independent_days",
+        "passed": false,
+        "progress": 0.0
+      },
+      {
+        "detail": "0/30 settled decisions",
+        "label": "Settled decisions",
+        "name": "settled_decisions",
+        "passed": false,
+        "progress": 0.0
+      },
+      {
+        "detail": "no day-clustered ROI CI (too few independent days)",
+        "label": "After-fee ROI lower CI > 0",
+        "name": "after_fee_roi_lower_ci_positive",
+        "passed": false,
+        "progress": 0.0
+      },
+      {
+        "detail": "no settled days to measure growth",
+        "label": "Positive after-fee log-growth/day",
+        "name": "positive_log_growth_per_day",
+        "passed": false,
+        "progress": 0.0
+      },
+      {
+        "detail": "no traded cohorts yet",
+        "label": "Traded-cohort forecast skill",
+        "name": "cohort_skill",
+        "passed": false,
+        "progress": 0.0
+      },
+      {
+        "detail": "max bucket gap 0.276",
+        "label": "Calibration gap < 0.1",
+        "name": "calibration_gap",
+        "passed": false,
+        "progress": 0.0
+      }
+    ],
+    "checks_passed": 0,
+    "checks_total": 6,
+    "config_basis": "paper-realism, not real-money validated",
+    "profile": "live",
+    "readiness_pct": 0.0,
+    "ready": false,
+    "summary": "0% ready for real money -- 0/6 go-live checks pass",
+    "thresholds": {
+      "max_calibration_gap": 0.1,
+      "max_cohort_brier": 0.25,
+      "min_cohort_brier_skill": 0.0,
+      "min_cohort_independent_days": 10,
+      "min_independent_days": 30,
+      "min_settled_decisions": 30,
+      "min_side_independent_days": 10
+    },
+    "verdict": "NOT READY"
+  },
   "research_notes": [
     {
       "note": "Replay historical rows to see how probabilities scored after outcomes were known.",
@@ -11581,7 +11590,7 @@
     "deduped_signal_count": 132,
     "entry_scanner_reason": null,
     "entry_scanner_status": "Entry scanner active for eligible target dates.",
-    "last_updated": "2026-06-18T20:39:27.344547+00:00",
+    "last_updated": "2026-06-18T20:40:48.177118+00:00",
     "latest_signal_targets": [
       "2026-06-17",
       "2026-06-18",
@@ -11596,6 +11605,6 @@
     "pre_resolution_signal_count": 31472,
     "raw_signal_count": 31820,
     "sample_warning": "",
-    "target_exposure_cap": 120.0
+    "target_exposure_cap": 180.0
   }
 }

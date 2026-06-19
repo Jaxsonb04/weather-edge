@@ -152,8 +152,17 @@ def decide_exit(
     Stop-loss: a reachable downside price floor (``stop_loss_net``), preserved
     with the existing NO-side model veto: if a fresh model snapshot says the side
     still clears the entry cost and net exit (plus a buffer), hold rather than
-    realize intraday noise. Once the loss crosses a hard floor the veto lapses
-    and discipline wins.
+    realize intraday noise. Once the loss crosses the catastrophic floor
+    (``model_veto_max_loss_roi``) the veto lapses and discipline wins.
+
+    Fail-safe: for a NO side with NO fresh model read available, the stop now
+    HOLDS (``HOLD_NO_MODEL_READ``) instead of firing. A daily weather high is
+    monotonic and settles at a known time, so an intraday NO mark is noise until
+    the high is set; without a model read to confirm the thesis is dead, selling
+    just crystallizes that noise. Max loss is already bounded by entry cost, and
+    the catastrophic floor still cuts a true disaster. (When the model read IS
+    present and has dropped below the veto floor, the thesis IS confirmed dead
+    and the stop fires as before.)
     """
 
     # Prefer the edge-based convergence target when a fresh model read exists;
@@ -183,13 +192,29 @@ def decide_exit(
 
     if net_exit <= stop_loss_net:
         roi = (net_exit - entry_cost) / entry_cost if entry_cost > 0 else 0.0
-        veto_applies = (
-            model_veto_enabled
-            and side.upper() == "NO"
-            and model_side_probability is not None
-            and (model_veto_max_loss_roi is None or roi > -model_veto_max_loss_roi)
+        # A catastrophic drawdown stops unconditionally -- past this floor the
+        # position is a genuine disaster, not intraday noise, and discipline wins
+        # even with no model read.
+        catastrophic = (
+            model_veto_max_loss_roi is not None and roi <= -model_veto_max_loss_roi
         )
-        if veto_applies:
+        if model_veto_enabled and side.upper() == "NO" and not catastrophic:
+            if model_side_probability is None:
+                # FAIL-SAFE: the daily high is monotonic and settles at a known
+                # time, so an intraday NO mark is noise until the high is set. With
+                # no fresh model read we cannot confirm the thesis is dead, so do
+                # NOT crystallize a price-noise loss -- hold (max loss is already
+                # bounded by entry cost) until a model read returns or it settles.
+                # This is the failure mode that drained the book once the veto's
+                # data source (probability_snapshots) went stale: the naked
+                # %-of-cost stop whipsawed NO favorites the model still expected to
+                # win. The catastrophic floor above still cuts a true disaster.
+                return ExitSignal(
+                    "HOLD_NO_MODEL_READ",
+                    f"stop-loss held: net exit {net_exit:.3f} <= floor "
+                    f"{stop_loss_net:.3f} but no fresh model read to confirm the "
+                    f"thesis is dead (fail-safe hold on a monotonic weather high)",
+                )
             veto_floor = max(entry_cost, net_exit + model_veto_buffer)
             if model_side_probability >= veto_floor:
                 return ExitSignal(

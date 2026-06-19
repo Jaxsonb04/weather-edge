@@ -23,6 +23,7 @@ from .config import (
     normalize_risk_profile_name,
     strategy_config_for_profile,
 )
+from .consensus import MarketConsensus, build_market_consensus
 from .db import PaperStore
 from .dataset_research import build_dataset_research, write_dataset_research
 from .datasets import (
@@ -1042,6 +1043,10 @@ def _analyze_one_target(
         ensemble=ensemble,
         intraday=intraday,
     )
+    # The market's de-vigged bin ladder distilled into a consensus forecast
+    # (implied high, distribution, confidence). Surfaced below and, when the
+    # profile enables it, anchored into sizing via the consensus guard in rank().
+    consensus = build_market_consensus(markets)
     risk_profile = _risk_profile_name(args)
     paper_bankroll = _sizing_bankroll(store, config, risk_profile)
     evaluator = TradeEvaluator(config)
@@ -1057,6 +1062,7 @@ def _analyze_one_target(
         # on a disagreement day it widens, so near-forecast NO is blocked further
         # out. Floored inside the assessment so it never collapses.
         forecast_sigma_f=forecast.source_spread_f,
+        market_consensus=consensus,
     )
     entry_allowed = True
     entry_block_reason = None
@@ -1137,6 +1143,7 @@ def _analyze_one_target(
         intraday=intraday,
         ensemble=ensemble,
         entry_block_reason=entry_block_reason,
+        consensus=consensus,
     )
 
 
@@ -2108,7 +2115,7 @@ def cmd_paper_monitor(args: argparse.Namespace) -> int:
             stop_loss_pct=stop_loss_pct,
         )
 
-        if signal.action in ("HOLD", "HOLD_MODEL_VETO"):
+        if signal.action in ("HOLD", "HOLD_MODEL_VETO", "HOLD_NO_MODEL_READ"):
             store.record_monitor_snapshot(
                 row,
                 side=side,
@@ -2516,6 +2523,44 @@ def _enforce_live_forecast_freshness(forecast, config: StrategyConfig) -> None:
         )
 
 
+def _print_consensus_line(
+    consensus: MarketConsensus | None,
+    forecast_high_f: float,
+    color: Color,
+) -> None:
+    """One-line "what the market forecasts" summary under the model forecast.
+
+    This is the same headline number Kalshi prints on the market ("70.7
+    forecast"), rebuilt from the ladder, shown with its spread, modal bin, and
+    the signed gap to our model right where the model's own forecast prints.
+    """
+
+    if consensus is None or not consensus.available or consensus.implied_high_f is None:
+        return
+    pieces = [f"{consensus.implied_high_f:.1f}F"]
+    if (
+        consensus.p10_f is not None
+        and consensus.median_f is not None
+        and consensus.p90_f is not None
+    ):
+        pieces.append(
+            f"P10/P50/P90={consensus.p10_f:.1f}/{consensus.median_f:.1f}/{consensus.p90_f:.1f}F"
+        )
+    if consensus.modal_bin_label:
+        pieces.append(f"modal={consensus.modal_bin_label} {consensus.modal_probability:.0%}")
+    if consensus.implied_stdev_f is not None:
+        pieces.append(f"implied_spread={consensus.implied_stdev_f:.1f}F")
+    gap = consensus.gap_to_forecast_f(forecast_high_f)
+    line = color.cyan("kalshi forecast: " + " ".join(pieces))
+    if gap is not None:
+        direction = "warmer than" if gap > 0 else "cooler than" if gap < 0 else "level with"
+        gap_text = f"model {gap:+.1f}F ({direction} market)"
+        # Flag a material disagreement: that is both the edge source and the risk.
+        gap_render = color.yellow(gap_text) if abs(gap) >= 2.0 else color.gray(gap_text)
+        line = f"{line} {color.gray('|')} {gap_render}"
+    print(line)
+
+
 def _print_analysis(
     event_title,
     forecast,
@@ -2529,12 +2574,14 @@ def _print_analysis(
     intraday: IntradaySnapshot | None = None,
     ensemble: EnsembleSnapshot | None = None,
     entry_block_reason: str | None = None,
+    consensus: MarketConsensus | None = None,
 ) -> None:
     print(color.cyan(color.bold(event_title)))
     print(
         f"{color.bold('forecast')} {forecast.target_date.isoformat()}: {forecast.predicted_high_f:.2f}F "
         f"source_spread={forecast.source_spread_f:.2f}F method={forecast.method}"
     )
+    _print_consensus_line(consensus, forecast.predicted_high_f, color)
     forecast_context = _forecast_context_pieces(forecast)
     if forecast_context:
         print(color.cyan("forecast context: " + "; ".join(forecast_context)))

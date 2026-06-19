@@ -141,6 +141,53 @@ def test_yes_side_has_no_stop_veto():
     assert signal.action == "STOP_LOSS"
 
 
+# --- fail-safe: a NO stop must not fire on price noise with no model read ---
+
+def test_no_side_stop_held_when_no_fresh_model_read():
+    """The 2026-06-18 failure mode reproduced: a NO favorite drops to its hard
+    %-of-cost floor while no fresh model read is available (the veto's data
+    source had gone stale). It must HOLD, not crystallize the price-noise loss --
+    the daily high is monotonic and the loss is already bounded by entry cost."""
+    signal = decide_exit(
+        side="NO",
+        entry_cost=0.916,
+        net_exit=0.573,
+        stop_loss_net=0.916 * 0.65,  # 0.595 floor; net_exit is below it
+        model_side_probability=None,
+        model_veto_max_loss_roi=0.60,
+    )
+    assert signal.action == "HOLD_NO_MODEL_READ"
+
+
+def test_no_side_failsafe_still_cuts_a_catastrophic_loss():
+    """Even with no model read, a drawdown past the catastrophic floor stops --
+    the fail-safe is for intraday noise, not for an unbounded disaster."""
+    signal = decide_exit(
+        side="NO",
+        entry_cost=0.916,
+        net_exit=0.30,  # roi ~ -0.67, past the 60% floor
+        stop_loss_net=0.916 * 0.65,
+        model_side_probability=None,
+        model_veto_max_loss_roi=0.60,
+    )
+    assert signal.action == "STOP_LOSS"
+
+
+def test_no_side_stop_fires_when_model_read_present_and_below_floor():
+    """With a fresh model read that has dropped below the veto floor, the thesis
+    IS confirmed dead and the stop fires (the fail-safe only covers the
+    no-read case, never a read that says the side now loses)."""
+    signal = decide_exit(
+        side="NO",
+        entry_cost=0.916,
+        net_exit=0.573,
+        stop_loss_net=0.916 * 0.65,
+        model_side_probability=0.40,
+        model_veto_max_loss_roi=0.60,
+    )
+    assert signal.action == "STOP_LOSS"
+
+
 # --- helpers ---
 
 def test_net_exit_per_contract_guards_invalid_bids():

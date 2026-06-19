@@ -552,6 +552,22 @@ def _intraday_blend_weight(local_hour: float | None, config: StrategyConfig) -> 
     return min(config.intraday_probability_weight, base)
 
 
+def market_implied_probabilities(markets: list[MarketBin]) -> dict[str, float]:
+    """Public de-vigged ladder distribution (ticker -> probability, sums to ~1).
+
+    The single source of truth for "what the market implies", shared by the
+    per-bin market prior here and the ladder-level consensus in ``consensus``.
+    """
+
+    return _market_implied_probabilities(markets)
+
+
+def market_implied_yes_value(market: MarketBin) -> float | None:
+    """Public single-bin implied YES probability (pre-normalization), or None."""
+
+    return _market_implied_yes_value(market)
+
+
 def _market_implied_probabilities(markets: list[MarketBin]) -> dict[str, float]:
     raw: dict[str, float] = {}
     for market in markets:
@@ -630,11 +646,24 @@ def _model_weight(
 ) -> float:
     if market is None:
         return 1.0
-    market_weight = config.market_prior_weight
+    # The "huge consideration" anchor: when enabled, the market gets a heavier
+    # base voice (anchor_weight, e.g. 0.60 vs 0.45) and a lower model floor, so a
+    # confident, liquid ladder pulls the posterior harder toward the crowd. The
+    # reliability scaling and the model-weight floor still bind, so a thin/wide
+    # book never dominates and the model is never fully silenced (the edge lives
+    # in its residual disagreement). Default off on live pending a walk-forward
+    # backtest; on for research to collect validation samples.
+    if config.market_consensus_anchor_enabled:
+        base_weight = config.market_consensus_anchor_weight
+        min_model_weight = config.market_consensus_anchor_min_model_weight
+    else:
+        base_weight = config.market_prior_weight
+        min_model_weight = config.min_model_weight
+    market_weight = base_weight
     if source_spread_f > 3.0:
         market_weight += (source_spread_f - 3.0) * config.source_spread_market_weight_per_f
     market_weight *= _market_prior_reliability(market, config)
-    market_weight = min(1.0 - config.min_model_weight, max(0.0, market_weight))
+    market_weight = min(1.0 - min_model_weight, max(0.0, market_weight))
     return 1.0 - market_weight
 
 

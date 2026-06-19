@@ -4,6 +4,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 
 from .config import StrategyConfig, temperature_cohort
+from .consensus import MarketConsensus
 from .fees import (
     expected_profit_per_yes_contract,
     kelly_fraction_spent,
@@ -26,6 +27,7 @@ class TradeEvaluator:
         source_spread_f: float | None = None,
         forecast_high_f: float | None = None,
         forecast_sigma_f: float | None = None,
+        market_consensus: MarketConsensus | None = None,
     ) -> TradeDecision:
         side = _normalize_side(side)
         reasons: list[str] = []
@@ -36,6 +38,21 @@ class TradeEvaluator:
         spread = market.side_spread(side)
         side_probability = _side_probability(probability, side)
         side_probability_lcb = _side_probability_lcb(probability, side)
+        # Floor the modelled uncertainty: a day-ahead 2F bin can never be known
+        # with zero error (the live calibration gap is ~0.28), yet intraday
+        # conditioning or a saturated normal-CDF can collapse the side LCB onto
+        # the point estimate -- a literal 1.0 -- which NULLIFIES the edge_lcb gate
+        # (the primary defense against model overconfidence) and erases the sizing
+        # haircut. Hold the LCB at least min_probability_uncertainty below the
+        # point estimate so degenerate certainty is gated and sized as the
+        # uncertain bet it is. Capped at the ABSOLUTE bound (1 - u), not relative
+        # to the point estimate, so it bites only near-certain extremes and leaves
+        # ordinary favorites (LCB ~0.85-0.93) untouched. No-op at 0.0 (the frozen
+        # baseline); set per profile.
+        if self.config.min_probability_uncertainty > 0.0:
+            side_probability_lcb = min(
+                side_probability_lcb, 1.0 - self.config.min_probability_uncertainty
+            )
         residual_probability = _side_optional_probability(probability.residual_probability, side)
         ensemble_probability = _side_optional_probability(probability.ensemble_probability, side)
         model_probability = _side_model_probability(probability, side)
@@ -185,6 +202,19 @@ class TradeEvaluator:
             self.config.kelly_lcb_weight * side_probability_lcb
             + (1.0 - self.config.kelly_lcb_weight) * side_probability
         )
+        # Defend Kelly against degenerate certainty: intraday conditioning or a
+        # saturated normal-CDF can drive side_probability AND its LCB to a literal
+        # 1.0, removing the uncertainty haircut and betting the whole budget on a
+        # day-ahead 2F bin (the over-sizing behind the 2026-06-18 NO favorites).
+        # Cap the SIZING probability away from the [0, 1] extremes -- this never
+        # touches the edge/edge_lcb gate above, so a genuinely safe favorite still
+        # trades, it just cannot max-size off false certainty. No-op when
+        # min_probability_uncertainty is 0.0 (the frozen baseline).
+        uncertainty_floor = self.config.min_probability_uncertainty
+        if uncertainty_floor > 0.0:
+            sizing_probability = min(
+                1.0 - uncertainty_floor, max(uncertainty_floor, sizing_probability)
+            )
         kelly = kelly_fraction_spent(sizing_probability, cost)
         kelly *= self.config.fractional_kelly
         risk_budget = bankroll * self.config.max_position_risk_pct
@@ -208,6 +238,20 @@ class TradeEvaluator:
             spend_budget *= comfort_size_multiplier
             if budget_label == "position_risk_cap":
                 budget_label = "comfort_far_tail_boost"
+        # Market-consensus guard: don't bet HARD against a confident, liquid
+        # market. When our point forecast disagrees with the market-implied
+        # consensus high and the ladder is tight + deep + well-formed, the bet's
+        # whole edge rides on the model out-forecasting a crowd that put money on
+        # the other view -- so shrink the size. It never blocks a trade (the gate
+        # decisions above are untouched) and only fires when explicitly enabled.
+        consensus_size_multiplier = _consensus_guard_assessment(
+            market_consensus=market_consensus,
+            forecast_high_f=forecast_high_f,
+            config=self.config,
+        )
+        if consensus_size_multiplier != 1.0:
+            spend_budget *= consensus_size_multiplier
+            budget_label = "consensus_guard_haircut"
         if self.config.yes_estimation_shrink and side == "YES":
             # Size YES off the conservative lower bound, shrunk for estimation
             # error and scaled by payout, then hard-capped at the tighter YES cap.
@@ -304,6 +348,7 @@ class TradeEvaluator:
         source_spread_f: float | None = None,
         forecast_high_f: float | None = None,
         forecast_sigma_f: float | None = None,
+        market_consensus: MarketConsensus | None = None,
     ) -> list[TradeDecision]:
         normalized_sides = tuple(_normalize_side(side) for side in sides)
         decisions = []
@@ -320,6 +365,7 @@ class TradeEvaluator:
                         source_spread_f=source_spread_f,
                         forecast_high_f=forecast_high_f,
                         forecast_sigma_f=forecast_sigma_f,
+                        market_consensus=market_consensus,
                     )
                 )
         decisions.sort(
@@ -544,6 +590,52 @@ def _comfort_edge_assessment(
     fraction = _unit(fraction)
     multiplier = 1.0 + fraction * (config.comfort_edge_max_size_boost - 1.0)
     return None, multiplier
+
+
+def _consensus_guard_assessment(
+    *,
+    market_consensus: MarketConsensus | None,
+    forecast_high_f: float | None,
+    config: StrategyConfig,
+) -> float:
+    """Size multiplier (<= 1.0) for the "don't bet hard against a confident,
+    liquid market" guard.
+
+    Returns 1.0 (no effect) unless the guard is enabled AND our point forecast
+    disagrees with the market-implied consensus high by at least ``guard_gap_f``
+    while the ladder is confident (tight implied spread), liquid (enough
+    two-sided bins), and well-formed (small overround). In that case the bet is
+    riding on the model out-forecasting a crowd that put real money on a
+    different high, so its size is cut to ``guard_size_haircut``. It only shrinks
+    size and never adds a rejection reason; like any sizing reduction in this
+    engine (e.g. yes_estimation_shrink), a haircut that drives a marginal bet
+    below one whole contract surfaces as the usual zero-contracts non-trade, not
+    as a guard block. It never creates a bet.
+    """
+
+    if not config.market_consensus_guard_enabled:
+        return 1.0
+    if market_consensus is None or not market_consensus.available:
+        return 1.0
+    if forecast_high_f is None or market_consensus.implied_high_f is None:
+        return 1.0
+    if market_consensus.implied_stdev_f is None:
+        return 1.0
+
+    gap_f = abs(forecast_high_f - market_consensus.implied_high_f)
+    if gap_f < config.market_consensus_guard_gap_f:
+        return 1.0
+    if market_consensus.implied_stdev_f > config.market_consensus_guard_max_stdev_f:
+        return 1.0
+    if market_consensus.liquid_bin_count < config.market_consensus_guard_min_bins:
+        return 1.0
+    # A well-formed book carries implied mass near 1.0; a large |overround| means
+    # the ladder is overlapping/inconsistent (positive) or thin/incomplete
+    # (negative) -- either way not a confident crowd we should defer to.
+    if abs(market_consensus.overround) > config.market_consensus_guard_max_overround:
+        return 1.0
+
+    return _unit(config.market_consensus_guard_size_haircut)
 
 
 def _normalize_side(side: str) -> str:

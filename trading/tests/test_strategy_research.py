@@ -11,11 +11,12 @@ from pathlib import Path
 
 from sfo_kalshi_quant.cli import main
 from sfo_kalshi_quant.db import PaperStore
-from sfo_kalshi_quant.models import TradeDecision
+from sfo_kalshi_quant.models import EventSnapshot, ForecastSnapshot, TradeDecision
 from sfo_kalshi_quant.config import SFO_TZ, StrategyConfig
 from sfo_kalshi_quant.strategy_research import (
     _dataset_research_summary,
     _entry_block_reason,
+    _market_consensus_payload,
     _strategy_alerts,
     _status_target_date,
     build_strategy_research,
@@ -864,3 +865,159 @@ def test_settlement_alert_escalates_to_critical_when_two_days_stale():
     assert "settlement-pending" not in by_code
     assert by_code["settlement-backlog"]["level"] == "critical"
     assert "3 days" in by_code["settlement-backlog"]["detail"]
+
+
+def _kalshi_ladder_event(event_ticker: str = "KXHIGHTSFO-26JUN03") -> EventSnapshot:
+    """A realistic two-sided Kalshi event payload peaking on the 66-67 bin.
+
+    Built as the raw ``with_nested_markets`` body that the public client returns
+    so it round-trips through ``record_market`` -> ``latest_market_snapshot``.
+    The event ticker is date-encoded (as production tickers are) so the stored
+    snapshot's ``target_date`` column resolves to 2026-06-03 — the column the
+    accessor reads. The decision tickers stay ``KXHIGHTSFO-TEST-*`` to match the
+    shared ``_approved_decision`` fixture's model-probability join.
+    """
+
+    def market(label, strike_type, floor, cap, yes_bid, yes_ask):
+        return {
+            "ticker": f"KXHIGHTSFO-TEST-{label}",
+            "event_ticker": event_ticker,
+            "title": "",
+            "yes_sub_title": label,
+            "strike_type": strike_type,
+            "floor_strike": floor,
+            "cap_strike": cap,
+            "yes_bid_dollars": yes_bid,
+            "yes_ask_dollars": yes_ask,
+            "no_bid_dollars": round(1.0 - yes_ask, 2),
+            "no_ask_dollars": round(1.0 - yes_bid, 2),
+            "yes_bid_size_fp": 150,
+            "yes_ask_size_fp": 150,
+            "status": "active",
+        }
+
+    payload = {
+        "event_ticker": event_ticker,
+        "title": "SFO daily high",
+        "markets": [
+            market("T63", "less", 63, 63, 0.01, 0.03),
+            market("B64.5", "between", 64, 65, 0.10, 0.13),
+            market("B66.5", "between", 66, 67, 0.43, 0.46),
+            market("B68.5", "between", 68, 69, 0.22, 0.25),
+            market("G70", "greater", 70, 70, 0.04, 0.06),
+        ],
+    }
+    return EventSnapshot.from_kalshi(payload)
+
+
+def _forecast_snapshot(target: str = "2026-06-03", high: float = 66.5) -> ForecastSnapshot:
+    return ForecastSnapshot(
+        target_date=date.fromisoformat(target),
+        predicted_high_f=high,
+        fetched_at="2026-06-02T18:00:00+00:00",
+        source_count=4,
+    )
+
+
+def test_market_consensus_payload_reconstructs_from_stored_ladder():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "trading" / "paper.db"
+        store = PaperStore(db_path)
+        decision = _approved_decision()  # ticker KXHIGHTSFO-TEST-B66.5
+        store.record_market(_kalshi_ladder_event())
+        store.record_decisions(
+            "2026-06-03",
+            [decision],
+            event=pre_resolution_event([decision]),
+            forecast=_forecast_snapshot(),
+        )
+
+        payload = _market_consensus_payload(db_path)
+
+        assert payload["available"] is True
+        assert payload["target_date"] == "2026-06-03"
+        # Model high comes from the decision snapshot's forecast_predicted_high_f.
+        assert payload["model_high_f"] == 66.5
+        # Market consensus is distilled from the de-vigged ladder; the gap is the
+        # signed model-minus-market high.
+        assert payload["implied_high_f"] is not None
+        assert (
+            round(payload["model_high_f"] - payload["implied_high_f"], 2)
+            == payload["model_minus_market_f"]
+        )
+        # Mirrors report.consensus_to_dict: a per-bin distribution overlaying the
+        # de-vigged market probability against the stored model probability.
+        assert payload["modal_bin_label"] == "B66.5"
+        assert payload["distribution"], "distribution should not be empty"
+        modal_bin = next(
+            row for row in payload["distribution"] if row["label"] == "B66.5"
+        )
+        assert modal_bin["implied_probability"] > 0
+        assert modal_bin["model_probability"] == 0.70  # the recorded model prob
+
+
+def test_market_consensus_unavailable_without_stored_ladder():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "trading" / "paper.db"
+        store = PaperStore(db_path)
+        decision = _approved_decision()
+        # Decisions recorded, but no market_snapshot ever stored.
+        store.record_decisions(
+            "2026-06-03", [decision], event=pre_resolution_event([decision])
+        )
+
+        payload = _market_consensus_payload(db_path)
+
+        assert payload == {"available": False}
+
+
+def test_market_consensus_unavailable_when_db_missing():
+    with tempfile.TemporaryDirectory() as tmp:
+        missing = Path(tmp) / "missing" / "paper.db"
+        assert _market_consensus_payload(missing) == {"available": False}
+
+
+def test_latest_market_snapshot_roundtrips_the_ladder():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "trading" / "paper.db"
+        store = PaperStore(db_path)
+        store.record_market(_kalshi_ladder_event())
+
+        event = store.latest_market_snapshot("2026-06-03")
+        assert event is not None
+        labels = {market.yes_sub_title for market in event.markets}
+        assert labels == {"T63", "B64.5", "B66.5", "B68.5", "G70"}
+        # Bid/ask survive the round-trip so the consensus de-vig is meaningful.
+        modal = next(m for m in event.markets if m.yes_sub_title == "B66.5")
+        assert modal.yes_bid == 0.43 and modal.yes_ask == 0.46
+
+        assert store.latest_market_snapshot("2099-01-01") is None
+
+
+def test_strategy_research_surfaces_market_consensus_in_signal_quality():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "forecaster"
+        db_path = Path(tmp) / "trading" / "paper.db"
+        _write_lstm_fixture(root)
+        _write_settlement(root)
+
+        store = PaperStore(db_path)
+        decision = _approved_decision()
+        store.record_market(_kalshi_ladder_event())
+        store.record_decisions(
+            "2026-06-03",
+            [decision],
+            event=pre_resolution_event([decision]),
+            forecast=_forecast_snapshot(),
+        )
+
+        payload = build_strategy_research(
+            forecaster_root=root,
+            db_path=db_path,
+            calibration_min_train=40,
+        )
+
+        consensus = payload["signal_quality"]["market_consensus"]
+        assert consensus["available"] is True
+        assert consensus["modal_bin_label"] == "B66.5"
+        assert consensus["distribution"]

@@ -118,6 +118,23 @@ def test_debias_correction_is_capped():
     assert abs(predictor(new_row, history) - 67.5) < 1e-9  # 66 + capped 1.5
 
 
+def test_production_debias_holdout_guard_flags_tail_cohort_regression():
+    # The live activation path (google_weather_cache) must refuse a correction
+    # that worsens a cohort's holdout MAE -- zero tolerance on the warm/hot tail.
+    holdout = (
+        [{"cohort": "warm", "raw_pred": 72.0, "actual": 72.0} for _ in range(5)]
+        + [{"cohort": "normal", "raw_pred": 65.0, "actual": 67.0} for _ in range(5)]
+        + [{"cohort": "cold", "raw_pred": 55.0, "actual": 58.0} for _ in range(2)]
+    )
+    corrections = {"warm": 1.5, "normal": 1.5, "cold": 1.0}
+    regressions, inconclusive = google_weather_cache._bias_holdout_cohort_regressions(
+        holdout, corrections, 0.5
+    )
+    assert "warm" in regressions       # +1.5 on a perfect cohort regresses it
+    assert "normal" not in regressions  # +1.5 improves an under-prediction
+    assert "cold" in inconclusive       # too few holdout samples to judge
+
+
 # --------------------------------------------------------------------------- #
 # End-to-end backtest + acceptance
 # --------------------------------------------------------------------------- #

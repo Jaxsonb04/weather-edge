@@ -67,6 +67,16 @@ class StrategyConfig:
     min_posterior_probability: float = 0.06
     fractional_kelly: float = 0.15
     kelly_lcb_weight: float = 1.0
+    # Minimum modelled uncertainty applied when SIZING (not when gating). A
+    # day-ahead 2F bin can never be known with zero error -- the live
+    # calibration gap is ~0.28 -- yet intraday conditioning or a saturated
+    # normal-CDF can drive the side probability and its lower bound to a literal
+    # 1.0, which erases the uncertainty haircut and max-sizes Kelly off false
+    # certainty (the over-sizing behind the 22/16-contract NO favorites on
+    # 2026-06-18). Clamping the sizing probability to [u, 1-u] leaves ordinary
+    # favorites (p ~0.85-0.93) untouched while capping degenerate certainty.
+    # 0.0 on the frozen baseline for reproducible tests; enabled per profile.
+    min_probability_uncertainty: float = 0.0
     max_position_risk_pct: float = 0.01
     max_event_risk_pct: float = 0.03
     # When True, Kelly and the percentage risk caps size against live paper
@@ -245,6 +255,10 @@ LIVE_PROFILE_OVERRIDES = {
     # bound while letting size track the actual edge. Held to the balanced
     # (real-trading-intent) profile; conservative base stays at the strict 1.0.
     "kelly_lcb_weight": 0.6,
+    # Cap sizing certainty: a degenerate p/LCB of 1.0 (intraday conditioning or
+    # CDF saturation) must not max-size Kelly on a day-ahead 2F bin. See the
+    # field comment on StrategyConfig.min_probability_uncertainty.
+    "min_probability_uncertainty": 0.04,
     # Realistic paper stake (see round_contracts above).
     "round_contracts": True,
     # Meaningful-stake retune (2026-06-17). The point: on a $1000 paper book,

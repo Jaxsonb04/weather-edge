@@ -237,6 +237,115 @@ def test_latest_model_probability_missing_market_is_none():
         assert store.latest_model_probability("2026-06-10", "KXHIGHTSFO-TEST-T78") is None
 
 
+# --- the veto must read the LIVE decision journal, not the context snapshots ---
+# probability_snapshots is written only on the first command per tick
+# (--skip-context-snapshots), so it can flatline while decision_snapshots keeps
+# flowing -- which silently disabled this veto from 2026-06-16.
+
+def _record_decision_model_read(
+    store: PaperStore, target_date: str, ticker: str, side: str, model_probability: float
+) -> None:
+    decision = TradeDecision(
+        ticker=ticker,
+        label="82° or above",
+        action="BUY_NO" if side == "NO" else "BUY_YES",
+        approved=False,
+        probability=model_probability,
+        probability_lcb=max(0.0, model_probability - 0.05),
+        yes_bid=0.19,
+        yes_ask=0.21,
+        spread=0.02,
+        fee_per_contract=0.01,
+        cost_per_contract=0.21,
+        edge=0.0,
+        edge_lcb=0.0,
+        kelly_fraction=0.0,
+        recommended_contracts=0.0,
+        expected_profit=0.0,
+        reasons=[],
+        side=side,
+        model_probability=model_probability,
+        strike_type="above",
+        floor_strike=82.0,
+        cap_strike=None,
+    )
+    store.record_decisions(target_date, [decision])
+
+
+def test_latest_model_probability_reads_no_side_decision_journal():
+    """decision_snapshots stores model_probability per SIDE; a BUY_NO row's 0.95
+    is the NO-side conviction, which must normalize back to YES = 0.05."""
+    with TemporaryDirectory() as tmp:
+        store = PaperStore(Path(tmp) / "paper.db")
+        _record_decision_model_read(store, "2026-06-18", "KXHIGHTSFO-TEST-B82.5", "NO", 0.95)
+        value = store.latest_model_probability("2026-06-18", "KXHIGHTSFO-TEST-B82.5")
+        assert value is not None
+        assert abs(value - 0.05) < 1e-9
+
+
+def test_latest_model_probability_prefers_decision_over_probability_snapshot():
+    """When both tables have the market, the live decision journal wins."""
+    with TemporaryDirectory() as tmp:
+        store = PaperStore(Path(tmp) / "paper.db")
+        store.record_probabilities(
+            "2026-06-18", [_probability("KXHIGHTSFO-TEST-B82.5", 0.62)]
+        )
+        _record_decision_model_read(store, "2026-06-18", "KXHIGHTSFO-TEST-B82.5", "YES", 0.10)
+        value = store.latest_model_probability("2026-06-18", "KXHIGHTSFO-TEST-B82.5")
+        assert value is not None
+        assert abs(value - 0.10) < 1e-9
+
+
+def test_paper_monitor_no_veto_uses_decision_journal_model_read():
+    """End-to-end: a NO favorite at its hard floor is HELD by the model veto when
+    the only model source is the live decision journal (no probability_snapshots).
+    This is the exact path that was dead on 2026-06-18."""
+    with TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "paper.db"
+        store = PaperStore(db_path)
+        order_id = store.record_paper_order("2026-06-12", _stopped_no_decision())
+        # NO-side model conviction 0.95 (>= entry cost 0.803) lives ONLY in the
+        # decision journal; probability_snapshots is intentionally never written.
+        _record_decision_model_read(store, "2026-06-12", "KXHIGHTSFO-TEST-B82.5", "NO", 0.95)
+
+        out = StringIO()
+        with patch("sfo_kalshi_quant.cli.KalshiPublicClient", _FakeNoStopClient), redirect_stdout(out):
+            code = main(["--db-path", str(db_path), "--no-color", "paper-monitor"])
+
+        assert code == 0
+        assert store.paper_orders(1)[0]["status"] == "PAPER_FILLED"
+        with store.connect() as conn:
+            action = conn.execute(
+                "SELECT action FROM paper_monitor_snapshots WHERE order_id=? ORDER BY id DESC LIMIT 1",
+                (order_id,),
+            ).fetchone()[0]
+        assert action == "HOLD_MODEL_VETO"
+
+
+def test_paper_monitor_no_stop_held_failsafe_when_no_model_read():
+    """The 2026-06-18 regression: NO model source at all (dead context tables).
+    The NO favorite at its hard floor must HOLD (fail-safe), not whipsaw out --
+    a daily high is monotonic, so the intraday mark is noise we cannot confirm."""
+    with TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "paper.db"
+        store = PaperStore(db_path)
+        order_id = store.record_paper_order("2026-06-12", _stopped_no_decision())
+        # Deliberately record NO model read in either table.
+
+        out = StringIO()
+        with patch("sfo_kalshi_quant.cli.KalshiPublicClient", _FakeNoStopClient), redirect_stdout(out):
+            code = main(["--db-path", str(db_path), "--no-color", "paper-monitor"])
+
+        assert code == 0
+        assert store.paper_orders(1)[0]["status"] == "PAPER_FILLED"
+        with store.connect() as conn:
+            action = conn.execute(
+                "SELECT action FROM paper_monitor_snapshots WHERE order_id=? ORDER BY id DESC LIMIT 1",
+                (order_id,),
+            ).fetchone()[0]
+        assert action == "HOLD_NO_MODEL_READ"
+
+
 def test_paper_monitor_hard_floor_disables_model_veto():
     with TemporaryDirectory() as tmp:
         db_path = Path(tmp) / "paper.db"

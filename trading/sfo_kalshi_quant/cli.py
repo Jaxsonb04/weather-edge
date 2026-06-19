@@ -2108,7 +2108,7 @@ def cmd_paper_monitor(args: argparse.Namespace) -> int:
             stop_loss_pct=stop_loss_pct,
         )
 
-        if signal.action in ("HOLD", "HOLD_MODEL_VETO"):
+        if signal.action in ("HOLD", "HOLD_MODEL_VETO", "HOLD_NO_MODEL_READ"):
             store.record_monitor_snapshot(
                 row,
                 side=side,

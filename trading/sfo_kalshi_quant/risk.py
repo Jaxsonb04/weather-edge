@@ -36,6 +36,21 @@ class TradeEvaluator:
         spread = market.side_spread(side)
         side_probability = _side_probability(probability, side)
         side_probability_lcb = _side_probability_lcb(probability, side)
+        # Floor the modelled uncertainty: a day-ahead 2F bin can never be known
+        # with zero error (the live calibration gap is ~0.28), yet intraday
+        # conditioning or a saturated normal-CDF can collapse the side LCB onto
+        # the point estimate -- a literal 1.0 -- which NULLIFIES the edge_lcb gate
+        # (the primary defense against model overconfidence) and erases the sizing
+        # haircut. Hold the LCB at least min_probability_uncertainty below the
+        # point estimate so degenerate certainty is gated and sized as the
+        # uncertain bet it is. Capped at the ABSOLUTE bound (1 - u), not relative
+        # to the point estimate, so it bites only near-certain extremes and leaves
+        # ordinary favorites (LCB ~0.85-0.93) untouched. No-op at 0.0 (the frozen
+        # baseline); set per profile.
+        if self.config.min_probability_uncertainty > 0.0:
+            side_probability_lcb = min(
+                side_probability_lcb, 1.0 - self.config.min_probability_uncertainty
+            )
         residual_probability = _side_optional_probability(probability.residual_probability, side)
         ensemble_probability = _side_optional_probability(probability.ensemble_probability, side)
         model_probability = _side_model_probability(probability, side)
@@ -185,6 +200,19 @@ class TradeEvaluator:
             self.config.kelly_lcb_weight * side_probability_lcb
             + (1.0 - self.config.kelly_lcb_weight) * side_probability
         )
+        # Defend Kelly against degenerate certainty: intraday conditioning or a
+        # saturated normal-CDF can drive side_probability AND its LCB to a literal
+        # 1.0, removing the uncertainty haircut and betting the whole budget on a
+        # day-ahead 2F bin (the over-sizing behind the 2026-06-18 NO favorites).
+        # Cap the SIZING probability away from the [0, 1] extremes -- this never
+        # touches the edge/edge_lcb gate above, so a genuinely safe favorite still
+        # trades, it just cannot max-size off false certainty. No-op when
+        # min_probability_uncertainty is 0.0 (the frozen baseline).
+        uncertainty_floor = self.config.min_probability_uncertainty
+        if uncertainty_floor > 0.0:
+            sizing_probability = min(
+                1.0 - uncertainty_floor, max(uncertainty_floor, sizing_probability)
+            )
         kelly = kelly_fraction_spent(sizing_probability, cost)
         kelly *= self.config.fractional_kelly
         risk_budget = bankroll * self.config.max_position_risk_pct

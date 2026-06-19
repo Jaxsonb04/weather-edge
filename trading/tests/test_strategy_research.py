@@ -348,6 +348,12 @@ def test_strategy_research_alerts_on_duplicate_open_positions():
 
         store = PaperStore(db_path)
         decision = _approved_decision()
+        # The open-position guard index now blocks a duplicate at the DB layer.
+        # The duplicate-open alert is the backstop for a legacy book that predates
+        # the index (or one where it could not be built), so drop it to reproduce
+        # that state and prove the alert still fires.
+        with store.connect() as conn:
+            conn.execute("DROP INDEX IF EXISTS ux_paper_orders_open_market_side_profile")
         store.record_paper_order("2026-06-03", decision)
         store.record_paper_order("2026-06-03", decision)
 
@@ -395,6 +401,11 @@ def test_strategy_research_scopes_duplicate_alerts_to_profile_views():
         target = (datetime.now(UTC).astimezone(SFO_TZ).date() + timedelta(days=1)).isoformat()
 
         store = PaperStore(db_path)
+        # Reproduce a legacy book carrying a research duplicate (see the
+        # alert-backstop note above); the guard index would otherwise reject the
+        # second research insert.
+        with store.connect() as conn:
+            conn.execute("DROP INDEX IF EXISTS ux_paper_orders_open_market_side_profile")
         balanced = replace(_approved_decision(), ticker="KXHIGHTSFO-TEST-B65.5")
         fast = _approved_decision()
         store.record_paper_order(target, balanced, risk_profile="live")

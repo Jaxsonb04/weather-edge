@@ -231,6 +231,13 @@ def rescore_row(row: sqlite3.Row, config: StrategyConfig, *, bankroll: float) ->
 
     market = reconstruct_market(row)
     probability = reconstruct_probability(row)
+    # market_consensus is intentionally omitted: the full bid/ask ladder is not
+    # stored per snapshot, so the consensus guard's SIZE haircut cannot be
+    # replayed here (it no-ops). The rescore re-runs only gates + Kelly on the
+    # STORED posterior; the anchor's heavier blend weight is whatever was baked
+    # into that recorded probability at decision time, not re-derived under
+    # ``config`` -- so both anchor and guard effects must be validated from the
+    # live research book, not reconstructed here.
     return TradeEvaluator(config).evaluate_market(
         market,
         probability,

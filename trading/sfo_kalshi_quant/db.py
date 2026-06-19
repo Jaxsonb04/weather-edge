@@ -430,6 +430,39 @@ class PaperStore:
             )
             return int(cursor.lastrowid)
 
+    def latest_market_snapshot(self, target_date: str) -> EventSnapshot | None:
+        """Reconstruct the most recent stored Kalshi ladder for a target date.
+
+        ``record_market`` persists the full Kalshi event payload (the same
+        ``with_nested_markets`` body that ``EventSnapshot.from_kalshi`` parses) as
+        ``raw_json``, so the freshest snapshot round-trips losslessly back into an
+        ``EventSnapshot`` -- bid/ask ladder and all. The Strategy Lab builder uses
+        this to distill the market consensus offline (it never touches live
+        Kalshi). Returns None when no snapshot was ever stored for the target or
+        when the stored payload is unparseable.
+        """
+
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT raw_json
+                FROM market_snapshots
+                WHERE target_date = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                """,
+                (target_date,),
+            ).fetchone()
+        if row is None or not row[0]:
+            return None
+        try:
+            payload = json.loads(row[0])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return EventSnapshot.from_kalshi(payload)
+
     def record_probabilities(self, target_date: str, probabilities: Iterable[BucketProbability]) -> None:
         with self.connect() as conn:
             conn.executemany(

@@ -78,6 +78,16 @@ probability forecast in one run.
   station-centered forecast, and warns when nearby grid choices disagree.
 - Market-aware posterior probability using live Kalshi bid/ask prices as a
   normalized, liquidity-aware market prior.
+- Kalshi market-consensus forecast: the full de-vigged bin ladder distilled into
+  the crowd's implied high temperature, modal bin, implied spread, and
+  P10/P50/P90 — the forecast "people who put money" actually trade against. It
+  is always surfaced (a `kalshi consensus:` line under the model forecast in
+  `analyze`, a `market_consensus` block in the daily report, and the Strategy Lab
+  dashboard) so the model-vs-market gap is visible at a glance. The `research`
+  profile additionally *anchors* it harder into the blend and runs a guard that
+  haircuts position size when the model bets hard against a confident, liquid
+  market; both are OFF on `live` pending a walk-forward backtest (see
+  `StrategyConfig.market_consensus_*`).
 - Conservative Kalshi quadratic fee estimate.
 - Fee-adjusted edge, lower-confidence-bound edge, trade-quality score, and
   fractional-Kelly sizing.

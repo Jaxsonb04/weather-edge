@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import asdict, is_dataclass
 from datetime import date
 from pathlib import Path
@@ -9,6 +10,7 @@ from urllib.error import URLError
 
 from .backtest import run_walk_forward_calibration_backtest
 from .config import SERIES_TICKER, StrategyConfig
+from .consensus import MarketConsensus, build_market_consensus
 from .ensemble import OpenMeteoEnsembleError, SfoEnsembleClient
 from .forecast import (
     ForecastDataError,
@@ -141,6 +143,15 @@ def build_target_report(
         sides=_analysis_sides(side),
         source_spread_f=forecast.source_spread_f,
     )
+    # The market's own forecast, distilled from the live ladder. Only meaningful
+    # when a real Kalshi book is present (the fallback paper ladder has no
+    # prices), so it is surfaced as unavailable on the probability-only path.
+    # NOTE: this lighter public report surfaces the consensus for DISPLAY but,
+    # like comfort-edge, does not thread it (or forecast_high_f) into rank()'s
+    # sizing -- the authoritative consensus-guard sizing is applied in the live
+    # scan path (cli._analyze_one_target) and recorded to the paper DB that the
+    # Strategy Lab reads, so the dashboard's decisions reflect the guard.
+    consensus = build_market_consensus(markets) if market_available else None
     warnings = [warning for warning in (ensemble_warning, market_warning) if warning]
     return {
         "target_date": target.isoformat(),
@@ -149,6 +160,9 @@ def build_target_report(
         "forecast": forecast_to_dict(forecast),
         "intraday": intraday_to_dict(intraday),
         "ensemble": ensemble_to_dict(ensemble),
+        "market_consensus": consensus_to_dict(
+            consensus, forecast.predicted_high_f, probabilities
+        ),
         "warnings": warnings,
         "best_decision": decision_to_dict(decisions[0]) if decisions else None,
         "decisions": [decision_to_dict(decision) for decision in decisions],
@@ -298,6 +312,56 @@ def ensemble_to_dict(ensemble: EnsembleSnapshot | None) -> dict[str, Any] | None
         "station_bias_f": round(ensemble.station_bias_f, 2),
         "cell_selection": ensemble.cell_selection,
         "warning": ensemble.warning,
+    }
+
+
+def consensus_to_dict(
+    consensus: MarketConsensus | None,
+    forecast_high_f: float,
+    probabilities: dict[str, Any],
+) -> dict[str, Any]:
+    """Serialize the market-implied consensus forecast for the public report.
+
+    Includes a per-bin distribution that pairs the de-vigged market probability
+    with our model probability so the dashboard can overlay "what the market
+    thinks" against "what the model thinks" directly.
+    """
+
+    if consensus is None or not consensus.available or consensus.implied_high_f is None:
+        return {"available": False}
+
+    distribution = []
+    for bucket in consensus.bins:
+        probability = probabilities.get(bucket.ticker)
+        model_p = getattr(probability, "model_probability", None)
+        distribution.append(
+            {
+                "ticker": bucket.ticker,
+                "label": bucket.label,
+                "center_f": round(bucket.center_f, 1) if math.isfinite(bucket.center_f) else None,
+                "implied_probability": round(bucket.implied_probability, 4),
+                "model_probability": round(model_p, 4) if model_p is not None else None,
+            }
+        )
+
+    gap = consensus.gap_to_forecast_f(forecast_high_f)
+    return {
+        "available": True,
+        "implied_high_f": round(consensus.implied_high_f, 2),
+        "model_high_f": round(forecast_high_f, 2),
+        "model_minus_market_f": round(gap, 2) if gap is not None else None,
+        "modal_bin_ticker": consensus.modal_bin_ticker,
+        "modal_bin_label": consensus.modal_bin_label,
+        "modal_probability": round(consensus.modal_probability, 4),
+        "implied_stdev_f": _round_optional(consensus.implied_stdev_f),
+        "p10_f": _round_optional(consensus.p10_f),
+        "p25_f": _round_optional(consensus.p25_f),
+        "median_f": _round_optional(consensus.median_f),
+        "p75_f": _round_optional(consensus.p75_f),
+        "p90_f": _round_optional(consensus.p90_f),
+        "overround": round(consensus.overround, 4),
+        "liquid_bin_count": consensus.liquid_bin_count,
+        "distribution": distribution,
     }
 
 

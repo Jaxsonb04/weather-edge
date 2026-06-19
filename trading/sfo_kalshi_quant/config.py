@@ -112,6 +112,35 @@ class StrategyConfig:
     market_prior_tight_spread: float = 0.02
     market_prior_wide_spread: float = 0.12
     market_disagreement_lcb_penalty: float = 0.35
+    # --- Kalshi market-consensus anchor (the "huge consideration" addon) -----
+    # The bid/ask ladder encodes the crowd's forecast of the SFO high (extracted
+    # in consensus.py: implied high, distribution, percentiles). That consensus
+    # is ALWAYS surfaced in the report/CLI/dashboard. These flags gate only
+    # whether it gets a HEAVIER voice in the traded posterior and a guard against
+    # over-betting a confident, liquid market. Default OFF on live pending a
+    # walk-forward backtest; ON for research to collect validation samples.
+    market_consensus_anchor_enabled: bool = False
+    # Replaces market_prior_weight (0.45) as the base market weight in
+    # _model_weight when anchoring is on. Reliability scaling and the model-
+    # weight floor still apply, so a thin/wide market still cannot dominate.
+    market_consensus_anchor_weight: float = 0.60
+    # Model-weight floor when anchoring (replaces min_model_weight=0.35). Keeps
+    # the edge alive: the weather model is never silenced below this share, so
+    # its residual disagreement with the market remains the trade's edge source.
+    market_consensus_anchor_min_model_weight: float = 0.30
+    # Size guard: when our point forecast disagrees with the market-implied
+    # consensus high by >= guard_gap_f AND the market is confident (implied stdev
+    # <= guard_max_stdev_f), liquid (>= guard_min_bins two-sided bins), and
+    # well-formed (|overround| <= guard_max_overround), haircut the position size
+    # by guard_size_haircut. This is the "don't bet hard against a confident,
+    # liquid market" guard. It NEVER creates or blocks a trade; it only shrinks
+    # size on a bet that already cleared every gate. Default OFF on live.
+    market_consensus_guard_enabled: bool = False
+    market_consensus_guard_gap_f: float = 4.0
+    market_consensus_guard_max_stdev_f: float = 3.0
+    market_consensus_guard_min_bins: int = 4
+    market_consensus_guard_max_overround: float = 0.25
+    market_consensus_guard_size_haircut: float = 0.5
     ensemble_weight: float = 0.30
     ensemble_min_members: int = 10
     ensemble_disagreement_lcb_penalty: float = 0.20
@@ -373,6 +402,14 @@ RESEARCH_PROFILE_OVERRIDES = {
     "cheap_tail_max_model_market_gap": 0.12,
     "cheap_tail_min_ensemble_probability": 0.06,
     "edge_gate_uses_model_probability": True,
+    # The collector runs the market-consensus anchor + guard LIVE so the
+    # readiness rescore can prove they help before `live` adopts them. The
+    # heavier market weight is safe here because the edge gate already measures
+    # the POINT edge against the pure model probability (above), so a strong
+    # anchor leans sizing/LCB toward the crowd without erasing the model's
+    # measured disagreement -- exactly the validation signal we want to collect.
+    "market_consensus_anchor_enabled": True,
+    "market_consensus_guard_enabled": True,
 }
 
 

@@ -10,6 +10,10 @@ DB_PATH      = "weather.db"
 FEATURES_OUT = "weather_features.csv"
 SFO_TZ       = "America/Los_Angeles"
 SFO_STATION_ID = "USW00023234"
+# Inland upstream predictor: Concord leads SFO next-day heat (a hot Concord day
+# precedes an SFO day ~7F warmer than average). Stored as a second station_id in
+# the weather table by fetch_inland_history.py; joined onto the SFO hourly grid.
+INLAND_STATION_ID = "KCCR"
 
 # Marine-layer / sea-breeze regime is the dominant driver of the SFO daily high
 # and exactly where the blend is weakest (the warm/hot tail). SFO heat is an
@@ -49,6 +53,29 @@ def load_data(db_path=DB_PATH, station_id=SFO_STATION_ID):
     # Missing hours become NaN rows so lag features stay aligned.
     df = df.asfreq("h")
     return df
+
+
+def load_data_with_inland(db_path=DB_PATH, station_id=SFO_STATION_ID,
+                          inland_station_id=INLAND_STATION_ID):
+    """SFO frame plus an `inland_temp` column aligned to the SFO UTC hourly grid.
+
+    SFO defines the master index; the inland series is reindexed onto it by
+    absolute UTC timestamp (so a later .shift(N) is an exact N-hour lag and
+    "current hour" is the same instant for both stations -- this alignment is
+    itself part of the leakage guard). Short interior gaps are bridged up to 3h;
+    longer gaps stay NaN (XGBoost tolerates NaN). Degrades gracefully to an
+    all-NaN column if the inland station has not been ingested yet.
+    """
+    sfo = load_data(db_path, station_id)
+    try:
+        inland = load_data(db_path, inland_station_id)
+    except ValueError:
+        sfo["inland_temp"] = np.nan
+        return sfo
+    inland_temp = inland["temp_f"].reindex(sfo.index)
+    inland_temp = inland_temp.interpolate(method="time", limit=3, limit_area="inside")
+    sfo["inland_temp"] = inland_temp
+    return sfo
 
 
 def engineer_features(df):
@@ -144,11 +171,29 @@ def engineer_features(df):
 
     # Marine layer (stratus/fog): near-saturation + cloudy -> capped, cool high.
     if "dewpoint_depression" in df.columns and "cloud_cover_pct" in df.columns:
-        near_saturation = np.maximum(
-            0.0, 1.0 - df["dewpoint_depression"] / MARINE_LAYER_DEPRESSION_F
+        # Clip to [0, 1]: sensor noise can put dew point >= temp (negative
+        # depression -> supersaturation) or oktas slightly out of range.
+        near_saturation = np.clip(
+            1.0 - df["dewpoint_depression"] / MARINE_LAYER_DEPRESSION_F, 0.0, 1.0
         )
-        df["marine_layer_index"] = near_saturation * (df["cloud_cover_pct"] / 100.0)
+        cloud_fraction = np.clip(df["cloud_cover_pct"] / 100.0, 0.0, 1.0)
+        df["marine_layer_index"] = near_saturation * cloud_fraction
         df["marine_layer_index_lag_24h"] = df["marine_layer_index"].shift(24)
+
+    # --- Inland upstream lead signal (Concord leads SFO next-day heat) ---
+    # LEAKAGE RULE: every inland feature uses ONLY inland values at UTC timestamp
+    # <= the current row t -- the current-hour value, .shift(N>=1), or trailing
+    # reducers (groupby(local_dates).cummax / rolling). NEVER .shift(-N) and never
+    # a per-day reducer mapped onto the next-day target. groupby(local_dates) is
+    # an expanding op within settlement day D (fixed PST), so it can never touch a
+    # day-D+1 hour -- the same proof that makes temp_today_high_so_far safe.
+    if "inland_temp" in df.columns:
+        df["inland_temp_lag_24h"] = df["inland_temp"].shift(24)
+        df["inland_high_so_far_today"] = df["inland_temp"].groupby(local_dates).cummax()
+        df["inland_temp_max_24h"] = df["inland_temp"].rolling(24).max()
+        df["sfo_minus_inland_temp"] = df["temp_f"] - df["inland_temp"]
+        df["sfo_minus_inland_temp_lag_24h"] = df["sfo_minus_inland_temp"].shift(24)
+        df["inland_vs_24h_ago"] = df["inland_temp"] - df["inland_temp"].shift(24)
 
     # heat momentum: how much warmer than the same hour N days ago
     df["temp_vs_24h_ago"]  = df["temp_f"] - df["temp_lag_24h"]
@@ -197,7 +242,7 @@ def engineer_features(df):
 
 if __name__ == "__main__":
     print("loading raw data from weather.db...")
-    df_raw = load_data()
+    df_raw = load_data_with_inland()
     print(f"  {len(df_raw):,} rows on hourly grid "
           f"({df_raw.index.min()} to {df_raw.index.max()})")
 

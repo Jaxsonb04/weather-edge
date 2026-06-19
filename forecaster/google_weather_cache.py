@@ -97,11 +97,22 @@ ADAPTIVE_SOURCE_COLUMNS = {
 # without touching source weights). Cohort-aware and capped so a noisy week
 # cannot blow up the forecast; gated on a walk-forward holdout like the weights.
 ENABLE_ROLLING_BLEND_BIAS = env_bool("ENABLE_ROLLING_BLEND_BIAS", True)
-ROLLING_BIAS_MIN_SCORED_DAYS = ADAPTIVE_WEIGHT_MIN_SCORED_DAYS
+# Higher bar than the source-weight learner (15): the de-bias shifts the
+# trade-relevant warm/hot tail, so it stays off until there are enough clean
+# CLISFO-settled days to (a) match the backtest harness's >=30-day acceptance
+# evidence bar and (b) give the per-cohort holdout guard real samples.
+ROLLING_BIAS_MIN_SCORED_DAYS = env_int("SFO_ROLLING_BIAS_MIN_SCORED_DAYS", 30)
 ROLLING_BIAS_WINDOW_DAYS = 45
 ROLLING_BIAS_CAP_F = 1.5
 ROLLING_BIAS_COHORT_SHRINK_K = 10.0
 ROLLING_BIAS_HOLDOUT_MIN_DAYS = ADAPTIVE_WEIGHT_HOLDOUT_MIN_DAYS
+# A cohort must have at least this many holdout days before its no-regression
+# guard can fire -- below it the cohort MAE is too noisy to judge.
+ROLLING_BIAS_COHORT_HOLDOUT_MIN_SAMPLES = 4
+# Tail cohorts (warm/hot) are where the blend is anti-calibrated and where the
+# bot trades; they get a zero-tolerance no-regression guard, others a small one.
+ROLLING_BIAS_TAIL_COHORTS = ("warm", "hot")
+ROLLING_BIAS_COHORT_REGRESSION_TOL_F = 0.25
 AIRPORT_STATIONS = ("KSFO", "KOAK", "KSJC", "KSQL", "KPAO", "KHAF")
 DURATION_RE = re.compile(r"^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?)?$")
 
@@ -1701,6 +1712,35 @@ def _bias_holdout_mae(records, corrections, global_correction):
     )
 
 
+def _bias_holdout_cohort_regressions(records, corrections, global_correction):
+    """Cohorts whose holdout MAE the correction would WORSEN beyond tolerance.
+
+    Tail cohorts (warm/hot) get zero tolerance; others a small one. Cohorts with
+    too few holdout days to judge are skipped (returned via ``inconclusive``).
+    Mirrors the backtest harness's per-cohort no-regression gate inside the live
+    activation path, so the de-bias can never ship a tail-regressing correction.
+    """
+
+    by_cohort = {}
+    for record in records:
+        by_cohort.setdefault(record["cohort"], []).append(record)
+    regressions = []
+    inconclusive = []
+    for cohort, cohort_records in by_cohort.items():
+        if len(cohort_records) < ROLLING_BIAS_COHORT_HOLDOUT_MIN_SAMPLES:
+            inconclusive.append(cohort)
+            continue
+        raw = sum(abs(r["actual"] - r["raw_pred"]) for r in cohort_records) / len(cohort_records)
+        correction = _correction_for(cohort, corrections, global_correction)
+        corrected = sum(
+            abs(r["actual"] - (r["raw_pred"] + correction)) for r in cohort_records
+        ) / len(cohort_records)
+        tol = 0.0 if cohort in ROLLING_BIAS_TAIL_COHORTS else ROLLING_BIAS_COHORT_REGRESSION_TOL_F
+        if corrected > raw + tol:
+            regressions.append(cohort)
+    return regressions, inconclusive
+
+
 DISABLED_BIAS_TABLE = {"global_correction": 0.0, "cohort_corrections": {}, "enabled": False}
 
 
@@ -1763,6 +1803,20 @@ def rolling_blend_residual_bias() -> tuple[dict, dict]:
         return _disabled(
             "rolling de-bias did not beat the raw blend on a walk-forward holdout; "
             "applying zero correction"
+        )
+
+    # Overall holdout improved -- but never ship a correction that regresses a
+    # cohort's holdout MAE (zero tolerance on the warm/hot tail).
+    cohort_regressions, cohort_inconclusive = _bias_holdout_cohort_regressions(
+        holdout, train_corrections, train_global
+    )
+    holdout_report["cohort_regressions"] = cohort_regressions
+    holdout_report["cohort_inconclusive"] = cohort_inconclusive
+    if cohort_regressions:
+        metadata["mode"] = "base"
+        return _disabled(
+            "rolling de-bias regressed cohort(s) on the holdout: "
+            + ", ".join(cohort_regressions)
         )
 
     # Survived the holdout; refit on the full window for the live corrections.

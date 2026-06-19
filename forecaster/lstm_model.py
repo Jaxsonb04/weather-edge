@@ -40,6 +40,12 @@ LSTM_FEATURES = [
     "hour_sin", "hour_cos",
     "doy_sin", "doy_cos",
     "next_doy_sin", "next_doy_cos",
+    # Inland upstream (Concord) lead signal -- validated to cut hot-day MAE
+    # ~2.3F with no all-days regression. Dense (100% coverage after the hourly
+    # join), so no NaN windows are dropped. Requires features built via
+    # features.load_data_with_inland (the weather_features.csv default).
+    "inland_temp", "inland_temp_lag_24h", "inland_high_so_far_today",
+    "inland_temp_max_24h", "sfo_minus_inland_temp", "sfo_minus_inland_temp_lag_24h",
 ]
 
 

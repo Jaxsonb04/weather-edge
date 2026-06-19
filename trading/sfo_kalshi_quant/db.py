@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import re
 import sqlite3
@@ -15,6 +16,8 @@ from .fees import (
     quadratic_fee_per_contract,
 )
 from .models import BucketProbability, EventSnapshot, ForecastSnapshot, IntradaySnapshot, TradeDecision
+
+logger = logging.getLogger(__name__)
 
 
 SCHEMA = """
@@ -185,6 +188,30 @@ CREATE INDEX IF NOT EXISTS idx_monitor_snapshots_order
     ON paper_monitor_snapshots (order_id, created_at);
 """
 
+# DB-level backstop for the application's concurrent-open guard
+# (has_active_paper_entry). The app guard is a check-then-insert across separate
+# connections, so a transient profile-normalization gap during a deploy (the
+# 2026-06-18 duplicate-open incident) or a check-then-insert race can still leave
+# two OPEN orders on the same market/side/profile. This partial UNIQUE index makes
+# that physically impossible. It is SIDE-INCLUSIVE on purpose: a deliberate
+# arbitrage YES+NO box on one market (opposite sides) stays legal, while a second
+# OPEN order on the *identical* market/side/profile is rejected. Partial on the
+# open lifecycle so re-entry after a close/settlement is unaffected. Created
+# best-effort in init() because a book that still holds legacy duplicates cannot
+# build it until they are closed.
+OPEN_POSITION_GUARD_INDEX = """
+CREATE UNIQUE INDEX IF NOT EXISTS ux_paper_orders_open_market_side_profile
+    ON paper_orders (
+        target_date,
+        market_ticker,
+        UPPER(COALESCE(side, 'YES')),
+        COALESCE(risk_profile, 'live')
+    )
+    WHERE status IN ('PAPER_FILLED', 'PAPER_LIMIT_RESTING')
+      AND settled_at IS NULL
+      AND closed_at IS NULL
+"""
+
 PAPER_ORDER_AUDIT_COLUMNS = {
     "settled_at": "TEXT",
     "settlement_high_f": "REAL",
@@ -314,6 +341,40 @@ class PaperStore:
                     conn.execute(f"ALTER TABLE decision_snapshots ADD COLUMN {column} {column_type}")
             _migrate_legacy_profile_names(conn)
             conn.executescript(INDEXES)
+            self._ensure_open_position_guard_index(conn)
+
+    def _ensure_open_position_guard_index(self, conn: sqlite3.Connection) -> None:
+        """Build the unique open-position backstop index, tolerating a dirty book.
+
+        A database that still holds pre-existing duplicate OPEN orders (a book
+        from before this guard, e.g. the 2026-06-18 incident) cannot build the
+        unique index. Rather than brick every init()/scan, log which groups block
+        it so an operator can close the surplus with `paper-close`; the index then
+        builds automatically on the next run.
+        """
+        try:
+            conn.execute(OPEN_POSITION_GUARD_INDEX)
+        except sqlite3.IntegrityError:
+            offending = conn.execute(
+                """
+                SELECT market_ticker,
+                       UPPER(COALESCE(side, 'YES')) AS side,
+                       COALESCE(risk_profile, 'live') AS risk_profile,
+                       COUNT(*) AS open_orders
+                FROM paper_orders
+                WHERE status IN ('PAPER_FILLED', 'PAPER_LIMIT_RESTING')
+                  AND settled_at IS NULL
+                  AND closed_at IS NULL
+                GROUP BY 1, 2, 3
+                HAVING COUNT(*) > 1
+                """
+            ).fetchall()
+            logger.warning(
+                "open-position guard index not built: %d duplicate open group(s) "
+                "must be closed first (e.g. via `paper-close`): %s",
+                len(offending),
+                "; ".join(f"{row[3]}x {row[0]} {row[1]} [{row[2]}]" for row in offending),
+            )
 
     def record_forecast(self, forecast: ForecastSnapshot) -> int:
         created_at = _now()
@@ -553,7 +614,7 @@ class PaperStore:
         status: str | None = None,
         entry_mode: str = "market",
         group_id: str | None = None,
-    ) -> int:
+    ) -> int | None:
         contracts = float(decision.recommended_contracts)
         entry_price = float(decision.limit_price if decision.limit_price is not None else decision.ask)
         fee_per_contract = (
@@ -572,56 +633,63 @@ class PaperStore:
         profile = normalize_risk_profile_name(risk_profile) if risk_profile else None
         normalized_status = status or ("PAPER_FILLED" if decision.approved else "REJECTED")
         with self.connect() as conn:
-            cursor = conn.execute(
-                """
-                INSERT INTO paper_orders (
-                    created_at, target_date, market_ticker, label, action, risk_profile,
-                    group_id,
-                    side, contracts, yes_ask, entry_price, entry_bid, entry_bid_size, entry_ask_size,
-                    strike_type, floor_strike, cap_strike, entry_mode,
-                    limit_price, limit_fee_per_contract, limit_cost_per_contract, limit_edge, limit_edge_lcb,
-                    fee_per_contract, cost_per_contract, probability,
-                    probability_lcb, edge, edge_lcb, trade_quality_score,
-                    expected_profit, status, reasons_json
+            try:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO paper_orders (
+                        created_at, target_date, market_ticker, label, action, risk_profile,
+                        group_id,
+                        side, contracts, yes_ask, entry_price, entry_bid, entry_bid_size, entry_ask_size,
+                        strike_type, floor_strike, cap_strike, entry_mode,
+                        limit_price, limit_fee_per_contract, limit_cost_per_contract, limit_edge, limit_edge_lcb,
+                        fee_per_contract, cost_per_contract, probability,
+                        probability_lcb, edge, edge_lcb, trade_quality_score,
+                        expected_profit, status, reasons_json
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        _now(),
+                        target_date,
+                        decision.ticker,
+                        decision.label,
+                        decision.action,
+                        profile,
+                        group_id,
+                        decision.side,
+                        contracts,
+                        entry_price,
+                        entry_price,
+                        decision.bid,
+                        decision.bid_size,
+                        decision.ask_size,
+                        decision.strike_type,
+                        decision.floor_strike,
+                        decision.cap_strike,
+                        entry_mode,
+                        decision.limit_price,
+                        decision.limit_fee_per_contract,
+                        decision.limit_cost_per_contract,
+                        decision.limit_edge,
+                        decision.limit_edge_lcb,
+                        fee_per_contract,
+                        cost_per_contract,
+                        decision.probability,
+                        decision.probability_lcb,
+                        edge,
+                        edge_lcb,
+                        decision.trade_quality_score,
+                        expected_profit,
+                        normalized_status,
+                        json.dumps(decision.reasons),
+                    ),
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    _now(),
-                    target_date,
-                    decision.ticker,
-                    decision.label,
-                    decision.action,
-                    profile,
-                    group_id,
-                    decision.side,
-                    contracts,
-                    entry_price,
-                    entry_price,
-                    decision.bid,
-                    decision.bid_size,
-                    decision.ask_size,
-                    decision.strike_type,
-                    decision.floor_strike,
-                    decision.cap_strike,
-                    entry_mode,
-                    decision.limit_price,
-                    decision.limit_fee_per_contract,
-                    decision.limit_cost_per_contract,
-                    decision.limit_edge,
-                    decision.limit_edge_lcb,
-                    fee_per_contract,
-                    cost_per_contract,
-                    decision.probability,
-                    decision.probability_lcb,
-                    edge,
-                    edge_lcb,
-                    decision.trade_quality_score,
-                    expected_profit,
-                    normalized_status,
-                    json.dumps(decision.reasons),
-                ),
-            )
+            except sqlite3.IntegrityError:
+                # The open-position guard index rejected a second OPEN order on
+                # this market/side/profile -- a check-then-insert race the
+                # application guard (has_active_paper_entry) did not catch. The
+                # existing open order stands; signal "not recorded" to the caller.
+                return None
             return int(cursor.lastrowid)
 
     def record_manual_buy(
@@ -681,7 +749,12 @@ class PaperStore:
             floor_strike=floor_strike,
             cap_strike=cap_strike,
         )
-        return self.record_paper_order(target_date, decision)
+        order_id = self.record_paper_order(target_date, decision)
+        if order_id is None:
+            raise ValueError(
+                "an open paper position already exists for this market/side/profile"
+            )
+        return order_id
 
     def record_manual_yes_buy(
         self,

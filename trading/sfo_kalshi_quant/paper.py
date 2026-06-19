@@ -186,16 +186,20 @@ class PaperTrader:
                     continue
                 status = "PAPER_FILLED" if quote.would_cross else "PAPER_LIMIT_RESTING"
                 entry_mode = "limit"
-            order_ids.append(
-                self.store.record_paper_order(
-                    target_date,
-                    adjusted,
-                    risk_profile=self.risk_profile,
-                    status=status,
-                    entry_mode=entry_mode,
-                    group_id=group_id,
-                )
+            order_id = self.store.record_paper_order(
+                target_date,
+                adjusted,
+                risk_profile=self.risk_profile,
+                status=status,
+                entry_mode=entry_mode,
+                group_id=group_id,
             )
+            # None == the open-position guard index rejected a concurrent
+            # duplicate the side-agnostic check above raced past. Skip it and do
+            # not consume exposure for a position that was never recorded.
+            if order_id is None:
+                continue
+            order_ids.append(order_id)
             if exposure_remaining is not None:
                 exposure_remaining -= adjusted.recommended_contracts * adjusted.cost_per_contract
         return order_ids
@@ -289,14 +293,22 @@ class PaperTrader:
         order_ids: list[int] = []
         try:
             for decision in normalized.decisions:
-                order_ids.append(
-                    self.store.record_paper_order(
-                        target_date,
-                        decision,
-                        risk_profile=self.risk_profile,
-                        group_id=group_id,
-                    )
+                order_id = self.store.record_paper_order(
+                    target_date,
+                    decision,
+                    risk_profile=self.risk_profile,
+                    group_id=group_id,
                 )
+                # A box must record every leg or none. If the open-position guard
+                # rejected a leg (None), abort loudly rather than book a partial,
+                # unbounded box. Preflight (has_open_paper_position) makes this
+                # unreachable in normal operation since arb legs are YES+NO.
+                if order_id is None:
+                    raise RuntimeError(
+                        "arbitrage leg rejected by the open-position guard; "
+                        "aborting partially-recorded box"
+                    )
+                order_ids.append(order_id)
         except Exception:
             # The SQLite store autocommits each insert, so there is no safe
             # partial rollback API here. Preflight checks above keep expected

@@ -537,6 +537,15 @@ def build_parser() -> argparse.ArgumentParser:
     backtest = sub.add_parser("backtest-calibration", help="Walk-forward probability calibration backtest")
     backtest.add_argument("--min-train", type=int, default=180)
     backtest.add_argument(
+        "--truth",
+        choices=("stored", "clisfo"),
+        default="stored",
+        help=(
+            "Truth for the lstm source: clisfo re-scores predictions against the "
+            "CLISFO settlement (Kalshi-correct), dropping days without one."
+        ),
+    )
+    backtest.add_argument(
         "--source",
         choices=("lstm", "clean-blend"),
         default="lstm",
@@ -1711,11 +1720,11 @@ def cmd_backtest_calibration(args: argparse.Namespace) -> int:
     outcomes = (
         adapter.load_clean_blend_outcomes()
         if args.source == "clean-blend"
-        else adapter.load_lstm_outcomes()
+        else adapter.load_lstm_outcomes(clisfo_truth=(args.truth == "clisfo"))
     )
     result = run_walk_forward_calibration_backtest(outcomes, config=config, min_train=args.min_train)
     print(color.cyan(color.bold("walk-forward calibration backtest")))
-    print(f"source: {args.source}")
+    print(f"source: {args.source}" + (" (clisfo-truth)" if args.truth == "clisfo" else ""))
     print(f"n: {result.n}")
     print(f"brier_score: {result.brier_score:.4f}")
     print(f"log_loss: {result.log_loss:.4f}")

@@ -264,3 +264,61 @@ def test_observed_high_lock_is_detected_before_second_intraday_adjustment():
         raw={"observed_high_decision": {"mode": "lock"}},
     )
     assert has_forecaster_observed_high_adjustment(forecast)
+
+
+def test_load_lstm_outcomes_rescores_against_clisfo_truth():
+    # The LSTM A/B daily chart stores the obs-station "actual". For the
+    # calibration baseline we must re-score those predictions against the CLISFO
+    # settlement Kalshi resolves on (load_ksfo_daily_highs: CLISFO integer
+    # preferred, floored-NWS fallback), not the station-obs high which runs ~1F
+    # cooler and flips warm/hot cohorts.
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "ab_test_results.json").write_text(
+            json.dumps(
+                {
+                    "target_daily_high_next_day": {
+                        "chart": {
+                            "daily": [
+                                {"date": "2026-06-17", "lstm": 68.0, "actual": 71.0},
+                                {"date": "2026-06-16", "lstm": 70.0, "actual": 70.0},
+                            ]
+                        }
+                    }
+                }
+            )
+        )
+        with sqlite3.connect(root / "weather.db") as conn:
+            conn.execute(
+                """
+                CREATE TABLE nws_daily_high_ground_truth (
+                    station_id TEXT NOT NULL, local_date TEXT NOT NULL, high_f REAL,
+                    observation_count INTEGER NOT NULL, is_complete INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL, source TEXT NOT NULL,
+                    PRIMARY KEY (station_id, local_date)
+                )
+                """
+            )
+            conn.execute(
+                "CREATE TABLE clisfo_settlements "
+                "(local_date TEXT PRIMARY KEY, max_temperature_f INTEGER, fetched_at TEXT)"
+            )
+            conn.executemany(
+                """
+                INSERT INTO nws_daily_high_ground_truth (
+                    station_id, local_date, high_f, observation_count, is_complete, updated_at, source
+                ) VALUES ('KSFO', ?, ?, 200, 1, '2026-06-18T00:00:00+00:00', 'NWS')
+                """,
+                [("2026-06-17", 73.4), ("2026-06-16", 71.6)],
+            )
+            conn.execute(
+                "INSERT INTO clisfo_settlements VALUES ('2026-06-17', 74, '2026-06-18T00:00:00+00:00')"
+            )
+        adapter = SfoForecasterAdapter(root)
+
+        obs = {o.local_date: o.actual_high_f for o in adapter.load_lstm_outcomes()}
+        assert obs[date(2026, 6, 17)] == 71.0  # stored obs truth unchanged
+
+        clisfo = {o.local_date: o.actual_high_f for o in adapter.load_lstm_outcomes(clisfo_truth=True)}
+        assert clisfo[date(2026, 6, 17)] == 74.0  # CLISFO integer, not obs 71
+        assert clisfo[date(2026, 6, 16)] == 72.0  # floored NWS fallback (no CLISFO row)

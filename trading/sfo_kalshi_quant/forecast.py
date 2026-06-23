@@ -297,20 +297,42 @@ class SfoForecasterAdapter:
             },
         )
 
-    def load_lstm_outcomes(self) -> list[ForecastOutcome]:
+    def load_lstm_outcomes(self, *, clisfo_truth: bool = False) -> list[ForecastOutcome]:
+        """LSTM next-day predictions from the A/B daily chart.
+
+        The chart stores the obs-station ``actual``. ``clisfo_truth`` re-scores each
+        prediction against the CLISFO settlement Kalshi resolves on
+        (``load_ksfo_daily_highs``: CLISFO integer preferred, floored-NWS fallback),
+        dropping days that have no settlement truth. The obs high runs ~1F cooler
+        than CLISFO and flips warm/hot cohorts, so the calibration baseline that
+        must mirror live P&L is scored on CLISFO truth.
+        """
+
         if not self.ab_test_path.exists():
             raise ForecastDataError(f"Missing calibration file: {self.ab_test_path}")
         payload = json.loads(self.ab_test_path.read_text())
         daily = payload["target_daily_high_next_day"]["chart"]["daily"]
-        outcomes = [
-            ForecastOutcome(
-                local_date=date.fromisoformat(row["date"]),
-                predicted_high_f=float(row["lstm"]),
-                actual_high_f=_integer_settlement_high_f(row["actual"]),
-                model_name="lstm",
+        truth = self._settlement_truth_map() if clisfo_truth else None
+        outcomes: list[ForecastOutcome] = []
+        for row in daily:
+            local_date = date.fromisoformat(row["date"])
+            if truth is not None:
+                settled = truth.get(local_date)
+                if settled is None:
+                    continue
+                actual_high_f = float(settled)
+                model_name = "lstm_clisfo"
+            else:
+                actual_high_f = _integer_settlement_high_f(row["actual"])
+                model_name = "lstm"
+            outcomes.append(
+                ForecastOutcome(
+                    local_date=local_date,
+                    predicted_high_f=float(row["lstm"]),
+                    actual_high_f=actual_high_f,
+                    model_name=model_name,
+                )
             )
-            for row in daily
-        ]
         outcomes.sort(key=lambda row: row.local_date)
         return outcomes
 
@@ -428,6 +450,35 @@ class SfoForecasterAdapter:
             else:
                 settlements[date.fromisoformat(local_date)] = _integer_settlement_high_f(nws_high)
         return settlements
+
+    def _settlement_truth_map(self) -> dict[date, float]:
+        """Kalshi-correct settlement highs by date, for re-scoring historical
+        predictions against the truth Kalshi resolves on.
+
+        CLISFO integer where present (deep after the GHCN backfill), with the
+        floored-NWS station high as a fallback for any date a CLISFO row does not
+        cover. Unlike ``load_ksfo_daily_highs`` (driven by the NWS ground-truth
+        table for the live settle path, ~weeks deep), this is CLISFO-driven so it
+        spans the full backfilled settlement history.
+        """
+
+        if not self.weather_db.exists():
+            return {}
+        truth: dict[date, float] = {}
+        with sqlite3.connect(self.weather_db) as conn:
+            if _table_exists(conn, "nws_daily_high_ground_truth"):
+                for local_date, high_f in conn.execute(
+                    "SELECT local_date, high_f FROM nws_daily_high_ground_truth "
+                    "WHERE high_f IS NOT NULL AND is_complete = 1"
+                ):
+                    truth[date.fromisoformat(local_date)] = _integer_settlement_high_f(high_f)
+            if _table_exists(conn, "clisfo_settlements"):
+                for local_date, max_t in conn.execute(
+                    "SELECT local_date, max_temperature_f FROM clisfo_settlements "
+                    "WHERE max_temperature_f IS NOT NULL"
+                ):
+                    truth[date.fromisoformat(local_date)] = float(max_t)
+        return truth
 
 
 def _maybe_float(value: object) -> float | None:

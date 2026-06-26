@@ -234,8 +234,17 @@ def serve_live_emos(
     return mu, sigma
 
 
+def _settlement_today() -> date:
+    return (datetime.now(timezone.utc) - timedelta(hours=8)).date()
+
+
 def _settlement_tomorrow() -> date:
-    return (datetime.now(timezone.utc) - timedelta(hours=8)).date() + timedelta(days=1)
+    return _settlement_today() + timedelta(days=1)
+
+
+# The scheduled paper scan trades a rolling window (today .. today+2); serve EMOS
+# for each open target so the research book has a distribution for every market.
+ROLLING_SERVE_DAYS = 3
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -244,9 +253,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--lead", type=int, default=1)
     parser.add_argument("--backfill", action="store_true", help="(re)build the rolling-origin archive")
     parser.add_argument("--serve", metavar="DATE", help="serve live EMOS for a target ('tomorrow' or YYYY-MM-DD)")
+    parser.add_argument(
+        "--serve-rolling",
+        action="store_true",
+        help="serve live EMOS for today..today+2 (the scan's rolling window)",
+    )
     args = parser.parse_args(argv)
-    if not (args.backfill or args.serve):
-        parser.error("nothing to do; pass --backfill or --serve")
+    if not (args.backfill or args.serve or args.serve_rolling):
+        parser.error("nothing to do; pass --backfill, --serve, or --serve-rolling")
 
     with sqlite3.connect(args.db) as conn:
         if args.backfill:
@@ -257,14 +271,25 @@ def main(argv: list[str] | None = None) -> int:
                 (args.lead, DEFAULT_SOURCE),
             ).fetchone()[0]
             print(f"wrote {written} EMOS forecasts (lead {args.lead}); {scored} have CLISFO truth")
+
+        targets: list[date] = []
         if args.serve:
-            target = _settlement_tomorrow() if args.serve == "tomorrow" else date.fromisoformat(args.serve)
+            targets.append(_settlement_tomorrow() if args.serve == "tomorrow" else date.fromisoformat(args.serve))
+        if args.serve_rolling:
+            targets.extend(_settlement_today() + timedelta(days=offset) for offset in range(ROLLING_SERVE_DAYS))
+
+        served = 0
+        for target in targets:
             result = serve_live_emos(conn, target, lead_days=args.lead)
             if result is None:
-                print(f"live EMOS for {target.isoformat()}: unavailable (insufficient history or live coverage)")
-                return 1
+                print(f"live EMOS for {target.isoformat()}: unavailable (already settled or thin coverage)")
+                continue
             mu, sigma = result
+            served += 1
             print(f"live EMOS for {target.isoformat()} (lead {args.lead}): mu={mu:.2f}F sigma={sigma:.2f}F")
+        # Fail loud only when an explicit single --serve produced nothing.
+        if args.serve and not args.serve_rolling and served == 0:
+            return 1
     return 0
 
 

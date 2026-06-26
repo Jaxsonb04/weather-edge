@@ -152,6 +152,7 @@
     [data-theme="dark"] .paper-state.good .paper-state-value b,
     [data-theme="dark"] .trade-stat b.good-text,
     [data-theme="dark"] .exit-stat b.good-text,
+    [data-theme="dark"] .history-pnl b.good-text,
     [data-theme="dark"] .rule-tile b.good-text { color: var(--mint); }
     [data-theme="dark"] .pill.bad,
     [data-theme="dark"] .access-error { color: var(--danger); }
@@ -925,6 +926,120 @@
     .good-text { color: #0b684f; }
     .bad-text { color: var(--danger); }
     .muted { color: var(--ink-3); }
+    /* Paper history (closed positions + recent actions): result-forward rows.
+       Replaces the wide horizontal-scroll tables so the realized result reads
+       immediately at any width, with a 5-row collapse for long histories. */
+    .history-stack { display: grid; gap: 1rem; }
+    .history-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 0.75rem;
+      margin-bottom: 0.62rem;
+    }
+    .history-head h3 { margin-bottom: 0; }
+    .history-count {
+      color: var(--ink-3);
+      font: 600 0.66rem var(--font-mono);
+      text-transform: uppercase;
+      letter-spacing: 0;
+      white-space: nowrap;
+    }
+    .history-list { display: grid; gap: 0.5rem; margin: 0; padding: 0; list-style: none; }
+    .history-row {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 0.85rem;
+      padding: 0.68rem 0.8rem;
+      background: var(--surface);
+      border: 1px solid var(--line-2);
+      border-left: 3px solid var(--line);
+      border-radius: 10px;
+    }
+    .history-row.good { border-left-color: var(--mint); }
+    .history-row.bad { border-left-color: var(--danger); }
+    .history-row.warn { border-left-color: var(--warm); }
+    .history-row.is-hidden { display: none; }
+    .history-main { flex: 1 1 auto; min-width: 0; }
+    .history-title {
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+      flex-wrap: wrap;
+      color: var(--ink);
+      font: 600 0.92rem var(--font-sans);
+    }
+    .history-meta {
+      margin-top: 0.26rem;
+      color: var(--ink-3);
+      font-size: 0.77rem;
+      line-height: 1.45;
+    }
+    .history-meta .sep { padding: 0 0.16rem; opacity: 0.55; }
+    .history-pnl {
+      flex: 0 0 auto;
+      text-align: right;
+      white-space: nowrap;
+    }
+    .history-pnl b {
+      display: block;
+      color: var(--ink);
+      font: 600 1.12rem var(--font-mono);
+      font-variant-numeric: tabular-nums;
+    }
+    .history-pnl b.good-text { color: #0b684f; }
+    .history-pnl b.bad-text { color: var(--danger); }
+    .history-pnl span {
+      display: block;
+      margin-top: 0.16rem;
+      color: var(--ink-3);
+      font: 600 0.74rem var(--font-mono);
+      font-variant-numeric: tabular-nums;
+    }
+    .history-state {
+      display: inline-flex;
+      align-items: center;
+      min-height: 1.5rem;
+      padding: 0.16rem 0.5rem;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: var(--chip);
+      color: var(--ink-2);
+      font: 600 0.66rem var(--font-mono);
+      text-transform: uppercase;
+      letter-spacing: 0;
+    }
+    .side-pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 1.35rem;
+      padding: 0.1rem 0.44rem;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      font: 600 0.64rem var(--font-mono);
+      text-transform: uppercase;
+      letter-spacing: 0;
+    }
+    .side-pill.side-yes { color: var(--cold-deep); background: var(--cold-soft); border-color: rgba(28, 99, 169, 0.22); }
+    .side-pill.side-no { color: var(--warm-deep); background: var(--warm-soft); border-color: rgba(216, 121, 42, 0.25); }
+    .row-collapse {
+      appearance: none;
+      width: 100%;
+      margin-top: 0.55rem;
+      padding: 0.52rem 0.75rem;
+      background: var(--surface-2);
+      border: 1px solid var(--line-2);
+      border-radius: 10px;
+      color: var(--ink-2);
+      font: 600 0.72rem var(--font-mono);
+      text-transform: uppercase;
+      letter-spacing: 0;
+      cursor: pointer;
+      transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+    }
+    .row-collapse:hover { background: var(--surface-3); border-color: var(--line); color: var(--ink); }
+    .row-collapse:focus-visible { outline: 2.5px solid var(--cold); outline-offset: 2px; }
     .count-strip {
       display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -1571,14 +1686,20 @@
       <div class="count-strip" id="paperCounts"></div>
       <div class="trade-list" id="pendingLimitCards"></div>
       <div class="trade-list" id="openPaperCards"></div>
-      <div class="grid-2">
+      <div class="history-stack">
         <div class="panel">
-          <h3>Closed paper positions</h3>
-          <div class="table-wrap" id="closedPaperTable"></div>
+          <div class="history-head">
+            <h3>Closed paper positions</h3>
+            <span class="history-count" id="closedPaperCount"></span>
+          </div>
+          <div id="closedPaperTable"></div>
         </div>
         <div class="panel">
-          <h3>Recent paper actions</h3>
-          <div class="table-wrap" id="paperActionTable"></div>
+          <div class="history-head">
+            <h3>Recent paper actions</h3>
+            <span class="history-count" id="paperActionCount"></span>
+          </div>
+          <div id="paperActionTable"></div>
         </div>
       </div>
     </section>
@@ -2770,8 +2891,11 @@
       $('openPaperCards').innerHTML = openRows.length
         ? openRows.map(paperPositionCard).join('')
         : '<p class="empty">No open paper positions are published.</p>';
-      $('closedPaperTable').innerHTML = closedPaperTable(closedRows);
-      $('paperActionTable').innerHTML = actionTable(paper.recent_monitor_actions || []);
+      const actionRows = paper.recent_monitor_actions || [];
+      $('closedPaperCount').textContent = closedRows.length ? `${fmt(closedRows.length)} total` : '';
+      $('paperActionCount').textContent = actionRows.length ? `${fmt(actionRows.length)} total` : '';
+      $('closedPaperTable').innerHTML = closedHistoryList(closedRows);
+      $('paperActionTable').innerHTML = actionHistoryList(actionRows);
     }
 
     function paperDashboard(paper, summary) {
@@ -2944,52 +3068,124 @@
         </article>`;
     }
 
-    function closedPaperTable(rows) {
-      if (!rows.length) return '<p class="empty">No closed paper positions are published yet.</p>';
-      return `
-        <table>
-          <thead><tr><th>ID</th><th>Market</th><th>${term('Bought', 'initial-cost')}</th><th>Exit / ${term('Settlement', 'settlement')}</th><th>${term('Realized P&L', 'realized-pnl')}</th></tr></thead>
-          <tbody>
-            ${rows.map((row) => {
-              const tone = toneForValue(row.realized_pnl);
-              const exit = row.exit_price != null
-                ? `${price(row.exit_price)} sold`
-                : row.settlement_high_f != null
-                  ? `${fmt(row.settlement_high_f, 1)}F settled`
-                  : '-';
-              return `
-                <tr>
-                  <td class="num">${htmlEscape(row.id)}</td>
-                  <td><b>${htmlEscape(row.label || row.ticker || '-')}</b><br><span class="muted">${htmlEscape(row.target_date || '')} - ${htmlEscape(row.side || '-')}</span> ${profilePill(row.risk_profile)}</td>
-                  <td class="num">${money(row.initial_cost ?? row.risk)}<br><span class="muted">${fmt(row.contracts, 2)} @ ${price(row.entry_price)}</span></td>
-                  <td>${htmlEscape(exit)}<br><span class="muted">${htmlEscape(row.status || '-')}</span></td>
-                  <td class="num ${toneText(tone)}">${signedMoney(row.realized_pnl)}<br><span class="muted">${signedPct(row.realized_roi)}</span></td>
-                </tr>`;
-            }).join('')}
-          </tbody>
-        </table>`;
+    // Paper history is shown as result-forward rows (realized P&L pinned right,
+    // always on-screen) instead of wide horizontal-scroll tables. Long lists
+    // collapse to the most recent HISTORY_VISIBLE rows behind a toggle.
+    const HISTORY_VISIBLE = 5;
+    const HISTORY_SEP = '<span class="sep" aria-hidden="true">·</span>';
+
+    function sidePill(side) {
+      const s = String(side || '').toUpperCase();
+      if (s !== 'YES' && s !== 'NO') return '';
+      return `<span class="side-pill side-${s.toLowerCase()}">${s}</span>`;
     }
 
-    function actionTable(rows) {
-      if (!rows.length) return '<p class="empty">No monitor inspections, closes, or settlement actions are published yet.</p>';
+    function humanActionStatus(status) {
+      const map = {
+        HOLD: 'Hold', OPEN: 'Opened', LIMIT_RESTING: 'Resting',
+        PAPER_CLOSED: 'Sold', PAPER_SETTLED: 'Settled', CLOSE: 'Closed', SETTLE: 'Settled'
+      };
+      if (!status) return '';
+      return map[status] || String(status).replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+    }
+
+    function historyList(rows, renderRow, opts) {
+      if (!rows.length) return `<p class="empty">${htmlEscape(opts.emptyText)}</p>`;
+      const collapses = rows.length > HISTORY_VISIBLE;
+      const body = rows.map((row, i) => renderRow(row, i, collapses && i >= HISTORY_VISIBLE)).join('');
+      const listId = opts.id;
+      const toggle = collapses
+        ? `<button type="button" class="row-collapse" aria-expanded="false" aria-controls="${htmlEscape(listId)}" data-noun="${htmlEscape(opts.noun)}">Show all ${fmt(rows.length)} ${htmlEscape(opts.noun)} ▾</button>`
+        : '';
+      return `<ul class="history-list" role="list" id="${htmlEscape(listId)}">${body}</ul>${toggle}`;
+    }
+
+    function closedHistoryRow(row, index, hidden) {
+      const tone = number(row.realized_pnl) === null ? '' : toneForValue(row.realized_pnl);
+      const exit = row.exit_price != null
+        ? `sold ${price(row.exit_price)}`
+        : row.settlement_high_f != null
+          ? `settled ${fmt(row.settlement_high_f, 1)}F`
+          : 'closed';
+      const lot = row.contracts != null && row.entry_price != null
+        ? `${fmt(row.contracts, 2)} @ ${price(row.entry_price)}`
+        : '';
+      const lead = [
+        `#${htmlEscape(row.id)}`,
+        htmlEscape(row.target_date || ''),
+        `bought ${money(row.initial_cost ?? row.risk)}`,
+        lot
+      ].filter(Boolean).join(HISTORY_SEP);
       return `
-        <table>
-          <thead><tr><th>ID</th><th>Time</th><th>Market</th><th>${term('Side', 'side')}</th><th>Status</th><th>P&L / ROI</th><th>Exit</th><th>Note</th></tr></thead>
-          <tbody>
-            ${rows.map((row) => `
-              <tr>
-                <td class="num">${htmlEscape(row.id)}</td>
-                <td class="num">${dt(row.time)}</td>
-                <td><b>${htmlEscape(row.label || row.ticker || '-')}</b><br><span class="muted">${htmlEscape(row.target_date || '')}</span></td>
-                <td class="num">${htmlEscape(row.side || '-')}</td>
-                <td>${htmlEscape(row.status || '-')}${row.unrealized ? ' <span class="pill warn">open</span>' : ''}</td>
-                <td class="num ${toneText(toneForValue(row.realized_pnl))}">${signedMoney(row.realized_pnl)}<br><span class="muted">${row.unrealized ? 'unrealized mark' : signedPct(row.realized_roi)}</span></td>
-                <td class="num">${row.exit_price == null ? '-' : price(row.exit_price)}${row.unrealized ? '<br><span class="muted">live bid</span>' : (row.settlement_high_f == null ? '' : `<br><span class="muted">${fmt(row.settlement_high_f, 1)}F</span>`)}</td>
-                <td>${htmlEscape(row.note || '-')}</td>
-              </tr>
-            `).join('')}
-          </tbody>
-        </table>`;
+        <li class="history-row ${tone}${hidden ? ' is-hidden' : ''}">
+          <div class="history-main">
+            <div class="history-title">${sidePill(row.side)}<span>${htmlEscape(row.label || row.ticker || '-')}</span>${profilePill(row.risk_profile)}</div>
+            <div class="history-meta">${lead}<span class="sep" aria-hidden="true">→</span>${htmlEscape(exit)}</div>
+          </div>
+          <div class="history-pnl">
+            <b class="${toneText(tone)}">${signedMoney(row.realized_pnl)}</b>
+            <span>${signedPct(row.realized_roi)}</span>
+          </div>
+        </li>`;
+    }
+
+    function actionHistoryRow(row, index, hidden) {
+      const status = String(row.status || '').toUpperCase();
+      // Lifecycle actions (a new order opening, a limit resting) have no result
+      // yet, so show their status instead of a misleading $0.00.
+      const lifecycle = status === 'OPEN' || status === 'LIMIT_RESTING' || status === 'CANCELLED' || status === 'EXPIRED';
+      const hasPnl = !lifecycle && number(row.realized_pnl) !== null;
+      const tone = hasPnl ? toneForValue(row.realized_pnl) : 'warn';
+      const statusLabel = humanActionStatus(row.status);
+      const meta = [`#${htmlEscape(row.id)}`, htmlEscape(dt(row.time)), htmlEscape(row.note || '')]
+        .filter(Boolean).join(HISTORY_SEP);
+      const result = hasPnl
+        ? `<b class="${toneText(tone)}">${signedMoney(row.realized_pnl)}</b><span>${row.unrealized ? 'open mark' : signedPct(row.realized_roi)}</span>`
+        : `<span class="history-state">${htmlEscape(statusLabel || 'pending')}</span>`;
+      const titleState = hasPnl && statusLabel
+        ? `<span class="history-state">${htmlEscape(statusLabel)}${row.unrealized ? ' · open' : ''}</span>`
+        : '';
+      return `
+        <li class="history-row ${tone}${hidden ? ' is-hidden' : ''}">
+          <div class="history-main">
+            <div class="history-title">${sidePill(row.side)}<span>${htmlEscape(row.label || row.ticker || '-')}</span>${titleState}</div>
+            <div class="history-meta">${meta}</div>
+          </div>
+          <div class="history-pnl">${result}</div>
+        </li>`;
+    }
+
+    function closedHistoryList(rows) {
+      return historyList(rows, closedHistoryRow, {
+        id: 'closedHistoryItems',
+        emptyText: 'No closed paper positions are published yet.',
+        noun: 'closed positions'
+      });
+    }
+
+    function actionHistoryList(rows) {
+      return historyList(rows, actionHistoryRow, {
+        id: 'actionHistoryItems',
+        emptyText: 'No monitor inspections, closes, or settlement actions are published yet.',
+        noun: 'actions'
+      });
+    }
+
+    function bindHistoryCollapse() {
+      document.addEventListener('click', (event) => {
+        const btn = event.target.closest?.('.row-collapse');
+        if (!btn) return;
+        const list = btn.previousElementSibling;
+        if (!list || !list.classList.contains('history-list')) return;
+        const nowExpanded = btn.getAttribute('aria-expanded') !== 'true';
+        btn.setAttribute('aria-expanded', String(nowExpanded));
+        list.querySelectorAll('.history-row').forEach((el, i) => {
+          if (i >= HISTORY_VISIBLE) el.classList.toggle('is-hidden', !nowExpanded);
+        });
+        const noun = btn.getAttribute('data-noun') || 'rows';
+        const total = list.querySelectorAll('.history-row').length;
+        btn.textContent = nowExpanded ? 'Show less ▴' : `Show all ${total} ${noun} ▾`;
+      });
     }
 
     function renderCohorts(data) {
@@ -3598,6 +3794,7 @@
       bindTermHelp();
       bindStrategyLabRefresh();
       bindThemeToggle();
+      bindHistoryCollapse();
       if (STRATEGY_LAB_PROTECTION.enabled) {
         initProtectedStrategyLab();
       } else {

@@ -40,6 +40,7 @@ OPEN_METEO_PREVIOUS_RUN_MODEL_PRESETS = {
 }
 NOAA_GUIDANCE_CYCLES_6H = (0, 6, 12, 18)
 NOAA_LAMP_CYCLES_3H = (0, 3, 6, 9, 12, 15, 18, 21)
+NOAA_GUIDANCE_UNAVAILABLE_HTTP_CODES = {403, 404}
 
 
 DATASET_SCHEMA = """
@@ -825,8 +826,10 @@ def backfill_lamp(
             try:
                 text = _http_text(url, timeout=timeout)
             except HTTPError as exc:
-                if exc.code == 404:
-                    failures.append(f"{cycle_date.isoformat()}T{cycle_hour:02d}:30Z missing")
+                if exc.code in NOAA_GUIDANCE_UNAVAILABLE_HTTP_CODES:
+                    failures.append(
+                        f"{cycle_date.isoformat()}T{cycle_hour:02d}:30Z HTTP {exc.code}"
+                    )
                     continue
                 raise
             rows.extend(
@@ -842,7 +845,7 @@ def backfill_lamp(
     written = store.upsert_forecast_features(rows)
     detail = f"{len(rows)} station guidance feature rows for {station_id}"
     if failures:
-        detail += f"; skipped {len(failures)} missing cycle(s)"
+        detail += f"; skipped {len(failures)} unavailable cycle(s): {_summarize_failures(failures)}"
     return DatasetResult("noaa-lamp", written, detail)
 
 
@@ -862,8 +865,10 @@ def backfill_gfs_mos(
             try:
                 text = _http_text(url, timeout=timeout)
             except HTTPError as exc:
-                if exc.code == 404:
-                    failures.append(f"{cycle_date.isoformat()}T{cycle_hour:02d}:00Z missing")
+                if exc.code in NOAA_GUIDANCE_UNAVAILABLE_HTTP_CODES:
+                    failures.append(
+                        f"{cycle_date.isoformat()}T{cycle_hour:02d}:00Z HTTP {exc.code}"
+                    )
                     continue
                 raise
             rows.extend(
@@ -879,8 +884,14 @@ def backfill_gfs_mos(
     written = store.upsert_forecast_features(rows)
     detail = f"{len(rows)} station guidance feature rows for {station_id}"
     if failures:
-        detail += f"; skipped {len(failures)} missing cycle(s)"
+        detail += f"; skipped {len(failures)} unavailable cycle(s): {_summarize_failures(failures)}"
     return DatasetResult("gfs-mos", written, detail)
+
+
+def _summarize_failures(failures: list[str], *, limit: int = 3) -> str:
+    shown = failures[:limit]
+    suffix = ", ..." if len(failures) > limit else ""
+    return ", ".join(shown) + suffix
 
 
 def backfill_nbm(

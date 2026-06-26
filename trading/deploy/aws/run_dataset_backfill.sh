@@ -52,6 +52,7 @@ mkdir -p "$(dirname "$DB_PATH")"
 cd "$TRADING_DIR"
 
 IFS=',' read -r -a sources <<< "$SFO_DATASET_SOURCES"
+failed_sources=()
 for raw_source in "${sources[@]}"; do
   source="${raw_source//[[:space:]]/}"
   if [[ -z "$source" ]]; then
@@ -97,8 +98,15 @@ for raw_source in "${sources[@]}"; do
   esac
 
   echo "running dataset backfill source=$source start=$source_start end=$source_end db=$DB_PATH"
-  "$PYTHON_BIN" -m sfo_kalshi_quant.cli "${args[@]}"
+  if ! "$PYTHON_BIN" -m sfo_kalshi_quant.cli "${args[@]}"; then
+    failed_sources+=("$source")
+    echo "warning: dataset backfill source=$source failed; continuing" >&2
+  fi
 done
+
+if [[ "${#failed_sources[@]}" -gt 0 ]]; then
+  echo "warning: dataset backfill skipped failed source(s): ${failed_sources[*]}" >&2
+fi
 
 # Evaluate the collected datasets right after every backfill so the research
 # verdict (promote vs collect-only) ships with the Strategy Lab artifact

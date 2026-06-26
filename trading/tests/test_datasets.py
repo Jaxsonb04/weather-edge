@@ -262,6 +262,23 @@ def test_lamp_and_gfs_mos_backfills_store_station_guidance_features():
     assert ("gfs-mos", "gfs-mos", "temperature_2m_max", 61.0) in rows
 
 
+def test_station_guidance_backfills_skip_unavailable_http_cycles():
+    def unavailable(url: str, *, timeout: int = 30):
+        raise HTTPError(url=url, code=403, msg="Forbidden", hdrs=None, fp=None)
+
+    with TemporaryDirectory() as tmp, patch("sfo_kalshi_quant.datasets._http_text", unavailable):
+        store = DatasetStore(Path(tmp) / "dataset.db")
+        lamp = backfill_lamp(store, start=date(2026, 6, 26), end=date(2026, 6, 26), timeout=1)
+        mos = backfill_gfs_mos(store, start=date(2026, 6, 26), end=date(2026, 6, 26), timeout=1)
+
+    assert lamp.rows_written == 0
+    assert mos.rows_written == 0
+    assert "skipped" in lamp.detail
+    assert "HTTP 403" in lamp.detail
+    assert "skipped" in mos.detail
+    assert "HTTP 403" in mos.detail
+
+
 def test_nbm_and_hrrr_backfills_use_model_specific_previous_run_sources():
     payload = {
         "latitude": 37.62612,

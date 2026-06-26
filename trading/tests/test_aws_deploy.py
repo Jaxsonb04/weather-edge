@@ -142,6 +142,8 @@ def test_dataset_backfill_timer_is_lightsail_safe_and_installed():
     assert "dataset-backfill" in runner
     assert "--source noaa-isd" not in runner
     assert 'SFO_DATASET_DB:-${SFO_KALSHI_DB:-$TRADING_DIR/data/paper_trading.db}' in runner
+    assert "failed_sources=()" in runner
+    assert "failed; continuing" in runner
     assert 'KALSHI_LOOKBACK_DAYS="${SFO_DATASET_KALSHI_LOOKBACK_DAYS:-90}"' in runner
     assert "SFO_DATASET_KALSHI_LOOKBACK_DAYS=90" in example_env
     assert 'SFO_DATASET_KALSHI_CANDLES:-0' in runner

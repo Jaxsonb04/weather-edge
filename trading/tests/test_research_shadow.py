@@ -77,6 +77,80 @@ def test_unsampled_research_explore_is_shadow_only_and_not_paper_pnl() -> None:
         )
 
 
+def test_paused_research_records_shadow_without_paper_order() -> None:
+    with TemporaryDirectory() as tmp:
+        store = PaperStore(Path(tmp) / "paper.db")
+        config = StrategyConfig(research_shadow_sample_probability=0.25)
+        trader = PaperTrader(store, config, risk_profile="research")
+        decision = _research_explore_decision(
+            ticker="KXHIGHTSFO-TEST-PAUSED",
+            contracts=3.0,
+            cost=0.42,
+        )
+        blocked = decision.__class__(
+            **{
+                **decision.__dict__,
+                "approved": False,
+                "signal_approved": True,
+                "entry_block_reason": "research paused: daily loss cap reached",
+                "reasons": [
+                    "research paused: daily loss cap reached",
+                    *decision.reasons,
+                ],
+            }
+        )
+
+        shadow_ids = trader.record_research_shadow_candidates(
+            "2026-06-26",
+            [blocked],
+            sample_probability=0.25,
+            sampled=False,
+        )
+
+        assert len(shadow_ids) == 1
+        assert len(store.paper_orders(10)) == 0
+        shadow = store.research_shadow_orders(10)[0]
+        assert shadow["risk_profile"] == "research"
+        assert shadow["sampled"] == 0
+        assert shadow["sample_probability"] == 0.25
+        assert shadow["linked_paper_order_id"] is None
+        assert shadow["contracts"] == 3.0
+        assert "research paused: daily loss cap reached" in shadow["reasons_json"]
+
+
+def test_paused_research_records_positive_lcb_core_shadow() -> None:
+    with TemporaryDirectory() as tmp:
+        store = PaperStore(Path(tmp) / "paper.db")
+        trader = PaperTrader(store, StrategyConfig(), risk_profile="research")
+        decision = _research_explore_decision(
+            ticker="KXHIGHTSFO-TEST-CORE",
+            contracts=2.0,
+            cost=0.44,
+        )
+        core = decision.__class__(
+            **{
+                **decision.__dict__,
+                "edge_lcb": 0.06,
+                "signal_approved": True,
+                "entry_block_reason": "research paused: daily loss cap reached",
+                "reasons": [
+                    "research paused: daily loss cap reached",
+                    "portfolio PF-test: sleeve=no_core, growth=0.001000",
+                ],
+            }
+        )
+
+        shadow_ids = trader.record_research_shadow_candidates(
+            "2026-06-26",
+            [core],
+            sampled=False,
+        )
+
+        assert len(shadow_ids) == 1
+        assert len(store.paper_orders(10)) == 0
+        assert store.research_shadow_orders(10)[0]["market_ticker"] == "KXHIGHTSFO-TEST-CORE"
+
+
 def test_sampled_research_explore_caps_to_one_contract_and_links_paper_order() -> None:
     with TemporaryDirectory() as tmp:
         store = PaperStore(Path(tmp) / "paper.db")

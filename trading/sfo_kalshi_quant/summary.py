@@ -496,9 +496,21 @@ def _decision_stats(db_path: Path, window_start: date) -> dict[str, Any]:
         conn.row_factory = sqlite3.Row
         if not _table_exists(conn, "decision_snapshots"):
             return empty
+        columns = _table_columns(conn, "decision_snapshots")
+        signal_approved_expr = (
+            "signal_approved"
+            if "signal_approved" in columns
+            else "approved AS signal_approved"
+        )
+        entry_block_expr = (
+            "entry_block_reason"
+            if "entry_block_reason" in columns
+            else "NULL AS entry_block_reason"
+        )
         rows = conn.execute(
-            """
-            SELECT created_at, approved, model_probability, market_probability,
+            f"""
+            SELECT created_at, approved, {signal_approved_expr},
+                   {entry_block_expr}, model_probability, market_probability,
                    reasons_json, COALESCE(risk_profile, 'unknown') AS risk_profile
             FROM decision_snapshots
             WHERE created_at >= ?
@@ -512,13 +524,26 @@ def _decision_stats(db_path: Path, window_start: date) -> dict[str, Any]:
     category_counts: dict[str, int] = {"no_data": 0, "edge": 0, "other": 0}
     approved_total = 0
     gaps: list[float] = []
-    by_profile: dict[str, dict[str, int]] = {}
+    by_profile: dict[str, dict[str, Any]] = {}
     for row in rows:
+        profile = str(row["risk_profile"])
         profile_stats = by_profile.setdefault(
-            str(row["risk_profile"]), {"signals": 0, "approved": 0}
+            profile,
+            {
+                "signals": 0,
+                "approved": 0,
+                "rejection_counts": {},
+                "rejection_counts_all": {},
+                "rejection_categories": {"no_data": 0, "edge": 0, "other": 0},
+                "entry_block_reasons": {},
+            },
         )
         profile_stats["signals"] += 1
-        if row["approved"]:
+        signal_approved = bool(
+            row["signal_approved"] if row["signal_approved"] is not None else row["approved"]
+        )
+        entry_block_reason = row["entry_block_reason"]
+        if signal_approved:
             profile_stats["approved"] += 1
         day = _local_day(row["created_at"])
         stats = per_day.setdefault(
@@ -533,19 +558,26 @@ def _decision_stats(db_path: Path, window_start: date) -> dict[str, Any]:
             },
         )
         day_profile = stats["profiles"].setdefault(
-            str(row["risk_profile"]),
+            profile,
             {"signals": 0, "approved": 0},
         )
         day_profile["signals"] += 1
         stats["signals"] += 1
-        if row["approved"]:
+        if signal_approved:
             stats["approved"] += 1
             day_profile["approved"] += 1
             approved_total += 1
+            if entry_block_reason:
+                block_counts = profile_stats["entry_block_reasons"]
+                block_counts[str(entry_block_reason)] = (
+                    block_counts.get(str(entry_block_reason), 0) + 1
+                )
         else:
             reason = _primary_reason(row["reasons_json"])
             if reason:
                 rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
+                profile_counts = profile_stats["rejection_counts"]
+                profile_counts[reason] = profile_counts.get(reason, 0) + 1
             # Tally every reason on the row, not just the first, so a gate that
             # is always appended after source-spread is still visible. Bucket
             # the row by its most fundamental blocker (no_data > edge) so the
@@ -556,11 +588,15 @@ def _decision_stats(db_path: Path, window_start: date) -> dict[str, Any]:
             for normalized in row_reasons:
                 if normalized not in seen:
                     rejection_counts_all[normalized] = rejection_counts_all.get(normalized, 0) + 1
+                    profile_all = profile_stats["rejection_counts_all"]
+                    profile_all[normalized] = profile_all.get(normalized, 0) + 1
                     seen.add(normalized)
                 category = _reason_category(normalized)
                 if category == "no_data" or (category == "edge" and row_category != "no_data"):
                     row_category = category
             category_counts[row_category] = category_counts.get(row_category, 0) + 1
+            profile_categories = profile_stats["rejection_categories"]
+            profile_categories[row_category] = profile_categories.get(row_category, 0) + 1
         model_p = row["model_probability"]
         market_p = row["market_probability"]
         if model_p is not None and market_p is not None:
@@ -599,7 +635,7 @@ def _decision_stats(db_path: Path, window_start: date) -> dict[str, Any]:
             # loosening any gate to "trade more".
             "rejection_categories": dict(category_counts),
             "by_profile": [
-                {"risk_profile": name, **stats}
+                _profile_gate_stats(name, stats)
                 for name, stats in sorted(by_profile.items())
             ],
         },
@@ -608,6 +644,36 @@ def _decision_stats(db_path: Path, window_start: date) -> dict[str, Any]:
             "mean_abs_gap": round(sum(gaps) / len(gaps), 4) if gaps else None,
             "max_abs_gap": round(max(gaps), 4) if gaps else None,
         },
+    }
+
+
+def _profile_gate_stats(name: str, stats: dict[str, Any]) -> dict[str, Any]:
+    rejection_counts = stats.get("rejection_counts") or {}
+    rejection_counts_all = stats.get("rejection_counts_all") or {}
+    entry_block_reasons = stats.get("entry_block_reasons") or {}
+    return {
+        "risk_profile": name,
+        "signals": int(stats.get("signals") or 0),
+        "approved": int(stats.get("approved") or 0),
+        "top_rejections": [
+            {"reason": reason, "count": count}
+            for reason, count in sorted(
+                rejection_counts.items(), key=lambda item: item[1], reverse=True
+            )[:6]
+        ],
+        "top_rejections_all": [
+            {"reason": reason, "count": count}
+            for reason, count in sorted(
+                rejection_counts_all.items(), key=lambda item: item[1], reverse=True
+            )[:8]
+        ],
+        "rejection_categories": dict(stats.get("rejection_categories") or {}),
+        "entry_block_reasons": [
+            {"reason": reason, "count": count}
+            for reason, count in sorted(
+                entry_block_reasons.items(), key=lambda item: item[1], reverse=True
+            )[:6]
+        ],
     }
 
 
@@ -897,3 +963,7 @@ def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
         (table_name,),
     ).fetchone()
     return row is not None
+
+
+def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
+    return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()}

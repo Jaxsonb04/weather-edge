@@ -103,6 +103,7 @@ def build_strategy_research(
     backtest = _signal_backtest_payload(adapter, db_path)
     config_rescore = _config_rescore_payload(adapter, db_path)
     real_money_readiness = _real_money_readiness_payload(config_rescore, active_calibration)
+    live_frequency_tuning = _live_frequency_tuning_payload(config_rescore, strategy_config_for_profile("live"))
     research_shadow = _research_shadow_payload(adapter, db_path)
     signal_quality = _signal_quality_payload(db_path, trading_signal)
     paper = _paper_payload(db_path)
@@ -148,6 +149,7 @@ def build_strategy_research(
         "backtest_summary": backtest,
         "config_rescore": config_rescore,
         "real_money_readiness": real_money_readiness,
+        "live_frequency_tuning": live_frequency_tuning,
         "research_shadow": research_shadow,
         "paper_trading": paper,
         "profiles": profiles,
@@ -241,6 +243,8 @@ def _profile_names(
             names.add(_profile_key(row.get("risk_profile")))
     for row in paper.get("pending_limit_orders") or []:
         names.add(_profile_key(row.get("risk_profile")))
+    for name in (signal_quality.get("latest_candidates_by_profile") or {}):
+        names.add(_profile_key(name))
     for row in signal_quality.get("latest_candidates") or []:
         names.add(_profile_key(row.get("risk_profile")))
     names.discard("unknown")
@@ -474,11 +478,14 @@ def _profile_paper_payload(paper: dict[str, Any], name: str) -> dict[str, Any]:
 
 
 def _profile_signal_quality(signal_quality: dict[str, Any], name: str) -> dict[str, Any]:
-    rows = [
-        row
-        for row in signal_quality.get("latest_candidates") or []
-        if _profile_key(row.get("risk_profile")) == name
-    ]
+    by_profile = signal_quality.get("latest_candidates_by_profile") or {}
+    rows = by_profile.get(name)
+    if rows is None:
+        rows = [
+            row
+            for row in signal_quality.get("latest_candidates") or []
+            if _profile_key(row.get("risk_profile")) == name
+        ]
     return {
         "available": bool(rows),
         "source": signal_quality.get("source"),
@@ -501,7 +508,10 @@ def _profile_gate_behavior(daily_summary: dict[str, Any], name: str) -> dict[str
     return {
         "approved": int(_to_float(row.get("approved"))),
         "rejected": max(0, int(_to_float(row.get("signals"))) - int(_to_float(row.get("approved")))),
-        "top_rejections": [],
+        "top_rejections": row.get("top_rejections") or [],
+        "top_rejections_all": row.get("top_rejections_all") or [],
+        "rejection_categories": row.get("rejection_categories") or {},
+        "entry_block_reasons": row.get("entry_block_reasons") or [],
         "by_profile": [row] if row else [],
     }
 
@@ -972,6 +982,76 @@ def _real_money_readiness_payload(
     }
 
 
+def _live_frequency_tuning_payload(
+    config_rescore: dict[str, Any],
+    live_config: StrategyConfig,
+) -> dict[str, Any]:
+    """Guarded frequency report for the live real-money-candidate profile.
+
+    This does not loosen gates. It reports whether the current live config is
+    producing the desired paper frequency and explicitly publishes the guardrails
+    that a future retune must preserve.
+    """
+
+    target_min = 2.0
+    target_max = 3.0
+    guardrails = {
+        "min_edge_lcb": _round(live_config.min_edge_lcb, 4),
+        "blocked_forecast_cohorts": list(live_config.blocked_forecast_cohorts),
+        "paper_pause_enabled": True,
+        "max_source_spread_f": _round(live_config.max_source_spread_f, 2),
+    }
+    if not config_rescore.get("available"):
+        return {
+            "available": False,
+            "status": "RESCORE_UNAVAILABLE",
+            "reason": config_rescore.get("reason", "config rescore unavailable"),
+            "target_trades_per_day": [target_min, target_max],
+            "safe_config_change": None,
+            "guardrails": guardrails,
+        }
+    live = (config_rescore.get("by_profile") or {}).get("live") or {}
+    counts = live.get("counts") or {}
+    approved = int(_to_float(counts.get("approved_under_candidate_config")))
+    days = int(_to_float(counts.get("independent_days")))
+    considered = int(_to_float(counts.get("considered")))
+    approved_per_day = approved / days if days > 0 else 0.0
+    if days <= 0 or approved < 30:
+        status = "BELOW_TARGET_COLLECT_ONLY"
+        recommendation = (
+            "Current live gates do not yet produce enough settled, independent "
+            "evidence to tune toward 2-3 paper entries/day without weakening "
+            "the lower-bound edge or pause guardrails."
+        )
+    elif target_min <= approved_per_day <= target_max:
+        status = "ON_TARGET"
+        recommendation = "Current live gates are within the target paper frequency band."
+    elif approved_per_day < target_min:
+        status = "BELOW_TARGET_COLLECT_ONLY"
+        recommendation = (
+            "Live frequency is below target; inspect profile-scoped rejection "
+            "diagnostics before considering any guarded retune."
+        )
+    else:
+        status = "ABOVE_TARGET_REVIEW_RISK"
+        recommendation = (
+            "Live frequency is above target; review drawdown and exposure before "
+            "raising any limits."
+        )
+    return {
+        "available": True,
+        "status": status,
+        "target_trades_per_day": [target_min, target_max],
+        "approved_under_current_live_config": approved,
+        "considered_snapshots": considered,
+        "independent_days": days,
+        "approved_per_independent_day": _round(approved_per_day, 4),
+        "safe_config_change": None,
+        "guardrails": guardrails,
+        "recommendation": recommendation,
+    }
+
+
 def _signal_backtest_payload(adapter: SfoForecasterAdapter, db_path: Path) -> dict[str, Any]:
     empty = {
         "available": False,
@@ -1107,21 +1187,33 @@ def _signal_quality_payload(db_path: Path, trading_signal: dict[str, Any] | None
         ),
         reverse=True,
     )
-    decisions = decisions[:24]
+    latest_candidates_by_profile = {
+        name: rows[:24]
+        for name, rows in _candidate_rows_by_profile(decisions).items()
+    }
+    published_decisions = decisions[:24]
     return {
-        "available": bool(decisions),
+        "available": bool(published_decisions),
         "source": source,
         "stale_candidates_filtered": stale_filtered,
         "latest_target_date": latest_target,
-        "latest_candidates": decisions,
+        "latest_candidates": published_decisions,
+        "latest_candidates_by_profile": latest_candidates_by_profile,
         "lead_mode_counts": _lead_mode_counts(decisions),
         "market_consensus": _market_consensus_payload(db_path),
         "charts": {
-            "probability_vs_market": _probability_market_points(decisions),
-            "edge_by_market_bucket": _edge_by_market_bucket(decisions),
-            "quality_distribution": _quality_distribution(decisions),
+            "probability_vs_market": _probability_market_points(published_decisions),
+            "edge_by_market_bucket": _edge_by_market_bucket(published_decisions),
+            "quality_distribution": _quality_distribution(published_decisions),
         },
     }
+
+
+def _candidate_rows_by_profile(decisions: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    by_profile: dict[str, list[dict[str, Any]]] = {}
+    for row in decisions:
+        by_profile.setdefault(_profile_key(row.get("risk_profile")), []).append(row)
+    return dict(sorted(by_profile.items(), key=lambda item: _profile_sort_key(item[0])))
 
 
 def _paper_payload(db_path: Path) -> dict[str, Any]:
@@ -2488,16 +2580,19 @@ def _latest_decision_rows(db_path: Path) -> list[dict[str, Any]]:
                 LIMIT 3
             ),
             latest_by_target AS (
-                SELECT d.target_date, MAX(d.created_at) AS created_at
+                SELECT d.target_date,
+                       COALESCE(d.risk_profile, 'unknown') AS risk_profile,
+                       MAX(d.created_at) AS created_at
                 FROM decision_snapshots d
                 JOIN recent_targets rt ON rt.target_date = d.target_date
                 WHERE d.market_ticker NOT LIKE '%-PAPER%'
-                GROUP BY d.target_date
+                GROUP BY d.target_date, COALESCE(d.risk_profile, 'unknown')
             )
             SELECT d.*
             FROM decision_snapshots d
             JOIN latest_by_target latest
               ON latest.target_date = d.target_date
+             AND latest.risk_profile = COALESCE(d.risk_profile, 'unknown')
              AND latest.created_at = d.created_at
             WHERE d.market_ticker NOT LIKE '%-PAPER%'
             ORDER BY d.target_date DESC, d.approved DESC,
@@ -2510,6 +2605,8 @@ def _latest_decision_rows(db_path: Path) -> list[dict[str, Any]]:
 def _decision_row(row: sqlite3.Row) -> dict[str, Any]:
     reasons = _json_list(row["reasons_json"])
     approved = bool(row["approved"])
+    raw_signal_approved = _sqlite_row_value(row, "signal_approved")
+    signal_approved = bool(raw_signal_approved) if raw_signal_approved is not None else approved
     lead_hours = _sqlite_row_value(row, "forecast_lead_hours")
     lead_mode = _forecast_lead_mode(
         lead_hours=lead_hours,
@@ -2528,6 +2625,11 @@ def _decision_row(row: sqlite3.Row) -> dict[str, Any]:
         "side": row["side"],
         "risk_profile": _row_risk_profile(row) or "unknown",
         "approved": approved,
+        "signal_approved": signal_approved,
+        "entry_block_reason": _sqlite_row_value(row, "entry_block_reason"),
+        "diagnostics_available": bool(_sqlite_row_value(row, "diagnostics_json")),
+        "forecast_snapshot_id": _sqlite_row_value(row, "forecast_snapshot_id"),
+        "market_snapshot_id": _sqlite_row_value(row, "market_snapshot_id"),
         "decision": "TRADE" if approved else "NO_TRADE",
         "probability": _round(row["probability"], 4),
         "probability_lcb": _round(row["probability_lcb"], 4),
@@ -2598,6 +2700,8 @@ def _decisions_from_trading_signal(payload: dict[str, Any] | None) -> list[dict[
                     "side": row.get("side"),
                     "risk_profile": row.get("risk_profile") or payload.get("risk_profile") or PRIMARY_PROFILE,
                     "approved": approved,
+                    "signal_approved": bool(row.get("signal_approved", approved)),
+                    "entry_block_reason": row.get("entry_block_reason"),
                     "decision": row.get("decision") or ("TRADE" if approved else "NO_TRADE"),
                     "probability": row.get("probability"),
                     "probability_lcb": row.get("probability_lcb"),
@@ -2858,6 +2962,8 @@ def _paper_row(
     monitor: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     reasons = _json_list(row["reasons_json"])
+    outcome_diagnostics = _json_object(_sqlite_row_value(row, "outcome_diagnostics_json"))
+    outcome = outcome_diagnostics.get("outcome") if isinstance(outcome_diagnostics, dict) else {}
     monitor = monitor or _paper_monitor_config()
     side = _side_from_row(row)
     contracts = _to_float(row["contracts"])
@@ -2943,6 +3049,11 @@ def _paper_row(
         "side": side,
         "status": row["status"],
         "risk_profile": _row_risk_profile(row),
+        "diagnostics_available": bool(
+            _sqlite_row_value(row, "diagnostics_json")
+            or _sqlite_row_value(row, "outcome_diagnostics_json")
+        ),
+        "entry_decision_snapshot_id": _sqlite_row_value(row, "entry_decision_snapshot_id"),
         "contracts": _round(contracts, 4),
         "entry_mode": row["entry_mode"] if "entry_mode" in row.keys() else "market",
         "limit_price": _round(row["limit_price"], 4) if "limit_price" in row.keys() else None,
@@ -3014,6 +3125,12 @@ def _paper_row(
         ),
         "closed_at": row["closed_at"],
         "settled_at": row["settled_at"],
+        "outcome_reason": outcome.get("win_loss_reason") if isinstance(outcome, dict) else None,
+        "forecast_error_f": (
+            _round(outcome.get("forecast_error_f"), 2)
+            if isinstance(outcome, dict)
+            else None
+        ),
         "reasons": reasons,
         "why_good": _why_trade_good(row, reasons),
     }
@@ -3553,6 +3670,9 @@ def _entry_block_reason(
         target = _date_from_string(row.get("target_date"))
         if target is not None and target != today:
             continue
+        explicit = row.get("entry_block_reason")
+        if explicit:
+            return str(explicit)
         for reason in row.get("reasons") or []:
             text = str(reason)
             if text.startswith("same-day entry disabled:"):
@@ -3790,6 +3910,18 @@ def _json_list(value: object) -> list[str]:
     if isinstance(payload, list):
         return [str(item) for item in payload]
     return []
+
+
+def _json_object(value: object) -> dict[str, Any]:
+    if not value:
+        return {}
+    if isinstance(value, dict):
+        return value
+    try:
+        payload = json.loads(str(value))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
 def _round_dict(row: dict[str, Any]) -> dict[str, Any]:

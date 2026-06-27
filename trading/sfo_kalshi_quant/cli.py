@@ -1219,10 +1219,12 @@ def _analyze_one_target(
     if not entry_allowed and entry_block_reason:
         display_decisions = _block_entry_decisions(display_decisions, entry_block_reason)
 
+    forecast_snapshot_id = None
+    market_snapshot_id = None
     if not getattr(args, "skip_context_snapshots", False):
-        store.record_forecast(forecast)
+        forecast_snapshot_id = store.record_forecast(forecast)
         if event:
-            store.record_market(event)
+            market_snapshot_id = store.record_market(event)
         store.record_probabilities(target.isoformat(), probabilities.values())
     store.record_decisions(
         target.isoformat(),
@@ -1233,6 +1235,9 @@ def _analyze_one_target(
         market_consensus=consensus,
         risk_profile=risk_profile,
         bankroll=paper_bankroll,
+        strategy_config=config,
+        forecast_snapshot_id=forecast_snapshot_id,
+        market_snapshot_id=market_snapshot_id,
     )
 
     order_ids = []
@@ -1374,12 +1379,20 @@ def _portfolio_scan_one_target(
 
     decisions_to_record = _portfolio_decisions_for_recording(decisions, plan)
     if not entry_allowed and entry_block_reason:
+        if risk_profile == "research":
+            paper_trader.record_research_shadow_candidates(
+                target.isoformat(),
+                _entry_blocked_shadow_decisions(plan.decisions, entry_block_reason),
+                sampled=False,
+            )
         decisions_to_record = _block_entry_decisions(decisions_to_record, entry_block_reason)
 
+    forecast_snapshot_id = None
+    market_snapshot_id = None
     if not getattr(args, "skip_context_snapshots", False):
-        store.record_forecast(forecast)
+        forecast_snapshot_id = store.record_forecast(forecast)
         if event:
-            store.record_market(event)
+            market_snapshot_id = store.record_market(event)
         store.record_probabilities(target.isoformat(), probabilities.values())
     store.record_decisions(
         target.isoformat(),
@@ -1390,6 +1403,9 @@ def _portfolio_scan_one_target(
         market_consensus=consensus,
         risk_profile=risk_profile,
         bankroll=paper_bankroll,
+        strategy_config=config,
+        forecast_snapshot_id=forecast_snapshot_id,
+        market_snapshot_id=market_snapshot_id,
     )
 
     placed_ids: list[int] = []
@@ -1626,10 +1642,12 @@ def _tail_basket_one_target(
     if not entry_allowed and entry_block_reason:
         decisions_to_record = _block_entry_decisions(decisions_to_record, entry_block_reason)
 
+    forecast_snapshot_id = None
+    market_snapshot_id = None
     if not getattr(args, "skip_context_snapshots", False):
-        store.record_forecast(forecast)
+        forecast_snapshot_id = store.record_forecast(forecast)
         if event:
-            store.record_market(event)
+            market_snapshot_id = store.record_market(event)
         store.record_probabilities(target.isoformat(), probabilities.values())
     store.record_decisions(
         target.isoformat(),
@@ -1639,6 +1657,9 @@ def _tail_basket_one_target(
         event=event,
         risk_profile=risk_profile,
         bankroll=paper_bankroll,
+        strategy_config=config,
+        forecast_snapshot_id=forecast_snapshot_id,
+        market_snapshot_id=market_snapshot_id,
     )
 
     order_ids = []
@@ -1752,6 +1773,8 @@ def _block_entry_decisions(decisions, reason: str):
         replace(
             decision,
             approved=False,
+            signal_approved=_decision_signal_approved(decision),
+            entry_block_reason=reason,
             recommended_contracts=0.0,
             expected_profit=0.0,
             reasons=[reason, *decision.reasons],
@@ -1760,9 +1783,25 @@ def _block_entry_decisions(decisions, reason: str):
     ]
 
 
+def _entry_blocked_shadow_decisions(decisions, reason: str):
+    return [
+        replace(
+            decision,
+            approved=False,
+            signal_approved=_decision_signal_approved(decision),
+            entry_block_reason=reason,
+            reasons=[reason, *decision.reasons],
+        )
+        for decision in decisions
+    ]
+
+
 def _portfolio_decisions_for_recording(decisions, plan: PortfolioPlan):
     selected_by_key = {
-        _portfolio_decision_key(leg.decision): leg.decision
+        _portfolio_decision_key(leg.decision): replace(
+            leg.decision,
+            signal_approved=_decision_signal_approved(leg.decision),
+        )
         for leg in plan.legs
     }
     recorded = []
@@ -1778,6 +1817,7 @@ def _portfolio_decisions_for_recording(decisions, plan: PortfolioPlan):
                 replace(
                     decision,
                     approved=False,
+                    signal_approved=True,
                     recommended_contracts=0.0,
                     expected_profit=0.0,
                     reasons=[*decision.reasons, "portfolio not allocated by shared risk budget"],
@@ -1791,6 +1831,12 @@ def _portfolio_decisions_for_recording(decisions, plan: PortfolioPlan):
             recorded.append(leg.decision)
             seen.add(key)
     return recorded
+
+
+def _decision_signal_approved(decision) -> bool:
+    return bool(
+        decision.signal_approved if decision.signal_approved is not None else decision.approved
+    )
 
 
 def _portfolio_decision_key(decision) -> tuple[str, str]:

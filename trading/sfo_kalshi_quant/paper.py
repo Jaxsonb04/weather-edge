@@ -170,6 +170,7 @@ class PaperTrader:
                     risk_profile=self.risk_profile,
                     sample_probability=sample_probability,
                     sampled=sampled,
+                    strategy_config=self.config,
                 )
                 if not sampled:
                     continue
@@ -226,6 +227,7 @@ class PaperTrader:
                 status=status,
                 entry_mode=entry_mode,
                 group_id=group_id,
+                strategy_config=self.config,
             )
             # None == the open-position guard index rejected a concurrent
             # duplicate the side-agnostic check above raced past. Skip it and do
@@ -238,6 +240,51 @@ class PaperTrader:
             if exposure_remaining is not None:
                 exposure_remaining -= adjusted.recommended_contracts * adjusted.cost_per_contract
         return order_ids
+
+    def record_research_shadow_candidates(
+        self,
+        target_date: str,
+        decisions: list[TradeDecision],
+        *,
+        sample_probability: float | None = None,
+        sampled: bool = False,
+    ) -> list[int]:
+        """Record research exploration signals even when paper entry is blocked.
+
+        Shadow rows are a data-collection ledger, not a paper PnL ledger. They
+        preserve the signal size and reason context so Strategy Lab can learn
+        from paused/rejected paper-entry windows without opening risk.
+        """
+
+        if (self.risk_profile or "").strip().lower().replace("_", "-") != "research":
+            return []
+        probability = _clamp_probability(
+            self.config.research_shadow_sample_probability
+            if sample_probability is None
+            else sample_probability
+        )
+        shadow_ids: list[int] = []
+        for decision in decisions:
+            if decision.recommended_contracts <= 0:
+                continue
+            if not _is_research_shadow_candidate(
+                self.risk_profile,
+                decision,
+                include_positive_lcb=True,
+                require_explore_sleeve=False,
+            ):
+                continue
+            shadow_ids.append(
+                self.store.record_research_shadow_order(
+                    target_date,
+                    decision,
+                    risk_profile=self.risk_profile,
+                    sample_probability=probability,
+                    sampled=sampled,
+                    strategy_config=self.config,
+                )
+            )
+        return shadow_ids
 
     def _fill_crossed_resting_limits(self, target_date: str, decision: TradeDecision) -> list[int]:
         if self.entry_mode != "limit":
@@ -333,6 +380,7 @@ class PaperTrader:
                     decision,
                     risk_profile=self.risk_profile,
                     group_id=group_id,
+                    strategy_config=self.config,
                 )
                 # A box must record every leg or none. If the open-position guard
                 # rejected a leg (None), abort loudly rather than book a partial,
@@ -495,12 +543,25 @@ def _decision_key(decision: TradeDecision) -> tuple[str, str]:
     return (decision.ticker, decision.side)
 
 
-def _is_research_shadow_candidate(risk_profile: str | None, decision: TradeDecision) -> bool:
+def _is_research_shadow_candidate(
+    risk_profile: str | None,
+    decision: TradeDecision,
+    *,
+    include_positive_lcb: bool = False,
+    require_explore_sleeve: bool = True,
+) -> bool:
     if (risk_profile or "").strip().lower().replace("_", "-") != "research":
         return False
-    if not decision.approved or decision.edge <= 0.0 or decision.edge_lcb >= 0.0:
+    signal_approved = decision.signal_approved if decision.signal_approved is not None else decision.approved
+    if not signal_approved or decision.edge <= 0.0:
         return False
-    return any("sleeve=research_explore" in reason for reason in decision.reasons)
+    if not include_positive_lcb and decision.edge_lcb >= 0.0:
+        return False
+    if require_explore_sleeve and not any(
+        "sleeve=research_explore" in reason for reason in decision.reasons
+    ):
+        return False
+    return True
 
 
 def _clamp_probability(value: float) -> float:

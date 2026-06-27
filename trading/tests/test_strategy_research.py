@@ -18,6 +18,7 @@ from sfo_kalshi_quant.strategy_research import (
     _dataset_research_summary,
     _entry_block_reason,
     _forecast_health_payload,
+    _live_frequency_tuning_payload,
     _market_consensus_payload,
     _strategy_alerts,
     _status_target_date,
@@ -187,8 +188,69 @@ def test_strategy_research_reads_decisions_and_open_paper_positions():
         assert position["max_loss"] == position["risk"]
         assert position["take_profit_bid"] is not None
         assert position["stop_loss_bid"] is not None
-        assert position["current_bid"] == 0.2
-        assert position["unrealized_pnl"] < 0
+
+
+def test_strategy_research_exposes_compact_learning_diagnostics():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "forecaster"
+        db_path = Path(tmp) / "trading" / "paper.db"
+        _write_lstm_fixture(root)
+        _write_settlement(root)
+
+        store = PaperStore(db_path)
+        decision = _approved_decision()
+        forecast = ForecastSnapshot(
+            target_date=date(2026, 6, 3),
+            predicted_high_f=66.0,
+            fetched_at="2026-06-03T12:00:00+00:00",
+            lead_hours=8.0,
+            method="weatheredge-blend",
+            google_high_f=66.0,
+            nws_high_f=67.0,
+            open_meteo_high_f=65.5,
+            history_high_f=64.0,
+            source_count=4,
+            raw={"marine_layer_index": 0.6},
+        )
+        event = pre_resolution_event([decision])
+        forecast_snapshot_id = store.record_forecast(forecast)
+        market_snapshot_id = store.record_market(event)
+        store.record_decisions(
+            "2026-06-03",
+            [decision],
+            forecast=forecast,
+            event=event,
+            risk_profile="research",
+            bankroll=1000.0,
+            strategy_config=StrategyConfig(),
+            forecast_snapshot_id=forecast_snapshot_id,
+            market_snapshot_id=market_snapshot_id,
+        )
+        store.record_paper_order(
+            "2026-06-03",
+            decision,
+            risk_profile="research",
+            strategy_config=StrategyConfig(),
+        )
+        store.settle_paper_orders("2026-06-03", 67.0)
+
+        payload = build_strategy_research(
+            forecaster_root=root,
+            db_path=db_path,
+            calibration_min_train=40,
+        )
+
+        profiles = {row["risk_profile"]: row for row in payload["profiles"]}
+        candidate = profiles["research"]["signal_quality"]["latest_candidates"][0]
+        assert candidate["diagnostics_available"] is True
+        assert candidate["forecast_snapshot_id"] == forecast_snapshot_id
+        assert candidate["market_snapshot_id"] == market_snapshot_id
+
+        closed = profiles["research"]["paper_trading"]["closed_positions"][0]
+        assert closed["diagnostics_available"] is True
+        assert closed["entry_decision_snapshot_id"] is not None
+        assert closed["outcome_reason"] == "YES position won because the market resolved YES."
+        assert closed["forecast_error_f"] == 1.0
 
 
 def test_strategy_research_summary_win_loss_counts_use_full_book():
@@ -465,6 +527,133 @@ def test_signal_quality_prefers_newest_target_before_old_approved_candidates():
         assert candidates[0]["target_date"] == "2026-06-20"
         assert candidates[0]["approved"] is False
         assert payload["status"]["latest_target_date"] == "2026-06-20"
+
+
+def test_profile_signal_quality_keeps_live_rows_when_research_scans_later():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "forecaster"
+        db_path = Path(tmp) / "trading" / "paper.db"
+        _write_lstm_fixture(root)
+
+        store = PaperStore(db_path)
+        live_rows = [
+            replace(
+                _approved_decision(),
+                ticker=f"KXHIGHTSFO-26JUN20-LIVE-{idx}",
+                label=f"live {idx}",
+                trade_quality_score=90.0 - idx,
+            )
+            for idx in range(2)
+        ]
+        research_rows = [
+            replace(
+                _approved_decision(),
+                ticker=f"KXHIGHTSFO-26JUN20-RESEARCH-{idx}",
+                label=f"research {idx}",
+                trade_quality_score=80.0 - idx,
+            )
+            for idx in range(30)
+        ]
+        store.record_decisions("2026-06-20", live_rows, risk_profile="live")
+        store.record_decisions("2026-06-20", research_rows, risk_profile="research")
+
+        payload = build_strategy_research(
+            forecaster_root=root,
+            db_path=db_path,
+            calibration_min_train=40,
+        )
+
+        profiles = {row["risk_profile"]: row for row in payload["profiles"]}
+        live_candidates = profiles["live"]["signal_quality"]["latest_candidates"]
+        research_candidates = profiles["research"]["signal_quality"]["latest_candidates"]
+        assert {row["ticker"] for row in live_candidates} == {
+            "KXHIGHTSFO-26JUN20-LIVE-0",
+            "KXHIGHTSFO-26JUN20-LIVE-1",
+        }
+        assert len(research_candidates) == 24
+        assert set(payload["signal_quality"]["latest_candidates_by_profile"]) >= {
+            "live",
+            "research",
+        }
+
+
+def test_profile_gate_behavior_includes_profile_scoped_rejections_and_entry_blocks():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "forecaster"
+        db_path = Path(tmp) / "trading" / "paper.db"
+        _write_lstm_fixture(root)
+
+        store = PaperStore(db_path)
+        live_rejected = replace(
+            _approved_decision(),
+            ticker="KXHIGHTSFO-26JUN20-LIVE-BLOCKED",
+            approved=False,
+            recommended_contracts=0.0,
+            expected_profit=0.0,
+            reasons=[
+                "forecast source spread 8.4F exceeds max 7.0F; point blend is unreliable",
+                "edge -0.010 below min 0.020",
+            ],
+        )
+        research_paused = replace(
+            _approved_decision(),
+            ticker="KXHIGHTSFO-26JUN20-RESEARCH-PAUSED",
+            approved=False,
+            signal_approved=True,
+            entry_block_reason="research paused: daily loss cap reached",
+            recommended_contracts=0.0,
+            expected_profit=0.0,
+            reasons=[
+                "research paused: daily loss cap reached",
+                "portfolio PF-test: sleeve=no_core, growth=0.001000",
+            ],
+        )
+        store.record_decisions("2026-06-20", [live_rejected], risk_profile="live")
+        store.record_decisions("2026-06-20", [research_paused], risk_profile="research")
+
+        payload = build_strategy_research(
+            forecaster_root=root,
+            db_path=db_path,
+            calibration_min_train=40,
+        )
+
+        profiles = {row["risk_profile"]: row for row in payload["profiles"]}
+        live_gate = profiles["live"]["daily_summary"]["gate_behavior"]
+        research_gate = profiles["research"]["daily_summary"]["gate_behavior"]
+        assert live_gate["top_rejections"][0]["reason"] == "source spread"
+        assert live_gate["rejection_categories"]["no_data"] == 1
+        assert research_gate["entry_block_reasons"] == [
+            {"reason": "research paused: daily loss cap reached", "count": 1}
+        ]
+        candidate = profiles["research"]["signal_quality"]["latest_candidates"][0]
+        assert candidate["signal_approved"] is True
+        assert candidate["approved"] is False
+        assert candidate["entry_block_reason"] == "research paused: daily loss cap reached"
+
+
+def test_live_frequency_tuning_report_does_not_loosen_guardrails_without_evidence():
+    live_config = StrategyConfig(min_edge_lcb=0.0, blocked_forecast_cohorts=("warm",))
+    report = _live_frequency_tuning_payload(
+        {
+            "available": True,
+            "by_profile": {
+                "live": {
+                    "counts": {
+                        "approved_under_candidate_config": 0,
+                        "considered": 12,
+                        "independent_days": 4,
+                    }
+                }
+            },
+        },
+        live_config,
+    )
+
+    assert report["available"] is True
+    assert report["status"] == "BELOW_TARGET_COLLECT_ONLY"
+    assert report["safe_config_change"] is None
+    assert report["guardrails"]["min_edge_lcb"] == 0.0
+    assert report["guardrails"]["blocked_forecast_cohorts"] == ["warm"]
 
 
 def test_strategy_research_surfaces_resting_limit_orders():

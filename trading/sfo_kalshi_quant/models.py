@@ -331,6 +331,12 @@ class TradeDecision:
     # Lets the dashboard explain why a position is small -- thin edge (kelly),
     # thin book (ask_size), or a configured cap -- rather than guessing.
     binding_constraint: str | None = None
+    # Diagnostic split between a qualifying signal and a paper entry. `approved`
+    # remains the paper-entry verdict after portfolio/pause/cutoff guards; this
+    # field preserves whether the underlying signal qualified before those entry
+    # guards were applied.
+    signal_approved: bool | None = None
+    entry_block_reason: str | None = None
 
     @property
     def bid(self) -> float:

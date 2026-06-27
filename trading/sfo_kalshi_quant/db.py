@@ -9,7 +9,7 @@ from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
 
-from .config import normalize_risk_profile_name
+from .config import StrategyConfig, normalize_risk_profile_name
 from .consensus import MarketConsensus
 from .fees import (
     contracts_for_budget,
@@ -71,6 +71,8 @@ CREATE TABLE IF NOT EXISTS decision_snapshots (
     action TEXT NOT NULL,
     side TEXT NOT NULL,
     approved INTEGER NOT NULL,
+    signal_approved INTEGER,
+    entry_block_reason TEXT,
     probability REAL NOT NULL,
     probability_lcb REAL NOT NULL,
     model_probability REAL,
@@ -108,7 +110,10 @@ CREATE TABLE IF NOT EXISTS decision_snapshots (
     intraday_latest_observed_at TEXT,
     intraday_is_complete INTEGER NOT NULL DEFAULT 0,
     intraday_observed_high_source TEXT,
+    forecast_snapshot_id INTEGER,
+    market_snapshot_id INTEGER,
     prediction_features_json TEXT,
+    diagnostics_json TEXT,
     reasons_json TEXT NOT NULL
 );
 
@@ -153,7 +158,10 @@ CREATE TABLE IF NOT EXISTS paper_orders (
     realized_pnl REAL,
     closed_at TEXT,
     exit_price REAL,
-    exit_fee_per_contract REAL
+    exit_fee_per_contract REAL,
+    entry_decision_snapshot_id INTEGER,
+    diagnostics_json TEXT,
+    outcome_diagnostics_json TEXT
 );
 
 CREATE TABLE IF NOT EXISTS paper_monitor_snapshots (
@@ -170,7 +178,8 @@ CREATE TABLE IF NOT EXISTS paper_monitor_snapshots (
     exit_fee_per_contract REAL,
     net_exit_per_contract REAL,
     unrealized_pnl REAL,
-    unrealized_roi REAL
+    unrealized_roi REAL,
+    diagnostics_json TEXT
 );
 
 CREATE TABLE IF NOT EXISTS research_shadow_orders (
@@ -210,7 +219,10 @@ CREATE TABLE IF NOT EXISTS research_shadow_orders (
     realized_pnl REAL,
     closed_at TEXT,
     exit_price REAL,
-    exit_fee_per_contract REAL
+    exit_fee_per_contract REAL,
+    entry_decision_snapshot_id INTEGER,
+    diagnostics_json TEXT,
+    outcome_diagnostics_json TEXT
 );
 
 CREATE TABLE IF NOT EXISTS research_shadow_monitor_snapshots (
@@ -227,7 +239,8 @@ CREATE TABLE IF NOT EXISTS research_shadow_monitor_snapshots (
     exit_fee_per_contract REAL,
     net_exit_per_contract REAL,
     unrealized_pnl REAL,
-    unrealized_roi REAL
+    unrealized_roi REAL,
+    diagnostics_json TEXT
 );
 """
 
@@ -303,6 +316,9 @@ PAPER_ORDER_AUDIT_COLUMNS = {
     "limit_edge_lcb": "REAL",
     "risk_profile": "TEXT",
     "group_id": "TEXT",
+    "entry_decision_snapshot_id": "INTEGER",
+    "diagnostics_json": "TEXT",
+    "outcome_diagnostics_json": "TEXT",
 }
 
 # Fixed-PST settlement clock (UTC-8 year round) used for the daily-loss window so
@@ -356,7 +372,22 @@ DECISION_AUDIT_COLUMNS = {
     "forecast_lead_hours": "REAL",
     "risk_profile": "TEXT",
     "bankroll": "REAL",
+    "forecast_snapshot_id": "INTEGER",
+    "market_snapshot_id": "INTEGER",
     "prediction_features_json": "TEXT",
+    "diagnostics_json": "TEXT",
+    "signal_approved": "INTEGER",
+    "entry_block_reason": "TEXT",
+}
+
+RESEARCH_SHADOW_AUDIT_COLUMNS = {
+    "entry_decision_snapshot_id": "INTEGER",
+    "diagnostics_json": "TEXT",
+    "outcome_diagnostics_json": "TEXT",
+}
+
+MONITOR_AUDIT_COLUMNS = {
+    "diagnostics_json": "TEXT",
 }
 
 
@@ -406,6 +437,21 @@ class PaperStore:
             for column, column_type in DECISION_AUDIT_COLUMNS.items():
                 if column not in existing_decision:
                     conn.execute(f"ALTER TABLE decision_snapshots ADD COLUMN {column} {column_type}")
+            existing_shadow = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(research_shadow_orders)").fetchall()
+            }
+            for column, column_type in RESEARCH_SHADOW_AUDIT_COLUMNS.items():
+                if column not in existing_shadow:
+                    conn.execute(f"ALTER TABLE research_shadow_orders ADD COLUMN {column} {column_type}")
+            for table in ("paper_monitor_snapshots", "research_shadow_monitor_snapshots"):
+                existing_monitor = {
+                    row[1]
+                    for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+                }
+                for column, column_type in MONITOR_AUDIT_COLUMNS.items():
+                    if column not in existing_monitor:
+                        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
             _migrate_legacy_profile_names(conn)
             conn.executescript(INDEXES)
             self._ensure_open_position_guard_index(conn)
@@ -681,6 +727,9 @@ class PaperStore:
         market_consensus: MarketConsensus | None = None,
         risk_profile: str | None = None,
         bankroll: float | None = None,
+        strategy_config: StrategyConfig | None = None,
+        forecast_snapshot_id: int | None = None,
+        market_snapshot_id: int | None = None,
     ) -> None:
         created_at = _now()
         rows = []
@@ -688,17 +737,37 @@ class PaperStore:
         if event is not None:
             markets_by_ticker = {market.ticker: market for market in event.markets}
         observed_high_mode = _forecast_observed_high_mode(forecast)
+        prediction_features = build_prediction_feature_snapshot(
+            forecast,
+            market_consensus=market_consensus,
+            intraday=intraday,
+        )
         prediction_features_json = json.dumps(
-            build_prediction_feature_snapshot(
-                forecast,
-                market_consensus=market_consensus,
-                intraday=intraday,
-            ),
+            prediction_features,
             sort_keys=True,
         )
         for decision in decisions:
             spend = decision.recommended_contracts * decision.cost_per_contract
             market = markets_by_ticker.get(decision.ticker)
+            diagnostics_json = json.dumps(
+                _decision_diagnostics_payload(
+                    target_date,
+                    decision,
+                    created_at=created_at,
+                    forecast=forecast,
+                    intraday=intraday,
+                    event=event,
+                    market=market,
+                    market_consensus=market_consensus,
+                    prediction_features=prediction_features,
+                    risk_profile=risk_profile,
+                    bankroll=bankroll,
+                    strategy_config=strategy_config,
+                    forecast_snapshot_id=forecast_snapshot_id,
+                    market_snapshot_id=market_snapshot_id,
+                ),
+                sort_keys=True,
+            )
             rows.append(
                 (
                     created_at,
@@ -708,6 +777,14 @@ class PaperStore:
                     decision.action,
                     decision.side,
                     1 if decision.approved else 0,
+                    1
+                    if (
+                        decision.signal_approved
+                        if decision.signal_approved is not None
+                        else decision.approved
+                    )
+                    else 0,
+                    decision.entry_block_reason,
                     decision.probability,
                     decision.probability_lcb,
                     decision.model_probability,
@@ -750,7 +827,10 @@ class PaperStore:
                     forecast.lead_hours if forecast is not None else None,
                     risk_profile,
                     bankroll,
+                    forecast_snapshot_id,
+                    market_snapshot_id,
                     prediction_features_json,
+                    diagnostics_json,
                     json.dumps(decision.reasons),
                 )
             )
@@ -759,7 +839,8 @@ class PaperStore:
                 """
                 INSERT INTO decision_snapshots (
                     created_at, target_date, market_ticker, label, action, side,
-                    approved, probability, probability_lcb, model_probability,
+                    approved, signal_approved, entry_block_reason,
+                    probability, probability_lcb, model_probability,
                     market_probability, residual_probability, ensemble_probability,
                     intraday_probability, remaining_heat_risk, yes_bid, yes_ask,
                     entry_bid, entry_ask, entry_bid_size, entry_ask_size, spread,
@@ -772,9 +853,10 @@ class PaperStore:
                     intraday_is_complete, intraday_observed_high_source,
                     forecast_predicted_high_f, forecast_source_spread_f,
                     forecast_lead_hours, risk_profile, bankroll,
-                    prediction_features_json, reasons_json
+                    forecast_snapshot_id, market_snapshot_id,
+                    prediction_features_json, diagnostics_json, reasons_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows,
             )
@@ -788,6 +870,7 @@ class PaperStore:
         status: str | None = None,
         entry_mode: str = "market",
         group_id: str | None = None,
+        strategy_config: StrategyConfig | None = None,
     ) -> int | None:
         contracts = float(decision.recommended_contracts)
         entry_price = float(decision.limit_price if decision.limit_price is not None else decision.ask)
@@ -806,7 +889,31 @@ class PaperStore:
         expected_profit = edge * contracts
         profile = normalize_risk_profile_name(risk_profile) if risk_profile else None
         normalized_status = status or ("PAPER_FILLED" if decision.approved else "REJECTED")
+        created_at = _now()
         with self.connect() as conn:
+            entry_decision = _latest_entry_decision_snapshot(
+                conn,
+                target_date,
+                decision,
+                risk_profile=profile,
+            )
+            diagnostics_json = json.dumps(
+                _order_entry_diagnostics_payload(
+                    target_date,
+                    decision,
+                    created_at=created_at,
+                    kind="paper_order",
+                    risk_profile=profile,
+                    status=normalized_status,
+                    entry_mode=entry_mode,
+                    group_id=group_id,
+                    strategy_config=strategy_config,
+                    sample_probability=None,
+                    sampled=None,
+                    entry_decision=entry_decision,
+                ),
+                sort_keys=True,
+            )
             try:
                 cursor = conn.execute(
                     """
@@ -818,12 +925,13 @@ class PaperStore:
                         limit_price, limit_fee_per_contract, limit_cost_per_contract, limit_edge, limit_edge_lcb,
                         fee_per_contract, cost_per_contract, probability,
                         probability_lcb, edge, edge_lcb, trade_quality_score,
-                        expected_profit, status, reasons_json
+                        expected_profit, status, entry_decision_snapshot_id,
+                        diagnostics_json, reasons_json
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        _now(),
+                        created_at,
                         target_date,
                         decision.ticker,
                         decision.label,
@@ -855,6 +963,8 @@ class PaperStore:
                         decision.trade_quality_score,
                         expected_profit,
                         normalized_status,
+                        _row_value(entry_decision, "id") if entry_decision is not None else None,
+                        diagnostics_json,
                         json.dumps(decision.reasons),
                     ),
                 )
@@ -875,6 +985,7 @@ class PaperStore:
         sample_probability: float,
         sampled: bool,
         linked_paper_order_id: int | None = None,
+        strategy_config: StrategyConfig | None = None,
     ) -> int:
         contracts = float(decision.recommended_contracts)
         entry_price = float(decision.limit_price if decision.limit_price is not None else decision.ask)
@@ -892,7 +1003,31 @@ class PaperStore:
         )
         expected_profit = edge * contracts
         profile = normalize_risk_profile_name(risk_profile) if risk_profile else None
+        created_at = _now()
         with self.connect() as conn:
+            entry_decision = _latest_entry_decision_snapshot(
+                conn,
+                target_date,
+                decision,
+                risk_profile=profile,
+            )
+            diagnostics_json = json.dumps(
+                _order_entry_diagnostics_payload(
+                    target_date,
+                    decision,
+                    created_at=created_at,
+                    kind="research_shadow_order",
+                    risk_profile=profile,
+                    status="SHADOW_OPEN",
+                    entry_mode="shadow",
+                    group_id=None,
+                    strategy_config=strategy_config,
+                    sample_probability=sample_probability,
+                    sampled=sampled,
+                    entry_decision=entry_decision,
+                ),
+                sort_keys=True,
+            )
             cursor = conn.execute(
                 """
                 INSERT INTO research_shadow_orders (
@@ -903,12 +1038,13 @@ class PaperStore:
                     cost_per_contract, probability, probability_lcb, edge,
                     edge_lcb, trade_quality_score, expected_profit,
                     sample_probability, sampled, linked_paper_order_id,
-                    status, reasons_json
+                    status, entry_decision_snapshot_id, diagnostics_json,
+                    reasons_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    _now(),
+                    created_at,
                     target_date,
                     decision.ticker,
                     decision.label,
@@ -936,6 +1072,8 @@ class PaperStore:
                     1 if sampled else 0,
                     linked_paper_order_id,
                     "SHADOW_OPEN",
+                    _row_value(entry_decision, "id") if entry_decision is not None else None,
+                    diagnostics_json,
                     json.dumps(decision.reasons),
                 ),
             )
@@ -1282,6 +1420,23 @@ class PaperStore:
         unrealized_pnl: float | None = None,
         unrealized_roi: float | None = None,
     ) -> int:
+        created_at = _now()
+        diagnostics_json = json.dumps(
+            _monitor_diagnostics_payload(
+                order,
+                created_at=created_at,
+                side=side,
+                action=action,
+                reason=reason,
+                market_status=market_status,
+                live_bid=live_bid,
+                exit_fee_per_contract=exit_fee_per_contract,
+                net_exit_per_contract=net_exit_per_contract,
+                unrealized_pnl=unrealized_pnl,
+                unrealized_roi=unrealized_roi,
+            ),
+            sort_keys=True,
+        )
         with self.connect() as conn:
             cursor = conn.execute(
                 """
@@ -1289,12 +1444,12 @@ class PaperStore:
                     created_at, order_id, target_date, market_ticker, side,
                     action, reason, market_status, live_bid,
                     exit_fee_per_contract, net_exit_per_contract,
-                    unrealized_pnl, unrealized_roi
+                    unrealized_pnl, unrealized_roi, diagnostics_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    _now(),
+                    created_at,
                     int(order["id"]),
                     order["target_date"],
                     order["market_ticker"],
@@ -1307,6 +1462,7 @@ class PaperStore:
                     net_exit_per_contract,
                     unrealized_pnl,
                     unrealized_roi,
+                    diagnostics_json,
                 ),
             )
             return int(cursor.lastrowid)
@@ -1354,20 +1510,45 @@ class PaperStore:
             # resolved can never fill now. Expire them (zero PnL) so they stop
             # consuming the per-target exposure cap, blocking re-entry, and
             # showing as perpetual pending exposure on the dashboard.
-            conn.execute(
+            resting_rows = conn.execute(
                 """
-                UPDATE paper_orders
-                SET status = 'PAPER_EXPIRED',
-                    settled_at = ?,
-                    settlement_high_f = ?,
-                    realized_pnl = 0.0
+                SELECT *
+                FROM paper_orders
                 WHERE target_date = ?
                   AND status = 'PAPER_LIMIT_RESTING'
                   AND settled_at IS NULL
                   AND closed_at IS NULL
                 """,
-                (settled_at, settlement_high_f, target_date),
-            )
+                (target_date,),
+            ).fetchall()
+            for row in resting_rows:
+                outcome_json = json.dumps(
+                    _outcome_diagnostics_payload(
+                        row,
+                        event="expiration",
+                        resolved_at=settled_at,
+                        settlement_high_f=settlement_high_f,
+                        resolved_yes=None,
+                        position_won=None,
+                        realized_pnl=0.0,
+                    ),
+                    sort_keys=True,
+                )
+                conn.execute(
+                    """
+                    UPDATE paper_orders
+                    SET status = 'PAPER_EXPIRED',
+                        settled_at = ?,
+                        settlement_high_f = ?,
+                        realized_pnl = 0.0,
+                        outcome_diagnostics_json = ?
+                    WHERE id = ?
+                      AND status = 'PAPER_LIMIT_RESTING'
+                      AND settled_at IS NULL
+                      AND closed_at IS NULL
+                    """,
+                    (settled_at, settlement_high_f, outcome_json, row["id"]),
+                )
             for row in rows:
                 resolved_yes = _row_resolves_yes(row, settlement_high_f)
                 side = _row_side(row)
@@ -1375,6 +1556,18 @@ class PaperStore:
                 cost = float(row["cost_per_contract"])
                 contracts = float(row["contracts"])
                 realized_pnl = contracts * ((1.0 - cost) if position_wins else -cost)
+                outcome_json = json.dumps(
+                    _outcome_diagnostics_payload(
+                        row,
+                        event="settlement",
+                        resolved_at=settled_at,
+                        settlement_high_f=settlement_high_f,
+                        resolved_yes=resolved_yes,
+                        position_won=position_wins,
+                        realized_pnl=realized_pnl,
+                    ),
+                    sort_keys=True,
+                )
                 # The status/closed_at guard makes settlement a no-op on a row a
                 # concurrent monitor close already flipped, instead of silently
                 # overwriting its realized_pnl. Count real row changes, not the
@@ -1387,7 +1580,8 @@ class PaperStore:
                         settlement_high_f = ?,
                         resolved_yes = ?,
                         realized_pnl = ?,
-                        status = 'PAPER_SETTLED'
+                        status = 'PAPER_SETTLED',
+                        outcome_diagnostics_json = ?
                     WHERE id = ?
                       AND status = 'PAPER_FILLED'
                       AND settled_at IS NULL
@@ -1398,6 +1592,7 @@ class PaperStore:
                         settlement_high_f,
                         1 if resolved_yes else 0,
                         realized_pnl,
+                        outcome_json,
                         row["id"],
                     ),
                 )
@@ -1426,6 +1621,20 @@ class PaperStore:
             position_won = realized_pnl > 0.0
             resolved_yes = 1 if (position_won if side == "YES" else not position_won) else 0
         closed_at = _now()
+        outcome_json = json.dumps(
+            _outcome_diagnostics_payload(
+                row,
+                event="close",
+                resolved_at=closed_at,
+                settlement_high_f=None,
+                resolved_yes=bool(resolved_yes) if resolved_yes is not None else None,
+                position_won=None if abs(realized_pnl) < 1e-9 else realized_pnl > 0.0,
+                realized_pnl=realized_pnl,
+                exit_price=exit_price,
+                exit_fee_per_contract=exit_fee,
+            ),
+            sort_keys=True,
+        )
         with self.connect() as conn:
             conn.execute(
                 """
@@ -1436,10 +1645,19 @@ class PaperStore:
                     exit_price = ?,
                     exit_fee_per_contract = ?,
                     resolved_yes = ?,
-                    realized_pnl = ?
+                    realized_pnl = ?,
+                    outcome_diagnostics_json = ?
                 WHERE id = ?
                 """,
-                (closed_at, exit_price, exit_fee, resolved_yes, realized_pnl, order_id),
+                (
+                    closed_at,
+                    exit_price,
+                    exit_fee,
+                    resolved_yes,
+                    realized_pnl,
+                    outcome_json,
+                    order_id,
+                ),
             )
         closed = self._order(order_id)
         if closed is None:
@@ -1884,6 +2102,552 @@ def _market_close_time(raw: dict | None) -> str | None:
         return None
     value = raw.get("close_time") or raw.get("expected_expiration_time") or raw.get("expiration_time")
     return str(value) if value else None
+
+
+def _decision_diagnostics_payload(
+    target_date: str,
+    decision: TradeDecision,
+    *,
+    created_at: str,
+    forecast: ForecastSnapshot | None,
+    intraday: IntradaySnapshot | None,
+    event: EventSnapshot | None,
+    market,
+    market_consensus: MarketConsensus | None,
+    prediction_features: dict[str, object],
+    risk_profile: str | None,
+    bankroll: float | None,
+    strategy_config: StrategyConfig | None,
+    forecast_snapshot_id: int | None,
+    market_snapshot_id: int | None,
+) -> dict[str, object]:
+    return _drop_none(
+        {
+            "schema_version": 1,
+            "kind": "trade_decision",
+            "created_at": created_at,
+            "target_date": target_date,
+            "risk_profile": risk_profile,
+            "bankroll": _round_number(bankroll),
+            "context_refs": {
+                "forecast_snapshot_id": forecast_snapshot_id,
+                "market_snapshot_id": market_snapshot_id,
+            },
+            "signal": _decision_signal_payload(decision),
+            "forecast": _forecast_diagnostics_payload(forecast),
+            "intraday": _intraday_diagnostics_payload(intraday),
+            "market": _market_diagnostics_payload(market, event),
+            "market_consensus": _market_consensus_diagnostics_payload(market_consensus),
+            "prediction_features": dict(prediction_features or {}),
+            "strategy_config": _strategy_config_snapshot(strategy_config),
+        }
+    )
+
+
+def _order_entry_diagnostics_payload(
+    target_date: str,
+    decision: TradeDecision,
+    *,
+    created_at: str,
+    kind: str,
+    risk_profile: str | None,
+    status: str,
+    entry_mode: str,
+    group_id: str | None,
+    strategy_config: StrategyConfig | None,
+    sample_probability: float | None,
+    sampled: bool | None,
+    entry_decision: sqlite3.Row | None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "kind": kind,
+        "created_at": created_at,
+        "target_date": target_date,
+        "risk_profile": risk_profile,
+        "status": status,
+        "entry_mode": entry_mode,
+        "group_id": group_id,
+        "signal": _decision_signal_payload(decision),
+        "strategy_config": _strategy_config_snapshot(strategy_config),
+        "entry_decision": _entry_decision_ref_payload(entry_decision),
+    }
+    if sample_probability is not None or sampled is not None:
+        payload["sampling"] = {
+            "sample_probability": _round_number(sample_probability),
+            "sampled": sampled,
+        }
+    return _drop_none(payload)
+
+
+def _monitor_diagnostics_payload(
+    order: sqlite3.Row,
+    *,
+    created_at: str,
+    side: str,
+    action: str,
+    reason: str | None,
+    market_status: str | None,
+    live_bid: float | None,
+    exit_fee_per_contract: float | None,
+    net_exit_per_contract: float | None,
+    unrealized_pnl: float | None,
+    unrealized_roi: float | None,
+) -> dict[str, object]:
+    return _drop_none(
+        {
+            "schema_version": 1,
+            "kind": "paper_monitor_snapshot",
+            "created_at": created_at,
+            "order_id": _row_value(order, "id"),
+            "target_date": _row_value(order, "target_date"),
+            "market_ticker": _row_value(order, "market_ticker"),
+            "risk_profile": _row_value(order, "risk_profile"),
+            "side": side.upper(),
+            "action": action,
+            "reason": reason,
+            "market_status": market_status,
+            "mark": {
+                "live_bid": _round_number(live_bid),
+                "exit_fee_per_contract": _round_number(exit_fee_per_contract),
+                "net_exit_per_contract": _round_number(net_exit_per_contract),
+                "unrealized_pnl": _round_number(unrealized_pnl),
+                "unrealized_roi": _round_number(unrealized_roi),
+            },
+            "entry": _order_entry_snapshot(order),
+            "entry_diagnostics": _json_object(_row_value(order, "diagnostics_json")),
+        }
+    )
+
+
+def _outcome_diagnostics_payload(
+    row: sqlite3.Row,
+    *,
+    event: str,
+    resolved_at: str,
+    settlement_high_f: float | None,
+    resolved_yes: bool | None,
+    position_won: bool | None,
+    realized_pnl: float,
+    exit_price: float | None = None,
+    exit_fee_per_contract: float | None = None,
+) -> dict[str, object]:
+    entry_diagnostics = _json_object(_row_value(row, "diagnostics_json"))
+    entry_decision = entry_diagnostics.get("entry_decision") if isinstance(entry_diagnostics, dict) else None
+    source_diagnostics = (
+        entry_decision.get("diagnostics")
+        if isinstance(entry_decision, dict) and isinstance(entry_decision.get("diagnostics"), dict)
+        else entry_diagnostics
+    )
+    prediction_features = (
+        source_diagnostics.get("prediction_features")
+        if isinstance(source_diagnostics, dict) and isinstance(source_diagnostics.get("prediction_features"), dict)
+        else {}
+    )
+    predicted_high = _optional_float(prediction_features.get("predicted_high_f"))
+    forecast_error = (
+        settlement_high_f - predicted_high
+        if settlement_high_f is not None and predicted_high is not None
+        else None
+    )
+    side = _row_side(row)
+    return _drop_none(
+        {
+            "schema_version": 1,
+            "kind": "paper_order_outcome",
+            "entry": {
+                "order_id": _row_value(row, "id"),
+                "decision_snapshot_id": _row_value(row, "entry_decision_snapshot_id"),
+                "created_at": _row_value(row, "created_at"),
+                "target_date": _row_value(row, "target_date"),
+                "market_ticker": _row_value(row, "market_ticker"),
+                "label": _row_value(row, "label"),
+                "side": side,
+                "risk_profile": _row_value(row, "risk_profile"),
+                "entry_price": _round_number(_row_value(row, "entry_price")),
+                "cost_per_contract": _round_number(_row_value(row, "cost_per_contract")),
+                "contracts": _round_number(_row_value(row, "contracts")),
+                "probability": _round_number(_row_value(row, "probability")),
+                "probability_lcb": _round_number(_row_value(row, "probability_lcb")),
+                "edge": _round_number(_row_value(row, "edge")),
+                "edge_lcb": _round_number(_row_value(row, "edge_lcb")),
+                "trade_quality_score": _round_number(_row_value(row, "trade_quality_score")),
+                "reasons": _json_list(_row_value(row, "reasons_json")),
+                "diagnostics": source_diagnostics,
+            },
+            "outcome": {
+                "event": event,
+                "resolved_at": resolved_at,
+                "settlement_high_f": _round_number(settlement_high_f),
+                "resolved_yes": resolved_yes,
+                "position_won": position_won,
+                "realized_pnl": _round_number(realized_pnl),
+                "pnl_per_contract": _round_number(
+                    realized_pnl / float(_row_value(row, "contracts", 0.0) or 1.0)
+                ),
+                "exit_price": _round_number(exit_price),
+                "exit_fee_per_contract": _round_number(exit_fee_per_contract),
+                "forecast_error_f": _round_number(forecast_error),
+                "win_loss_reason": _win_loss_reason(
+                    event,
+                    side=side,
+                    resolved_yes=resolved_yes,
+                    position_won=position_won,
+                    realized_pnl=realized_pnl,
+                ),
+            },
+        }
+    )
+
+
+def _decision_signal_payload(decision: TradeDecision) -> dict[str, object]:
+    return _drop_none(
+        {
+            "ticker": decision.ticker,
+            "label": decision.label,
+            "action": decision.action,
+            "side": decision.side,
+            "approved": bool(decision.approved),
+            "signal_approved": (
+                bool(decision.signal_approved)
+                if decision.signal_approved is not None
+                else bool(decision.approved)
+            ),
+            "entry_block_reason": decision.entry_block_reason,
+            "probability": _round_number(decision.probability),
+            "probability_lcb": _round_number(decision.probability_lcb),
+            "model_probability": _round_number(decision.model_probability),
+            "market_probability": _round_number(decision.market_probability),
+            "residual_probability": _round_number(decision.residual_probability),
+            "ensemble_probability": _round_number(decision.ensemble_probability),
+            "intraday_probability": _round_number(decision.intraday_probability),
+            "remaining_heat_risk": _round_number(decision.remaining_heat_risk),
+            "yes_bid": _round_number(decision.yes_bid),
+            "yes_ask": _round_number(decision.yes_ask),
+            "entry_bid": _round_number(decision.bid),
+            "entry_ask": _round_number(decision.ask),
+            "entry_bid_size": _round_number(decision.bid_size),
+            "entry_ask_size": _round_number(decision.ask_size),
+            "spread": _round_number(decision.spread),
+            "fee_per_contract": _round_number(decision.fee_per_contract),
+            "cost_per_contract": _round_number(decision.cost_per_contract),
+            "edge": _round_number(decision.edge),
+            "edge_lcb": _round_number(decision.edge_lcb),
+            "kelly_fraction": _round_number(decision.kelly_fraction),
+            "recommended_contracts": _round_number(decision.recommended_contracts),
+            "recommended_spend": _round_number(
+                decision.recommended_contracts * decision.cost_per_contract
+            ),
+            "expected_profit": _round_number(decision.expected_profit),
+            "trade_quality_score": _round_number(decision.trade_quality_score),
+            "binding_constraint": decision.binding_constraint,
+            "strike_type": decision.strike_type,
+            "floor_strike": _round_number(decision.floor_strike),
+            "cap_strike": _round_number(decision.cap_strike),
+            "limit_price": _round_number(decision.limit_price),
+            "limit_fee_per_contract": _round_number(decision.limit_fee_per_contract),
+            "limit_cost_per_contract": _round_number(decision.limit_cost_per_contract),
+            "limit_edge": _round_number(decision.limit_edge),
+            "limit_edge_lcb": _round_number(decision.limit_edge_lcb),
+            "reasons": list(decision.reasons),
+        }
+    )
+
+
+def _forecast_diagnostics_payload(forecast: ForecastSnapshot | None) -> dict[str, object] | None:
+    if forecast is None:
+        return None
+    return _drop_none(
+        {
+            "target_date": forecast.target_date.isoformat(),
+            "predicted_high_f": _round_number(forecast.predicted_high_f),
+            "fetched_at": forecast.fetched_at,
+            "lead_hours": _round_number(forecast.lead_hours),
+            "method": forecast.method,
+            "source_spread_f": _round_number(forecast.source_spread_f),
+            "source_count": forecast.source_count,
+            "sources": {
+                "google_high_f": _round_number(forecast.google_high_f),
+                "nws_high_f": _round_number(forecast.nws_high_f),
+                "open_meteo_high_f": _round_number(forecast.open_meteo_high_f),
+                "history_high_f": _round_number(forecast.history_high_f),
+            },
+            "weights": {
+                "google_weight": _round_number(forecast.google_weight),
+                "nws_weight": _round_number(forecast.nws_weight),
+                "open_meteo_weight": _round_number(forecast.open_meteo_weight),
+                "history_weight": _round_number(forecast.history_weight),
+            },
+            "station_adjustment_f": _round_number(forecast.station_adjustment_f),
+            "fresh_station_count": forecast.fresh_station_count,
+            "max_calls_per_day": forecast.max_calls_per_day,
+            "calls_used_today": forecast.calls_used_today,
+            "raw_feature_keys": sorted(forecast.raw.keys()) if isinstance(forecast.raw, dict) else None,
+        }
+    )
+
+
+def _intraday_diagnostics_payload(intraday: IntradaySnapshot | None) -> dict[str, object] | None:
+    if intraday is None:
+        return None
+    return _drop_none(
+        {
+            "target_date": intraday.target_date.isoformat(),
+            "observed_high_f": _round_number(intraday.observed_high_f),
+            "latest_temp_f": _round_number(intraday.latest_temp_f),
+            "latest_observed_at": intraday.latest_observed_at,
+            "remaining_forecast_high_f": _round_number(intraday.remaining_forecast_high_f),
+            "forecast_fetched_at": intraday.forecast_fetched_at,
+            "observation_count": intraday.observation_count,
+            "observed_high_source": intraday.observed_high_source,
+            "is_complete": intraday.is_complete,
+        }
+    )
+
+
+def _market_diagnostics_payload(market, event: EventSnapshot | None) -> dict[str, object] | None:
+    if market is None:
+        return _drop_none(
+            {
+                "event_ticker": event.event_ticker if event is not None else None,
+                "event_title": event.title if event is not None else None,
+                "target_date": event.target_date.isoformat() if event is not None and event.target_date else None,
+            }
+        )
+    return _drop_none(
+        {
+            "event_ticker": market.event_ticker,
+            "event_title": event.title if event is not None else None,
+            "ticker": market.ticker,
+            "title": market.title,
+            "label": market.yes_sub_title,
+            "status": market.status,
+            "result": market.result,
+            "close_time": _market_close_time(market.raw),
+            "strike_type": market.strike_type,
+            "floor_strike": _round_number(market.floor_strike),
+            "cap_strike": _round_number(market.cap_strike),
+            "yes_bid": _round_number(market.yes_bid),
+            "yes_ask": _round_number(market.yes_ask),
+            "no_bid": _round_number(market.no_bid),
+            "no_ask": _round_number(market.no_ask),
+            "yes_bid_size": _round_number(market.yes_bid_size),
+            "yes_ask_size": _round_number(market.yes_ask_size),
+            "no_bid_size": _round_number(market.no_bid_size),
+            "no_ask_size": _round_number(market.no_ask_size),
+            "spread": _round_number(market.spread),
+            "no_spread": _round_number(market.no_spread),
+            "expiration_value": _round_number(market.expiration_value),
+        }
+    )
+
+
+def _market_consensus_diagnostics_payload(
+    market_consensus: MarketConsensus | None,
+) -> dict[str, object] | None:
+    if market_consensus is None:
+        return None
+    return _drop_none(
+        {
+            "available": market_consensus.available,
+            "implied_high_f": _round_number(market_consensus.implied_high_f),
+            "modal_bin_ticker": market_consensus.modal_bin_ticker,
+            "modal_bin_label": market_consensus.modal_bin_label,
+            "modal_probability": _round_number(market_consensus.modal_probability),
+            "implied_stdev_f": _round_number(market_consensus.implied_stdev_f),
+            "p10_f": _round_number(market_consensus.p10_f),
+            "p25_f": _round_number(market_consensus.p25_f),
+            "median_f": _round_number(market_consensus.median_f),
+            "p75_f": _round_number(market_consensus.p75_f),
+            "p90_f": _round_number(market_consensus.p90_f),
+            "overround": _round_number(market_consensus.overround),
+            "liquid_bin_count": market_consensus.liquid_bin_count,
+        }
+    )
+
+
+def _strategy_config_snapshot(config: StrategyConfig | None) -> dict[str, object] | None:
+    if config is None:
+        return None
+    return {
+        key: _json_safe_value(value)
+        for key, value in sorted(config.__dict__.items())
+    }
+
+
+def _latest_entry_decision_snapshot(
+    conn: sqlite3.Connection,
+    target_date: str,
+    decision: TradeDecision,
+    *,
+    risk_profile: str | None,
+) -> sqlite3.Row | None:
+    conn.row_factory = sqlite3.Row
+    filters = [
+        "target_date = ?",
+        "market_ticker = ?",
+        "UPPER(COALESCE(side, 'YES')) = ?",
+    ]
+    params: list[object] = [target_date, decision.ticker, decision.side.upper()]
+    if risk_profile is not None:
+        filters.append("COALESCE(risk_profile, 'live') = ?")
+        params.append(risk_profile)
+    return conn.execute(
+        f"""
+        SELECT *
+        FROM decision_snapshots
+        WHERE {' AND '.join(filters)}
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        """,
+        params,
+    ).fetchone()
+
+
+def _entry_decision_ref_payload(row: sqlite3.Row | None) -> dict[str, object] | None:
+    if row is None:
+        return None
+    diagnostics = _json_object(_row_value(row, "diagnostics_json"))
+    if not diagnostics:
+        diagnostics = {
+            "schema_version": 1,
+            "kind": "legacy_trade_decision",
+            "signal": {
+                "approved": bool(_row_value(row, "approved", 0)),
+                "signal_approved": bool(
+                    _row_value(row, "signal_approved", _row_value(row, "approved", 0))
+                ),
+                "entry_block_reason": _row_value(row, "entry_block_reason"),
+                "probability": _round_number(_row_value(row, "probability")),
+                "edge": _round_number(_row_value(row, "edge")),
+                "edge_lcb": _round_number(_row_value(row, "edge_lcb")),
+                "reasons": _json_list(_row_value(row, "reasons_json")),
+            },
+        }
+    return _drop_none(
+        {
+            "snapshot_id": int(_row_value(row, "id")),
+            "created_at": _row_value(row, "created_at"),
+            "approved": bool(_row_value(row, "approved", 0)),
+            "signal_approved": bool(
+                _row_value(row, "signal_approved", _row_value(row, "approved", 0))
+            ),
+            "entry_block_reason": _row_value(row, "entry_block_reason"),
+            "diagnostics": diagnostics,
+        }
+    )
+
+
+def _order_entry_snapshot(row: sqlite3.Row) -> dict[str, object]:
+    return _drop_none(
+        {
+            "entry_decision_snapshot_id": _row_value(row, "entry_decision_snapshot_id"),
+            "created_at": _row_value(row, "created_at"),
+            "entry_price": _round_number(_row_value(row, "entry_price")),
+            "cost_per_contract": _round_number(_row_value(row, "cost_per_contract")),
+            "contracts": _round_number(_row_value(row, "contracts")),
+            "probability": _round_number(_row_value(row, "probability")),
+            "edge": _round_number(_row_value(row, "edge")),
+            "edge_lcb": _round_number(_row_value(row, "edge_lcb")),
+            "reasons": _json_list(_row_value(row, "reasons_json")),
+        }
+    )
+
+
+def _win_loss_reason(
+    event: str,
+    *,
+    side: str,
+    resolved_yes: bool | None,
+    position_won: bool | None,
+    realized_pnl: float,
+) -> str:
+    if event == "expiration":
+        return "Limit order expired unfilled at settlement."
+    if event == "close":
+        if position_won is True:
+            return f"{side} position won because it was closed for positive PnL before settlement."
+        if position_won is False:
+            return f"{side} position lost because it was closed for negative PnL before settlement."
+        return "Position was closed at break-even before settlement."
+    if resolved_yes is None or position_won is None:
+        return "Outcome was recorded without a resolved market side."
+    market_result = "YES" if resolved_yes else "NO"
+    verb = "won" if position_won else "lost"
+    return f"{side} position {verb} because the market resolved {market_result}."
+
+
+def _json_object(value: object) -> dict[str, object]:
+    if not value:
+        return {}
+    if isinstance(value, dict):
+        return value
+    try:
+        payload = json.loads(str(value))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _json_list(value: object) -> list[str]:
+    if not value:
+        return []
+    if isinstance(value, list):
+        return [str(item) for item in value]
+    try:
+        payload = json.loads(str(value))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    if isinstance(payload, list):
+        return [str(item) for item in payload]
+    return []
+
+
+def _optional_float(value: object) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _round_number(value: object) -> float | int | None:
+    number = _optional_float(value)
+    if number is None:
+        return None
+    rounded = round(number, 6)
+    if rounded.is_integer() and isinstance(value, int):
+        return int(rounded)
+    return rounded
+
+
+def _json_safe_value(value: object) -> object:
+    if isinstance(value, tuple):
+        return [_json_safe_value(item) for item in value]
+    if isinstance(value, list):
+        return [_json_safe_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _json_safe_value(item) for key, item in value.items()}
+    if isinstance(value, (str, bool, int)) or value is None:
+        return value
+    if isinstance(value, float):
+        return _round_number(value)
+    return str(value)
+
+
+def _drop_none(value):
+    if isinstance(value, dict):
+        cleaned = {}
+        for key, item in value.items():
+            cleaned_item = _drop_none(item)
+            if cleaned_item is not None:
+                cleaned[key] = cleaned_item
+        return cleaned
+    if isinstance(value, list):
+        return [_drop_none(item) for item in value if _drop_none(item) is not None]
+    return value
 
 
 def _date_filters(since: str | None, until: str | None) -> tuple[list[str], list[str]]:

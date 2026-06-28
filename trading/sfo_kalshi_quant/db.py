@@ -22,6 +22,23 @@ from .prediction_features import build_prediction_feature_snapshot
 logger = logging.getLogger(__name__)
 
 
+def _integer_settlement_high_f(value: object) -> float:
+    """Round a raw daily high to the integer °F Kalshi/CLISFO settle on.
+
+    Mirrors ``forecast._integer_settlement_high_f`` (kept here to avoid a
+    circular import). Every settlement and signal-scoring path must resolve
+    bins against this integer, not a fractional NWS/provisional high, so the
+    paper ledger, win-rate, Brier, and calibration all agree with the
+    backtest/rescore path. ``floor(x + 0.5)`` is round-half-up and idempotent
+    on values that are already integers (e.g. official CLISFO highs).
+    """
+
+    high = float(value)
+    if not math.isfinite(high):
+        raise ValueError("settlement high must be finite")
+    return float(math.floor(high + 0.5))
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS forecast_snapshots (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1484,6 +1501,13 @@ class PaperStore:
             ).fetchall()
 
     def settle_paper_orders(self, target_date: str, settlement_high_f: float) -> int:
+        # Resolve bins against the integer °F Kalshi settles on, never a
+        # fractional NWS/provisional high. Without this, a true high of 65.4
+        # would settle the 65-or-below bin differently than Kalshi does, and a
+        # value straddling a half-degree bin edge (e.g. 65.5 -> 66) flips the
+        # YES/NO outcome. This single chokepoint covers manual --settlement-high,
+        # CLISFO, and the WeatherEdge ground-truth fallback.
+        settlement_high_f = _integer_settlement_high_f(settlement_high_f)
         settled_at = _now()
         settled = 0
         with self.connect() as conn:
@@ -1636,7 +1660,14 @@ class PaperStore:
             sort_keys=True,
         )
         with self.connect() as conn:
-            conn.execute(
+            # Guard the close on the same open-state predicate settle uses, then
+            # require it to have actually changed a row. Between _open_order()
+            # above and this UPDATE, a concurrent settle (the q2min monitor and
+            # the settle path race on one DB) can flip this order to
+            # PAPER_SETTLED. A bare WHERE id = ? would then overwrite the true
+            # settlement outcome with an intraday exit price, permanently
+            # corrupting the paper PnL ledger, equity curve, and circuit breaker.
+            cursor = conn.execute(
                 """
                 UPDATE paper_orders
                 SET
@@ -1648,6 +1679,9 @@ class PaperStore:
                     realized_pnl = ?,
                     outcome_diagnostics_json = ?
                 WHERE id = ?
+                  AND status = 'PAPER_FILLED'
+                  AND settled_at IS NULL
+                  AND closed_at IS NULL
                 """,
                 (
                     closed_at,
@@ -1659,6 +1693,14 @@ class PaperStore:
                     order_id,
                 ),
             )
+            if cursor.rowcount == 0:
+                # Already settled/closed concurrently. Raise instead of returning
+                # the resolved row so the caller does not double-book it; the
+                # paper-monitor loop catches ValueError/RuntimeError per order and
+                # keeps inspecting the rest of the book.
+                raise ValueError(
+                    f"paper order {order_id} was resolved concurrently before close"
+                )
         closed = self._order(order_id)
         if closed is None:
             raise RuntimeError(f"paper order {order_id} disappeared after close")
@@ -1962,7 +2004,14 @@ class PaperStore:
             raise ValueError(
                 "sample_mode must be latest-per-market-side, entry-per-market-side, or all"
             )
-        normalized_settlements = {str(key): float(value) for key, value in settlements.items()}
+        # Score signals against the integer Kalshi settlement, matching the live
+        # settle path (settle_paper_orders) and backtest_rescore. Using the raw
+        # fractional high here made win_rate/Brier/log_loss/calibration wrong on
+        # every fractional-high day near a bin edge -- the exact numbers used to
+        # judge model edge and gate profiles.
+        normalized_settlements = {
+            str(key): _integer_settlement_high_f(value) for key, value in settlements.items()
+        }
         filters, params = _date_filters(since, until)
         if approved_only:
             filters.append("approved = 1")

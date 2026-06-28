@@ -2,6 +2,8 @@
 Description=Run SFO compact dataset backfill nightly
 
 [Timer]
+# Decorrelate firing on a no-swap box so units don't all spike together
+RandomizedDelaySec=120
 OnCalendar=*-*-* 02:25:00
 Persistent=true
 Unit=sfo-dataset-backfill.service

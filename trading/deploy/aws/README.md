@@ -178,8 +178,40 @@ gh-pages / root
 Then enable the timers:
 
 ```bash
-sudo systemctl enable --now sfo-forecaster-refresh.timer sfo-strategy-lab-refresh.timer sfo-dataset-backfill.timer sfo-kalshi-paper-scan.timer sfo-kalshi-paper-monitor.timer sfo-kalshi-paper-settle.timer
+sudo systemctl enable --now sfo-forecaster-refresh.timer sfo-strategy-lab-refresh.timer sfo-dataset-backfill.timer sfo-kalshi-paper-scan.timer sfo-kalshi-paper-monitor.timer sfo-kalshi-paper-settle.timer sfo-forecast-freshness.timer
 ```
+
+## Self-Sufficient Refresh (Mac powered off)
+
+The box can own the entire daily refresh, so the Mac heavy forecaster is no longer
+required. Every refresh-path entrypoint (`nws_ground_truth`, `google_weather_cache`,
+`nwp_archive`, `emos_forecast`, `build_dashboard`) is pure stdlib + numpy/pandas and
+peaks ~250 MB; only offline LSTM/XGBoost **training** is heavy, and that stays off the
+box (run on a dev machine or in CI; the box serves the committed `models/` artifacts).
+
+To run Mac-off:
+
+1. **Keep the box on light deps only.** `install_systemd.sh` installs `certifi numpy
+   pandas` into the forecaster venv. NEVER run `pip install .[forecaster]` is now safe
+   (it is light), but `pip install .[train]` (torch/xgboost/scipy/sklearn) must NEVER run
+   on the 1 GB box — it will OOM.
+2. **Set the env** in `/etc/weatheredge.env`: a real `GOOGLE_WEATHER_API_KEY` (the box
+   now drives the paid refresh; the 260/day + 8000/mo budget and overnight throttle still
+   apply), and `SFO_ENABLE_LIGHTSAIL_FORECASTER_REFRESH=1`.
+3. **Enable the refresh + watchdog timers** (above). `sfo-forecaster-refresh.timer`
+   tolerates transient NWS/Google fetch failures (`-` prefix) so a hiccup can't freeze
+   publishing.
+4. **Freshness watchdog.** `sfo-forecast-freshness.timer` runs
+   `check_forecast_db_freshness.sh` every 30 min; if `weather.db` is older than
+   `SFO_FORECAST_MAX_AGE_HOURS` (default 6 h, ahead of the 12 h trade-halt) it logs,
+   writes a `STALE_FORECAST` marker, exits non-zero (so `systemctl --failed` flags it),
+   and POSTs to `SFO_FRESHNESS_ALERT_URL` if set (ntfy.sh / Slack / Discord webhook).
+5. **Memory safety.** Every unit carries a `MemoryMax`, and a swapfile is recommended on
+   the no-swap box, so a transient spike self-limits instead of the OOM-killer taking the
+   trading loop. Tune the `MemoryMax` values after observing real peaks
+   (`systemctl status <unit>`).
+
+Retire the Mac only after one on-box refresh succeeds and the freshness watchdog reads OK.
 
 ## Check It
 

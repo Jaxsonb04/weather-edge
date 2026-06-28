@@ -10,3 +10,6 @@ WorkingDirectory=__TRADING_DIR__
 EnvironmentFile=__ENV_FILE__
 ExecStart=/usr/bin/env bash __TRADING_DIR__/deploy/aws/run_paper_scan_profiles.sh
 Nice=5
+# Per-unit memory cap so a spike self-limits on the no-swap 1 GB box.
+MemoryHigh=180M
+MemoryMax=240M

@@ -13,3 +13,6 @@ ExecStart=/bin/bash __TRADING_DIR__/deploy/aws/build_public_trading_signal.sh
 ExecStart=__FORECASTER_DIR__/.venv/bin/python build_dashboard.py
 ExecStart=/bin/bash __TRADING_DIR__/deploy/aws/publish_forecaster_pages.sh
 Nice=5
+# Per-unit memory cap so a spike self-limits on the no-swap 1 GB box.
+MemoryHigh=300M
+MemoryMax=400M

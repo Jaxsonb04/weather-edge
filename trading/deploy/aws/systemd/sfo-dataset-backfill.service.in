@@ -10,3 +10,6 @@ WorkingDirectory=__TRADING_DIR__
 EnvironmentFile=__ENV_FILE__
 ExecStart=/usr/bin/env bash __TRADING_DIR__/deploy/aws/run_dataset_backfill.sh
 Nice=10
+# Per-unit memory cap so a spike self-limits on the no-swap 1 GB box.
+MemoryHigh=280M
+MemoryMax=360M

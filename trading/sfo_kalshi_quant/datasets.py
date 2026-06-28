@@ -171,7 +171,21 @@ class DatasetStore:
             self.init()
 
     def connect(self) -> sqlite3.Connection:
-        return sqlite3.connect(self.db_path)
+        # The nightly dataset backfill writes the SAME paper_trading.db that the
+        # 24/7 paper scan (q5min), monitor (q2min), settle, and strategy-lab
+        # refresh hit. On the default 5s rollback-journal connection a lock
+        # collision fails fast with "database is locked" -- aborting a dataset
+        # source or, worse, dropping a monitor/scan tick. Mirror PaperStore.connect
+        # so every writer shares the same WAL + busy_timeout regime and waits
+        # instead of failing.
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
+        try:
+            conn.execute("PRAGMA busy_timeout = 30000")
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA synchronous = NORMAL")
+        except sqlite3.DatabaseError:
+            pass
+        return conn
 
     def init(self) -> None:
         with self.connect() as conn:

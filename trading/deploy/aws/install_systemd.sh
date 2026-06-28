@@ -58,6 +58,9 @@ render_unit "$SCRIPT_DIR/systemd/sfo-dataset-backfill.service.in" /etc/systemd/s
 render_unit "$SCRIPT_DIR/systemd/sfo-kalshi-paper-scan.service.in" /etc/systemd/system/sfo-kalshi-paper-scan.service
 render_unit "$SCRIPT_DIR/systemd/sfo-kalshi-paper-monitor.service.in" /etc/systemd/system/sfo-kalshi-paper-monitor.service
 render_unit "$SCRIPT_DIR/systemd/sfo-kalshi-paper-settle.service.in" /etc/systemd/system/sfo-kalshi-paper-settle.service
+render_unit "$SCRIPT_DIR/systemd/sfo-forecast-freshness.service.in" /etc/systemd/system/sfo-forecast-freshness.service
+
+chmod +x "$SCRIPT_DIR/check_forecast_db_freshness.sh" 2>/dev/null || true
 
 sudo install -m 644 "$SCRIPT_DIR/systemd/sfo-forecaster-refresh.timer" /etc/systemd/system/sfo-forecaster-refresh.timer
 sudo install -m 644 "$SCRIPT_DIR/systemd/sfo-strategy-lab-refresh.timer" /etc/systemd/system/sfo-strategy-lab-refresh.timer
@@ -65,15 +68,16 @@ sudo install -m 644 "$SCRIPT_DIR/systemd/sfo-dataset-backfill.timer" /etc/system
 sudo install -m 644 "$SCRIPT_DIR/systemd/sfo-kalshi-paper-scan.timer" /etc/systemd/system/sfo-kalshi-paper-scan.timer
 sudo install -m 644 "$SCRIPT_DIR/systemd/sfo-kalshi-paper-monitor.timer" /etc/systemd/system/sfo-kalshi-paper-monitor.timer
 sudo install -m 644 "$SCRIPT_DIR/systemd/sfo-kalshi-paper-settle.timer" /etc/systemd/system/sfo-kalshi-paper-settle.timer
+sudo install -m 644 "$SCRIPT_DIR/systemd/sfo-forecast-freshness.timer" /etc/systemd/system/sfo-forecast-freshness.timer
 
 sudo systemctl daemon-reload
 
 if sudo grep -q "replace_with_google_weather_key" "$ENV_FILE"; then
   echo "Edit $ENV_FILE and set GOOGLE_WEATHER_API_KEY before enabling timers."
   echo "Then run:"
-  echo "  sudo systemctl enable --now sfo-forecaster-refresh.timer sfo-strategy-lab-refresh.timer sfo-dataset-backfill.timer sfo-kalshi-paper-scan.timer sfo-kalshi-paper-monitor.timer sfo-kalshi-paper-settle.timer"
+  echo "  sudo systemctl enable --now sfo-forecaster-refresh.timer sfo-strategy-lab-refresh.timer sfo-dataset-backfill.timer sfo-kalshi-paper-scan.timer sfo-kalshi-paper-monitor.timer sfo-kalshi-paper-settle.timer sfo-forecast-freshness.timer"
   exit 0
 fi
 
-sudo systemctl enable --now sfo-forecaster-refresh.timer sfo-strategy-lab-refresh.timer sfo-dataset-backfill.timer sfo-kalshi-paper-scan.timer sfo-kalshi-paper-monitor.timer sfo-kalshi-paper-settle.timer
+sudo systemctl enable --now sfo-forecaster-refresh.timer sfo-strategy-lab-refresh.timer sfo-dataset-backfill.timer sfo-kalshi-paper-scan.timer sfo-kalshi-paper-monitor.timer sfo-kalshi-paper-settle.timer sfo-forecast-freshness.timer
 sudo systemctl list-timers 'sfo-*' --all

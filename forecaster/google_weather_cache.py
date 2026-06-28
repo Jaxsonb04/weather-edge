@@ -1147,13 +1147,30 @@ def fetch_google_forecast(key):
     page_token = None
     events_used = 0
 
+    # Hard cap on paid hourly pages. The budget reserves ~3 events per refresh; a
+    # misbehaving API that keeps returning a nextPageToken with few/no new hours
+    # could otherwise spend dozens of paid events in one refresh (and the budget
+    # reconciliation only runs AFTER, so it can't stop the current run). At ~24
+    # hours/page, the 72h lookahead needs ~3-4 pages; cap well above that and
+    # break on no forward progress.
+    max_hourly_pages = max(4, HOURLY_LOOKAHEAD_HOURS // 24 + 2)
     while True:
         payload = fetch_hourly_page(key, page_token)
         events_used += 1
-        hours.extend(payload.get("forecastHours") or [])
+        new_hours = payload.get("forecastHours") or []
+        hours.extend(new_hours)
         time_zone = time_zone or payload.get("timeZone")
         page_token = payload.get("nextPageToken")
         if not page_token or len(hours) >= HOURLY_LOOKAHEAD_HOURS:
+            break
+        if events_used >= max_hourly_pages:
+            print(
+                f"[google] hourly pagination hit hard cap of {max_hourly_pages} pages "
+                f"({len(hours)} hours); stopping to protect the paid-event budget"
+            )
+            break
+        if not new_hours:
+            print("[google] hourly page returned no new hours; stopping to avoid a paid-call loop")
             break
 
     daily_forecast = None

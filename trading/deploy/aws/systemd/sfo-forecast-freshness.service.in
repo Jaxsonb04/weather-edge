@@ -1,0 +1,14 @@
+[Unit]
+Description=SFO forecast DB freshness watchdog
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=__APP_USER__
+WorkingDirectory=__FORECASTER_DIR__
+EnvironmentFile=__ENV_FILE__
+ExecStart=/bin/bash __TRADING_DIR__/deploy/aws/check_forecast_db_freshness.sh
+Nice=10
+MemoryHigh=80M
+MemoryMax=120M

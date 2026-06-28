@@ -1165,3 +1165,140 @@ def test_signal_backtest_excludes_null_close_time_recorded_now():
         assert strict["signals"] == 0.0
         assert strict["excluded_post_resolution_signals"] == 1.0
         assert included["signals"] == 1.0
+
+
+def test_settle_paper_orders_rounds_fractional_high_to_integer_kalshi_settlement():
+    """Kalshi settles on the integer high. A raw NWS/provisional high of 65.6
+    must resolve the 66-67 bin as YES (rounds to 66), not NO. Regression for the
+    fractional-settlement mismatch that mis-resolved bins near half-degree edges
+    and stored a fractional settlement_high_f the rest of the system disagreed
+    with."""
+
+    with TemporaryDirectory() as tmp:
+        store = PaperStore(Path(tmp) / "paper.db")
+        decision = TradeDecision(
+            ticker="KXHIGHTSFO-TEST-B66.5",
+            label="66° to 67°",
+            action="BUY_YES",
+            approved=True,
+            probability=0.30,
+            probability_lcb=0.20,
+            yes_bid=0.02,
+            yes_ask=0.03,
+            spread=0.01,
+            fee_per_contract=0.01,
+            cost_per_contract=0.04,
+            edge=0.26,
+            edge_lcb=0.16,
+            kelly_fraction=0.01,
+            recommended_contracts=10.0,
+            expected_profit=2.6,
+            reasons=[],
+            strike_type="between",
+            floor_strike=66.0,
+            cap_strike=67.0,
+        )
+        store.record_paper_order("2026-06-03", decision)
+        # Raw high 65.6 would resolve 66 <= 65.6 <= 67 as False (a YES loss);
+        # rounded to the integer 66 it is a YES win.
+        assert store.settle_paper_orders("2026-06-03", 65.6) == 1
+        row = store.paper_orders(1)[0]
+        assert row["settlement_high_f"] == 66.0
+        assert row["resolved_yes"] == 1
+        assert row["realized_pnl"] > 0
+
+
+def test_signal_backtest_scores_against_integer_kalshi_settlement():
+    """win_rate / Brier / hit-rate must use the integer Kalshi settlement, not
+    the raw fractional high. A YES decision on the 66-67 bin is a WIN when the
+    true high 65.6 rounds to 66; scoring it against the raw 65.6 wrongly counts
+    it a loss. Regression for the metrics-path settlement mismatch."""
+
+    with TemporaryDirectory() as tmp:
+        store = PaperStore(Path(tmp) / "paper.db")
+        decision = TradeDecision(
+            ticker="KXHIGHTSFO-TEST-B66.5",
+            label="66° to 67°",
+            action="BUY_YES",
+            approved=True,
+            probability=0.70,
+            probability_lcb=0.60,
+            yes_bid=0.20,
+            yes_ask=0.30,
+            spread=0.10,
+            fee_per_contract=0.01,
+            cost_per_contract=0.31,
+            edge=0.39,
+            edge_lcb=0.29,
+            kelly_fraction=0.02,
+            recommended_contracts=10.0,
+            expected_profit=3.9,
+            reasons=[],
+            trade_quality_score=72.0,
+            strike_type="between",
+            floor_strike=66.0,
+            cap_strike=67.0,
+        )
+        store.record_decisions(
+            "2026-06-03", [decision], event=pre_resolution_event([decision])
+        )
+        summary = store.signal_backtest_summary({"2026-06-03": 65.6})
+
+        assert summary["settled_signals"] == 1.0
+        assert summary["win_rate"] == 1.0
+        assert summary["approved_hit_rate"] == 1.0
+        # A confident-correct YES: Brier = (probability - 1)^2.
+        assert round(summary["brier_score"], 4) == round((0.70 - 1.0) ** 2, 4)
+
+
+def test_close_paper_order_refuses_to_clobber_concurrently_settled_order():
+    """The q2min monitor and the settle path race on one DB. If a settle resolves
+    an order between the monitor's open-snapshot read and its close UPDATE, the
+    close must NOT overwrite the true settlement outcome with an intraday exit
+    price. Regression for the unguarded `WHERE id = ?` close UPDATE."""
+
+    with TemporaryDirectory() as tmp:
+        store = PaperStore(Path(tmp) / "paper.db")
+        decision = TradeDecision(
+            ticker="KXHIGHTSFO-TEST-B68.5",
+            label="68° to 69°",
+            action="BUY_NO",
+            side="NO",
+            approved=True,
+            probability=0.80,
+            probability_lcb=0.70,
+            yes_bid=0.20,
+            yes_ask=0.22,
+            spread=0.02,
+            fee_per_contract=0.01,
+            cost_per_contract=0.24,
+            edge=0.56,
+            edge_lcb=0.46,
+            kelly_fraction=0.01,
+            recommended_contracts=10.0,
+            expected_profit=5.6,
+            reasons=[],
+            entry_bid=0.76,
+            entry_ask=0.23,
+        )
+        order_id = store.record_paper_order("2026-06-03", decision)
+        # Snapshot the order while it is still open (what the monitor sees).
+        stale_open = store._open_order(order_id)
+        assert stale_open is not None
+        # A concurrent settle wins the race and resolves the row (high 67 -> the
+        # 68-69 NO favorite wins).
+        assert store.settle_paper_orders("2026-06-03", 67) == 1
+        # The monitor now tries to close using its now-stale open snapshot.
+        with patch.object(store, "_open_order", return_value=stale_open):
+            try:
+                store.close_paper_order(order_id, 0.40)
+            except ValueError as exc:
+                assert "resolved concurrently" in str(exc)
+            else:  # pragma: no cover - guard regression
+                raise AssertionError("expected concurrent-resolve guard to raise")
+
+        row = store.paper_orders(1)[0]
+        # Settlement outcome preserved, not clobbered into a PAPER_CLOSED exit.
+        assert row["status"] == "PAPER_SETTLED"
+        assert row["settlement_high_f"] == 67.0
+        assert row["exit_price"] is None

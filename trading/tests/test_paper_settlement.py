@@ -1302,3 +1302,81 @@ def test_close_paper_order_refuses_to_clobber_concurrently_settled_order():
         assert row["status"] == "PAPER_SETTLED"
         assert row["settlement_high_f"] == 67.0
         assert row["exit_price"] is None
+
+
+def test_paper_spend_excludes_expired_resting_orders():
+    """A resting limit that expires deployed ZERO capital, so it must not consume
+    the per-target exposure cap -- counting its never-filled notional blocked
+    valid re-entries on the next scan. Regression for paper_spend_for_target
+    including PAPER_EXPIRED rows."""
+
+    with TemporaryDirectory() as tmp:
+        store = PaperStore(Path(tmp) / "paper.db")
+        filled = TradeDecision(
+            ticker="KXHIGHTSFO-TEST-B68.5",
+            label="68° to 69°",
+            action="BUY_NO",
+            side="NO",
+            approved=True,
+            probability=0.80,
+            probability_lcb=0.70,
+            yes_bid=0.20,
+            yes_ask=0.22,
+            spread=0.02,
+            fee_per_contract=0.01,
+            cost_per_contract=0.24,
+            edge=0.56,
+            edge_lcb=0.46,
+            kelly_fraction=0.01,
+            recommended_contracts=10.0,
+            expected_profit=5.6,
+            reasons=[],
+            entry_bid=0.76,
+            entry_ask=0.23,
+        )
+        store.record_paper_order("2026-06-03", filled)
+        filled_spend = store.paper_spend_for_target("2026-06-03")
+        assert filled_spend > 0.0
+
+        # A resting limit on a different market that never crosses (proven resting
+        # config from the market-summary expiry test).
+        limit_trader = PaperTrader(
+            store,
+            StrategyConfig(limit_price_edge_lcb_buffer=0.02),
+            entry_mode="limit",
+        )
+        resting = TradeDecision(
+            ticker="KXHIGHTSFO-TEST-B74.5",
+            label="74° to 75°",
+            action="BUY_NO",
+            side="NO",
+            approved=True,
+            probability=0.85,
+            probability_lcb=0.81,
+            yes_bid=0.22,
+            yes_ask=0.24,
+            spread=0.03,
+            fee_per_contract=0.02,
+            cost_per_contract=0.77,
+            edge=0.05,
+            edge_lcb=0.01,
+            kelly_fraction=0.01,
+            recommended_contracts=2.0,
+            expected_profit=0.1,
+            reasons=[],
+            entry_bid=0.73,
+            entry_ask=0.75,
+            entry_bid_size=10.0,
+            entry_ask_size=10.0,
+        )
+        assert limit_trader.place_approved("2026-06-03", [resting])
+        # While RESTING, its reserved notional legitimately inflates spend.
+        assert store.paper_spend_for_target("2026-06-03") > filled_spend
+
+        # Settle expires the unreachable resting order (high 67 -> B74.5 never fills).
+        store.settle_paper_orders("2026-06-03", 67)
+        rows = {row["market_ticker"]: row for row in store.paper_orders(10)}
+        assert rows["KXHIGHTSFO-TEST-B74.5"]["status"] == "PAPER_EXPIRED"
+        # After expiry the zero-capital order no longer consumes the cap: spend is
+        # back to just the filled order's notional, freeing re-entry headroom.
+        assert abs(store.paper_spend_for_target("2026-06-03") - filled_spend) < 1e-9

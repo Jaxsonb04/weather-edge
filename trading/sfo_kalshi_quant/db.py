@@ -1243,11 +1243,17 @@ class PaperStore:
     def paper_spend_for_target(self, target_date: str, *, risk_profile: str | None = None) -> float:
         profile_filter, profile_params = _paper_profile_filter(risk_profile)
         with self.connect() as conn:
+            # Exclude PAPER_EXPIRED: those are resting limit orders that never
+            # crossed and deployed ZERO capital, so they must not consume the
+            # per-target exposure cap. Counting their intended-but-never-filled
+            # notional inflated cumulative spend and blocked valid re-entries on
+            # the next scan -- exactly the cap-freeing the settle path documents
+            # when it expires them. (REJECTED was never placed.)
             row = conn.execute(
                 f"""
                 SELECT COALESCE(SUM(contracts * cost_per_contract), 0)
                 FROM paper_orders
-                WHERE target_date = ? AND status != 'REJECTED'
+                WHERE target_date = ? AND status NOT IN ('REJECTED', 'PAPER_EXPIRED')
                 {profile_filter}
                 """,
                 (target_date, *profile_params),
